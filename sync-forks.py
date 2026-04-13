@@ -44,7 +44,7 @@ name: Sync Fork
 on:
   schedule:
     - cron: "{cron}"
-  workflow_dispatch:
+  workflow_dispatch: {{}}
 
 permissions:
   contents: write
@@ -59,38 +59,123 @@ jobs:
           fetch-depth: 0
           token: ${{{{ secrets.SYNC_PAT }}}}
 
-      - name: Safety check — compare file counts
+      - name: Resolve upstream
+        id: upstream
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
         run: |
-          UPSTREAM_URL=$(gh api repos/${{{{ github.repository }}}} --jq '.parent.clone_url')
-          if [ -z "$UPSTREAM_URL" ]; then
-            echo "::error::Cannot determine upstream repo. Not a fork or parent deleted."
-            exit 1
+          set -euo pipefail
+          UPSTREAM_FULL_NAME=$(gh api repos/${{{{ github.repository }}}} --jq '.parent.full_name // empty')
+          if [ -z "$UPSTREAM_FULL_NAME" ]; then
+            echo "::warning::Upstream repo metadata is missing. Sync skipped to preserve fork."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          git remote add upstream "$UPSTREAM_URL"
-          git fetch upstream ${{{{ github.event.repository.default_branch }}}}
-          FORK_FILES=$(git ls-tree -r --name-only HEAD | wc -l)
-          UPSTREAM_FILES=$(git ls-tree -r --name-only upstream/${{{{ github.event.repository.default_branch }}}} | wc -l)
+          if ! gh api "repos/$UPSTREAM_FULL_NAME" >/dev/null 2>&1; then
+            echo "::warning::Upstream repo $UPSTREAM_FULL_NAME is unavailable or deleted. Sync skipped to preserve fork."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          UPSTREAM_BRANCH=$(gh api "repos/$UPSTREAM_FULL_NAME" --jq '.default_branch // empty')
+          UPSTREAM_URL=$(gh api "repos/$UPSTREAM_FULL_NAME" --jq '.clone_url')
+          echo "full_name=$UPSTREAM_FULL_NAME" >> "$GITHUB_OUTPUT"
+          echo "branch=$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "url=$UPSTREAM_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Safety check - compare file counts
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
+        run: |
+          set -euo pipefail
+          git remote add upstream "${{{{ steps.upstream.outputs.url }}}}"
+          git fetch upstream "${{{{ steps.upstream.outputs.branch }}}}"
+          FORK_FILES=$(git ls-tree -r --name-only HEAD | wc -l | tr -d '[:space:]')
+          UPSTREAM_FILES=$(git ls-tree -r --name-only "upstream/${{{{ steps.upstream.outputs.branch }}}}" | wc -l | tr -d '[:space:]')
+          THRESHOLD=$(( (FORK_FILES + 1) / 2 ))
           echo "Fork files: $FORK_FILES"
           echo "Upstream files: $UPSTREAM_FILES"
-          if [ "$UPSTREAM_FILES" -lt "$(echo "$FORK_FILES * {threshold} / 1" | bc)" ]; then
+          if [ "$UPSTREAM_FILES" -lt "$THRESHOLD" ]; then
             echo "::error::SAFETY ABORT: Upstream has $UPSTREAM_FILES files vs fork's $FORK_FILES. Possible upstream deletion. Sync skipped."
             exit 1
           fi
           echo "Safety check passed."
 
-      - name: Merge upstream changes
+      - name: Create restore point
+        if: steps.upstream.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          BACKUP_BRANCH="backup/pre-sync"
+          git branch -f "$BACKUP_BRANCH" HEAD
+          git push origin "$BACKUP_BRANCH" --force
+
+      - name: Diff guard - inspect deletions
+        if: steps.upstream.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
         run: |
-          gh api repos/${{{{ github.repository }}}}/merge-upstream \
-            -X POST \
-            -f branch=${{{{ github.event.repository.default_branch }}}}
+          set -euo pipefail
+          FORK_FILES=$(git ls-tree -r --name-only HEAD | wc -l | tr -d '[:space:]')
+          COMPARE_JSON=$(gh api "repos/${{{{ github.repository }}}}/compare/${{{{ github.event.repository.default_branch }}}}...${{{{ steps.upstream.outputs.full_name }}}}:${{{{ steps.upstream.outputs.branch }}}}")
+          TOTAL_DELETIONS=$(printf '%s' "$COMPARE_JSON" | jq -r '.total_deletions // 0')
+          DELETED_FILES=$(printf '%s' "$COMPARE_JSON" | jq -r '.files[]? | select(.status == "removed") | .filename')
+          DELETE_LIMIT=$(( 5 + (FORK_FILES / 10) ))
+          echo "Total deletions: $TOTAL_DELETIONS"
+          echo "Deletion limit: $DELETE_LIMIT"
+          if [ "$TOTAL_DELETIONS" -gt "$DELETE_LIMIT" ]; then
+            echo "::error::SAFETY ABORT: deletion volume is too large for a safe sync."
+            exit 1
+          fi
+          if printf '%s\\n' "$DELETED_FILES" | grep -Eq '^(\\.github/|README\\.md$|LICENSE$|sync-fork\\.yml$)'; then
+            echo "::error::SAFETY ABORT: critical path deletion detected."
+            exit 1
+          fi
+
+      - name: Merge upstream changes
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
+        run: |
+          gh api repos/${{{{ github.repository }}}}/merge-upstream -X POST -f branch=${{{{ steps.upstream.outputs.branch }}}}
 '''
 
 
 # ── Core functions ────────────────────────────────────────────
+
+def _decode_workflow_content(existing_file):
+    """Decode GitHub contents API payload text, return None on failure."""
+    if not isinstance(existing_file, dict):
+        return None
+    encoded = existing_file.get("content")
+    if not encoded:
+        return None
+    try:
+        raw = base64.b64decode(encoded).decode("utf-8", errors="replace")
+    except (ValueError, TypeError):
+        return None
+    return raw
+
+
+def _has_workflow_dispatch(workflow_text):
+    """Best-effort trigger detection without YAML parser dependency."""
+    if not workflow_text:
+        return False
+    return "workflow_dispatch" in workflow_text
+
+
+def _needs_workflow_update(existing_file):
+    """Return (needs_update: bool, reason: str)."""
+    if "error" in existing_file:
+        return True, "missing file"
+
+    workflow_text = _decode_workflow_content(existing_file)
+    if workflow_text is None:
+        return True, "cannot decode existing workflow"
+
+    if not _has_workflow_dispatch(workflow_text):
+        return True, "missing workflow_dispatch trigger"
+
+    return False, "already has workflow_dispatch"
 
 def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
                  force=False):
@@ -106,8 +191,8 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
         print("  WARN: Cannot get fork file count, proceeding.")
         return True
     if upstream_count is None:
-        print("  ABORT: Cannot reach upstream. May have been deleted.")
-        return False
+        print("  WARN: Upstream unavailable or deleted. Skipping sync to preserve fork.")
+        return None
 
     print(f"  Files: fork={fork_count}, upstream={upstream_count}")
 
@@ -118,6 +203,40 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
         print("  Use --force to override (NOT recommended).")
         return False
 
+    compare = gh_api(
+        f"repos/{fork_name}/compare/{fork_branch}...{upstream_name}:{upstream_branch}"
+    )
+    if not isinstance(compare, dict) or "error" in compare:
+        print("  ABORT: Cannot inspect upstream diff safely.")
+        return False
+
+    total_deletions = int(compare.get("total_deletions", 0) or 0)
+    deleted_files = [
+        item.get("filename", "")
+        for item in compare.get("files", [])
+        if item.get("status") == "removed"
+    ]
+    deletion_limit = 5 + (fork_count // 10)
+
+    print(f"  Deletions: {total_deletions} (limit: {deletion_limit})")
+    if total_deletions > deletion_limit:
+        print("  *** SAFETY ABORT ***")
+        print("  Deletion volume is too large for a safe sync.")
+        return False
+
+    critical_deleted = [
+        path for path in deleted_files
+        if path.startswith(".github/") or path in {
+            "README.md", "LICENSE", "sync-fork.yml",
+        }
+    ]
+    if critical_deleted:
+        print("  *** SAFETY ABORT ***")
+        print("  Critical path deletions detected:")
+        for path in critical_deleted:
+            print(f"    - {path}")
+        return False
+
     return True
 
 
@@ -126,10 +245,11 @@ def add_sync_workflow(repo_name, branch, username, dry_run=False, force=False):
     existing = gh_api(
         f"repos/{repo_name}/contents/.github/workflows/sync-fork.yml?ref={branch}"
     )
+    needs_update, reason = _needs_workflow_update(existing)
     has_existing = "error" not in existing
 
-    if has_existing and not force:
-        print("  SKIP: sync-fork.yml already exists (use --force to overwrite)")
+    if has_existing and not needs_update and not force:
+        print("  SKIP: sync-fork.yml already includes workflow_dispatch")
         return True
 
     content = WORKFLOW_TEMPLATE.format(
@@ -139,7 +259,10 @@ def add_sync_workflow(repo_name, branch, username, dry_run=False, force=False):
 
     if dry_run:
         action = "update" if has_existing else "add"
-        print(f"  [DRY-RUN] Would {action} sync-fork.yml (branch: {branch})")
+        print(
+            f"  [DRY-RUN] Would {action} sync-fork.yml "
+            f"(branch: {branch}, reason: {reason})"
+        )
         return True
 
     payload = {
@@ -162,7 +285,7 @@ def add_sync_workflow(repo_name, branch, username, dry_run=False, force=False):
 
     url = result.get("content", {}).get("html_url", "ok")
     action = "Updated" if has_existing else "Added"
-    print(f"  {action}: {url}")
+    print(f"  {action}: {url} (reason: {reason})")
     return True
 
 
@@ -173,8 +296,12 @@ def sync_now(fork_name, fork_branch, upstream_name, upstream_branch,
         print(f"  [DRY-RUN] Would sync {upstream_name} -> {fork_name}")
         return True
 
-    if not safety_check(fork_name, fork_branch,
-                        upstream_name, upstream_branch, force):
+    safety_result = safety_check(
+        fork_name, fork_branch, upstream_name, upstream_branch, force
+    )
+    if safety_result is None:
+        return True
+    if not safety_result:
         return False
 
     result = gh_api(
