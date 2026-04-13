@@ -10,6 +10,10 @@ Provides:
   - get_fork_repos(): List all fork repos with parent info
   - get_file_count(): File count via git trees API
   - check_gh_cli(): Pre-flight CLI check
+
+NOTE: Currently uses plaintext credential storage (gh CLI HTTPS token stored
+in plain config). Do NOT handle secrets/tokens in code. Upgrade to encrypted
+credential store (e.g. keyring / SSH key) planned for future release.
 """
 
 import json
@@ -148,10 +152,15 @@ def get_fork_repos(username):
     for r in all_repos:
         if not r.get("fork"):
             continue
-        parent_info = r.get("parent", {})
+        full_name = r["full_name"]
+        # List API omits parent info — fetch per-repo for full details
+        parent_info = r.get("parent")
+        if not parent_info or not parent_info.get("full_name"):
+            detail = gh_api(f"repos/{full_name}")
+            parent_info = detail.get("parent") or {}
         forks.append({
             "name": r["name"],
-            "full_name": r["full_name"],
+            "full_name": full_name,
             "branch": r["default_branch"],
             "parent": parent_info.get("full_name", "unknown"),
             "parent_branch": parent_info.get(

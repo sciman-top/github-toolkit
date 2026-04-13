@@ -7,6 +7,10 @@ Safety mechanism:
   If upstream has significantly fewer files (suggesting deletion/wipe),
   the sync is ABORTED. Threshold: upstream < 50% of fork's file count.
 
+NOTE: Authentication relies on gh CLI plaintext token (HTTPS).
+      No passwords/tokens are handled in this code directly.
+      See README.md "认证方式" section for details.
+
 Usage:
   python sync-forks.py                  # Sync all forks now
   python sync-forks.py repo-name        # Sync specific repo (owner/name or just name)
@@ -42,6 +46,9 @@ on:
     - cron: "{cron}"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -50,10 +57,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{{{ secrets.SYNC_PAT }}}}
 
       - name: Safety check — compare file counts
+        env:
+          GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
         run: |
-          git remote add upstream ${{{{ github.event.repository.parent.clone_url }}}}
+          UPSTREAM_URL=$(gh api repos/${{{{ github.repository }}}} --jq '.parent.clone_url')
+          if [ -z "$UPSTREAM_URL" ]; then
+            echo "::error::Cannot determine upstream repo. Not a fork or parent deleted."
+            exit 1
+          fi
+          git remote add upstream "$UPSTREAM_URL"
           git fetch upstream ${{{{ github.event.repository.default_branch }}}}
           FORK_FILES=$(git ls-tree -r --name-only HEAD | wc -l)
           UPSTREAM_FILES=$(git ls-tree -r --name-only upstream/${{{{ github.event.repository.default_branch }}}} | wc -l)
@@ -65,13 +80,13 @@ jobs:
           fi
           echo "Safety check passed."
 
-      - name: Sync upstream changes
-        uses: tgymnich/fork-sync@v1.9
-        with:
-          owner: {owner}
-          token: ${{{{ secrets.GITHUB_TOKEN }}}}
-          base: ${{{{ github.event.repository.default_branch }}}}
-          head: ${{{{ github.event.repository.default_branch }}}}
+      - name: Merge upstream changes
+        env:
+          GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
+        run: |
+          gh api repos/${{{{ github.repository }}}}/merge-upstream \
+            -X POST \
+            -f branch=${{{{ github.event.repository.default_branch }}}}
 '''
 
 

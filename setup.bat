@@ -36,10 +36,15 @@ if %ERRORLEVEL% neq 0 (
 )
 
 :: --- 2. Check / Do Authentication ---
+:: NOTE: Currently uses plaintext token via HTTPS protocol.
+::       The gh CLI stores the OAuth token in plaintext under
+::       %APPDATA%\GitHub CLI\hosts.yml (or ~/.config/gh/hosts.yml).
+::       Upgrade to SSH key / encrypted credential store is planned.
 gh auth status >nul 2>&1
 if %ERRORLEVEL% neq 0 (
     echo.
     echo [2/3] Not authenticated. Starting login...
+    echo   * Using HTTPS protocol with plaintext token storage (temporary)
     echo.
     gh auth login -h github.com -p https -w
     if %ERRORLEVEL% neq 0 (
@@ -48,7 +53,7 @@ if %ERRORLEVEL% neq 0 (
         exit /b 1
     )
 ) else (
-    echo [2/3] Authentication: OK
+    echo [2/3] Authentication: OK ^(plaintext HTTPS token^)
 )
 
 :: --- 3. Check / Add workflow scope ---

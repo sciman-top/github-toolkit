@@ -94,6 +94,16 @@ github-toolkit/
 └── README.md          本文件
 ```
 
+## 认证方式（当前）
+
+> **本项目暂时使用明文方式存储凭据。**
+
+- 通过 `gh auth login` 以 HTTPS 协议认证，OAuth token 以**明文**保存在本地配置文件中：
+  - Windows: `%APPDATA%\GitHub CLI\hosts.yml`
+  - Linux/macOS: `~/.config/gh/hosts.yml`
+- GitHub Actions 工作流使用 `${{ secrets.GITHUB_TOKEN }}`，该令牌由 GitHub 运行时自动注入，不在代码中硬编码。
+- **后续计划**：迁移到 SSH 密钥 或 `gh` 内置 keyring 集成，实现加密凭据存储。
+
 ## 依赖
 
 - Python 3.8+
