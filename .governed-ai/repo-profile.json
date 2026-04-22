@@ -1,0 +1,80 @@
+{
+  "approval_defaults": {
+    "high_requires_explicit_approval": true,
+    "medium_write_requires_approval": true
+  },
+  "branch_policy": {
+    "allow_direct_push": false,
+    "default_branch": "main",
+    "working_branch_prefix": "governed/"
+  },
+  "build_commands": [
+    {
+      "command": "python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py",
+      "id": "build",
+      "required": true
+    }
+  ],
+  "compatibility_signals": [
+    {
+      "capability": "native_attach",
+      "degrade_to": "advisory",
+      "reason": "native adapter capability has not been detected during attachment",
+      "status": "unsupported"
+    }
+  ],
+  "contract_commands": [
+    {
+      "command": "python -m unittest test_toolkit.py",
+      "id": "contract",
+      "required": true
+    }
+  ],
+  "delivery_format": {
+    "include_patch": true,
+    "include_pr_body": true,
+    "summary_template": "default"
+  },
+  "display_name": "github-toolkit",
+  "invariant_commands": [],
+  "lint_commands": [],
+  "path_policies": {
+    "blocked": [
+      ".git/**"
+    ],
+    "read_allow": [
+      "**/*"
+    ],
+    "write_allow": [
+      "src/**",
+      "tests/**",
+      "docs/**"
+    ]
+  },
+  "primary_language": "python",
+  "repo_id": "github-toolkit",
+  "repo_root_locator": {
+    "kind": "local_path",
+    "value": "."
+  },
+  "risk_defaults": {
+    "blocked_command_patterns": [],
+    "default_write_tier": "medium"
+  },
+  "rollout_posture": {
+    "current_mode": "observe",
+    "target_mode": "advisory"
+  },
+  "schema_version": "1.0",
+  "test_commands": [
+    {
+      "command": "python -m unittest test_toolkit.py",
+      "id": "test",
+      "required": true
+    }
+  ],
+  "tool_allowlist": [
+    "shell"
+  ],
+  "typecheck_commands": []
+}

@@ -1,0 +1,109 @@
+name: Integration API Smoke
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Optional specific fork repo (owner/name or name) for dry-run checks"
+        required: false
+        type: string
+  schedule:
+    - cron: "30 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  integration_smoke:
+    if: ${{ secrets.INTEGRATION_GH_TOKEN != '' && secrets.INTEGRATION_EXPECTED_LOGIN != '' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.INTEGRATION_GH_TOKEN }}
+      INTEGRATION_EXPECTED_LOGIN: ${{ secrets.INTEGRATION_EXPECTED_LOGIN }}
+      TARGET_REPO_INPUT: ${{ github.event.inputs.target_repo || '' }}
+      TARGET_REPO_SECRET: ${{ secrets.INTEGRATION_TARGET_REPO }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify integration token principal
+        run: |
+          set -euo pipefail
+          ACTUAL_LOGIN="$(gh api user --jq '.login')"
+          echo "Integration login: ${ACTUAL_LOGIN}"
+          if [ "${ACTUAL_LOGIN}" != "${INTEGRATION_EXPECTED_LOGIN}" ]; then
+            echo "Expected login: ${INTEGRATION_EXPECTED_LOGIN}"
+            echo "Token principal mismatch."
+            exit 1
+          fi
+
+      - name: Compile Python sources
+        run: python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py scripts/benchmark_hotpaths.py
+
+      - name: Integration read-path checks
+        run: |
+          set -euo pipefail
+          python list-forks.py --json > integration-list-forks.json
+          python sync-forks.py --json --dry-run > integration-sync-all-dry-run.json
+
+      - name: Integration specific-repo dry checks
+        run: |
+          set -euo pipefail
+          TARGET="${TARGET_REPO_INPUT}"
+          if [ -z "${TARGET}" ]; then
+            TARGET="${TARGET_REPO_SECRET}"
+          fi
+          if [ -z "${TARGET}" ]; then
+            echo "No target repo configured. Skipping specific-repo dry checks."
+            exit 0
+          fi
+          echo "Target repo: ${TARGET}"
+          python sync-forks.py --json --dry-run "${TARGET}" > integration-sync-target-dry-run.json
+          python sync-forks.py --json --add-workflow --dry-run "${TARGET}" > integration-add-workflow-target-dry-run.json
+
+      - name: Validate integration JSON outputs
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob
+          import json
+          import sys
+
+          paths = sorted(glob.glob("integration-*.json"))
+          if not paths:
+              print("No integration output files found.")
+              sys.exit(1)
+
+          failed = []
+          for path in paths:
+              with open(path, "r", encoding="utf-8") as f:
+                  payload = json.load(f)
+              if payload.get("error"):
+                  failed.append((path, payload.get("error"), payload.get("error_code")))
+
+          if failed:
+              for path, message, error_code in failed:
+                  print(f"{path}: error={message}, error_code={error_code}")
+              sys.exit(1)
+
+          print(f"Validated {len(paths)} integration JSON payload(s).")
+          PY
+
+      - name: Upload integration artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-api-smoke-artifacts
+          path: integration-*.json
+          if-no-files-found: warn
+
+  integration_skipped_notice:
+    if: ${{ !(secrets.INTEGRATION_GH_TOKEN != '' && secrets.INTEGRATION_EXPECTED_LOGIN != '') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip reason
+        run: |
+          echo "Integration API smoke job skipped: set INTEGRATION_GH_TOKEN and INTEGRATION_EXPECTED_LOGIN secrets."

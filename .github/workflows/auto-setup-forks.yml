@@ -1,0 +1,25 @@
+name: Auto-setup fork sync
+on:
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout toolkit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Add sync workflow to new forks
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: python sync-forks.py --add-workflow
