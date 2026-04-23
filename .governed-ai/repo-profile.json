@@ -3,6 +3,19 @@
     "high_requires_explicit_approval": true,
     "medium_write_requires_approval": true
   },
+  "auto_commit_policy": {
+    "enabled": true,
+    "on": [
+      "milestone"
+    ],
+    "milestone_markers": [
+      "checkpoint",
+      "milestone",
+      "release-candidate"
+    ],
+    "require_all_required_gates_pass": true,
+    "commit_message_template": "自动提交：{repo_id} 里程碑 {milestone} 门禁通过 {timestamp}"
+  },
   "branch_policy": {
     "allow_direct_push": false,
     "default_branch": "main",
@@ -57,26 +70,6 @@
     "kind": "local_path",
     "value": "."
   },
-  "risk_defaults": {
-    "blocked_command_patterns": [],
-    "default_write_tier": "medium"
-  },
-  "rollout_posture": {
-    "current_mode": "observe",
-    "target_mode": "advisory"
-  },
-  "schema_version": "1.0",
-  "test_commands": [
-    {
-      "command": "python -m unittest test_toolkit.py",
-      "id": "test",
-      "required": true
-    }
-  ],
-  "tool_allowlist": [
-    "shell"
-  ],
-  "typecheck_commands": [],
   "required_entrypoint_policy": {
     "current_mode": "targeted_enforced",
     "target_mode": "repo_wide_enforced",
@@ -102,17 +95,24 @@
     ],
     "promotion_condition_ref": "docs/governance/entrypoint-promotion.md"
   },
-  "auto_commit_policy": {
-    "enabled": true,
-    "on": [
-      "milestone"
-    ],
-    "milestone_markers": [
-      "checkpoint",
-      "milestone",
-      "release-candidate"
-    ],
-    "require_all_required_gates_pass": true,
-    "commit_message_template": "自动提交：{repo_id} 里程碑 {milestone} 门禁通过 {timestamp}"
-  }
+  "risk_defaults": {
+    "blocked_command_patterns": [],
+    "default_write_tier": "medium"
+  },
+  "rollout_posture": {
+    "current_mode": "observe",
+    "target_mode": "advisory"
+  },
+  "schema_version": "1.0",
+  "test_commands": [
+    {
+      "command": "python -m unittest test_toolkit.py",
+      "id": "test",
+      "required": true
+    }
+  ],
+  "tool_allowlist": [
+    "shell"
+  ],
+  "typecheck_commands": []
 }
