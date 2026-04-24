@@ -20,7 +20,7 @@ jobs:
           python-version: "3.11"
 
       - name: Run compile check
-        run: python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py scripts/benchmark_hotpaths.py
+        run: python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py
 
       - name: Run unit tests
         run: python -m unittest test_toolkit.py
