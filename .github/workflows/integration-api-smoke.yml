@@ -14,7 +14,6 @@ permissions:
 
 jobs:
   integration_smoke:
-    if: ${{ secrets.INTEGRATION_GH_TOKEN != '' && secrets.INTEGRATION_EXPECTED_LOGIN != '' }}
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.INTEGRATION_GH_TOKEN }}
@@ -22,15 +21,29 @@ jobs:
       TARGET_REPO_INPUT: ${{ github.event.inputs.target_repo || '' }}
       TARGET_REPO_SECRET: ${{ secrets.INTEGRATION_TARGET_REPO }}
     steps:
+      - name: Check integration secret availability
+        id: integration_credentials
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ] || [ -z "${INTEGRATION_EXPECTED_LOGIN}" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Integration API smoke skipped: set INTEGRATION_GH_TOKEN and INTEGRATION_EXPECTED_LOGIN secrets."
+            exit 0
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repository
+        if: steps.integration_credentials.outputs.ready == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: steps.integration_credentials.outputs.ready == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Verify integration token principal
+        if: steps.integration_credentials.outputs.ready == 'true'
         run: |
           set -euo pipefail
           ACTUAL_LOGIN="$(gh api user --jq '.login')"
@@ -42,15 +55,18 @@ jobs:
           fi
 
       - name: Compile Python sources
-        run: python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py scripts/benchmark_hotpaths.py
+        if: steps.integration_credentials.outputs.ready == 'true'
+        run: python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py
 
       - name: Integration read-path checks
+        if: steps.integration_credentials.outputs.ready == 'true'
         run: |
           set -euo pipefail
           python list-forks.py --json > integration-list-forks.json
           python sync-forks.py --json --dry-run > integration-sync-all-dry-run.json
 
       - name: Integration specific-repo dry checks
+        if: steps.integration_credentials.outputs.ready == 'true'
         run: |
           set -euo pipefail
           TARGET="${TARGET_REPO_INPUT}"
@@ -66,6 +82,7 @@ jobs:
           python sync-forks.py --json --add-workflow --dry-run "${TARGET}" > integration-add-workflow-target-dry-run.json
 
       - name: Validate integration JSON outputs
+        if: steps.integration_credentials.outputs.ready == 'true'
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -94,16 +111,9 @@ jobs:
           PY
 
       - name: Upload integration artifacts
+        if: steps.integration_credentials.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: integration-api-smoke-artifacts
           path: integration-*.json
           if-no-files-found: warn
-
-  integration_skipped_notice:
-    if: ${{ !(secrets.INTEGRATION_GH_TOKEN != '' && secrets.INTEGRATION_EXPECTED_LOGIN != '') }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Skip reason
-        run: |
-          echo "Integration API smoke job skipped: set INTEGRATION_GH_TOKEN and INTEGRATION_EXPECTED_LOGIN secrets."

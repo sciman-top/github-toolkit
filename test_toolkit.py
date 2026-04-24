@@ -7,7 +7,8 @@ import importlib.util
 import io
 import json
 import os
-import subprocess
+# Tests construct TimeoutExpired only.
+import subprocess  # nosec B404
 import unittest
 try:
     from unittest.mock import Mock, patch
@@ -171,6 +172,15 @@ class TestGhApiErrors(unittest.TestCase):
         self.assertEqual(result["status_code"], 404)
         self.assertFalse(result["retryable"])
 
+    def test_classify_gh_login_hint_as_auth_error(self):
+        result = gh_utils._classify_gh_error(
+            "To get started with GitHub CLI, please run: gh auth login"
+        )
+
+        self.assertEqual(result["error_type"], "auth")
+        self.assertEqual(result["error_code"], "E_GH_AUTH")
+        self.assertFalse(result["retryable"])
+
     @patch("gh_utils.time.sleep", return_value=None)
     @patch("gh_utils.subprocess.run")
     def test_gh_api_retries_transient_server_error(self, mock_run, _mock_sleep):
@@ -208,7 +218,7 @@ class TestGhApiErrors(unittest.TestCase):
 
 
 class TestAuthDetection(unittest.TestCase):
-    @patch.dict("os.environ", {"GH_TOKEN": "token-value"}, clear=False)
+    @patch.dict("os.environ", {"GH_TOKEN": "token-value"}, clear=False)  # nosec
     def test_detect_auth_mode_prefers_gh_token_env(self):
         result = gh_utils.detect_auth_mode()
         self.assertTrue(result["configured"])
@@ -235,6 +245,28 @@ class TestAuthDetection(unittest.TestCase):
 
         self.assertFalse(result["configured"])
         self.assertEqual(result["mode"], "unconfigured")
+
+    @patch("gh_utils.gh_api")
+    @patch("gh_utils.detect_auth_mode")
+    def test_get_auth_context_reports_unconfigured_as_auth_error(
+        self, mock_detect_auth_mode, mock_gh_api
+    ):
+        mock_detect_auth_mode.return_value = {
+            "configured": False,
+            "mode": "unconfigured",
+            "source": None,
+        }
+        mock_gh_api.return_value = {
+            "error": "run gh auth login",
+            "error_type": "unknown",
+            "error_code": "E_GH_UNKNOWN",
+        }
+
+        with self.assertRaises(gh_utils.AuthContextError) as ctx:
+            gh_utils.get_auth_context()
+
+        self.assertEqual(ctx.exception.error_type, "auth")
+        self.assertIn("Not authenticated", ctx.exception.message)
 
 
 # ── get_file_count ────────────────────────────────────────────
@@ -457,6 +489,20 @@ class TestPaginate(unittest.TestCase):
 
 class TestForkDiscovery(unittest.TestCase):
     @patch("gh_utils.gh_api")
+    def test_get_fork_repos_uses_authenticated_owner_repo_endpoint(self, mock_api):
+        mock_api.return_value = []
+
+        result = gh_utils.get_fork_repos("me")
+
+        self.assertEqual(result, [])
+        self.assertTrue(mock_api.call_args_list)
+        self.assertTrue(
+            mock_api.call_args_list[0].args[0].startswith(
+                "user/repos?affiliation=owner&visibility=all&"
+            )
+        )
+
+    @patch("gh_utils.gh_api")
     def test_get_fork_repos_raises_on_initial_discovery_error(self, mock_api):
         mock_api.return_value = {
             "error": "gateway timeout",
@@ -494,6 +540,30 @@ class TestForkDiscovery(unittest.TestCase):
 
         with self.assertRaises(gh_utils.ForkDiscoveryError):
             gh_utils.get_fork_repos("me")
+
+
+class TestWorkflowContracts(unittest.TestCase):
+    def test_integration_smoke_does_not_reference_secrets_in_if_conditions(self):
+        workflow_path = os.path.join(
+            _here, ".github", "workflows", "integration-api-smoke.yml"
+        )
+        with open(workflow_path, "r", encoding="utf-8") as f:
+            workflow = f.read()
+
+        if_lines = [
+            line.strip()
+            for line in workflow.splitlines()
+            if line.strip().startswith("if:")
+        ]
+
+        self.assertTrue(if_lines)
+        self.assertTrue(all("secrets." not in line for line in if_lines))
+        self.assertIn("id: integration_credentials", workflow)
+        self.assertIn(
+            "steps.integration_credentials.outputs.ready == 'true'",
+            workflow,
+        )
+        self.assertIn("test_support.py", workflow)
 
 
 class TestListForks(unittest.TestCase):

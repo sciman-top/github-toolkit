@@ -21,7 +21,8 @@ import json
 import os
 import re
 import shutil
-import subprocess
+# gh CLI is invoked with argv lists only.
+import subprocess  # nosec B404
 import sys
 import time
 
@@ -44,6 +45,12 @@ NETWORK_ERROR_MARKERS = (
     "no such host",
     "temporary failure",
     "tls handshake timeout",
+)
+AUTH_ERROR_MARKERS = (
+    "gh auth login",
+    "not logged into any github hosts",
+    "populate the gh_token",
+    "authentication required",
 )
 HTTP_STATUS_PATTERNS = (
     re.compile(r"\bHTTP\s+(\d{3})\b", re.IGNORECASE),
@@ -159,8 +166,9 @@ def detect_auth_mode(timeout=5):
             capture_output=True,
             encoding="utf-8",
             errors="replace",
+            shell=False,
             timeout=timeout,
-        )
+        )  # nosec B603
     except subprocess.TimeoutExpired:
         return {
             "configured": False,
@@ -199,11 +207,10 @@ def get_auth_context():
         }
 
     detail = user.get("error") if isinstance(user, dict) else None
-    error_type = (
-        user.get("error_type", "auth")
-        if isinstance(user, dict) else
-        "auth"
-    )
+    if auth_info.get("configured") and isinstance(user, dict):
+        error_type = user.get("error_type", "auth")
+    else:
+        error_type = "auth"
 
     if auth_info.get("configured"):
         message = (
@@ -277,6 +284,11 @@ def _classify_gh_error(stderr):
             retryable=True,
         )
 
+    if any(marker in lowered for marker in AUTH_ERROR_MARKERS):
+        return _build_error_result(
+            message, error_type="auth", status_code=status_code,
+        )
+
     if status_code in {401, 403}:
         return _build_error_result(
             message, error_type="auth", status_code=status_code,
@@ -313,8 +325,9 @@ def gh_api(endpoint, method="GET", payload=None, timeout=API_TIMEOUT):
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
+                shell=False,
                 timeout=timeout,
-            )
+            )  # nosec B603
         except subprocess.TimeoutExpired:
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BASE_DELAY * (attempt + 1))
@@ -432,9 +445,13 @@ def build_fork_record(repo):
 def get_fork_repos(username):
     """Return list of fork repo dicts with keys:
     name, full_name, branch, parent, parent_branch.
+
+    ``username`` is retained for the existing helper contract; discovery uses
+    the authenticated-user repository endpoint so private owned forks are
+    visible when the token has access.
     """
     all_repos, page_error = paginate(
-        f"users/{username}/repos?type=forks",
+        "user/repos?affiliation=owner&visibility=all",
         include_error=True,
     )
     if page_error:

@@ -90,6 +90,7 @@ python sync-forks.py --json
 
 GitHub Actions 使用 `${{ secrets.GITHUB_TOKEN }}`，不会把令牌写进代码。
 如果使用环境变量令牌来修改 workflow，请确保令牌具备相应仓库和 workflow 权限。
+fork 发现会使用已认证账号的仓库视图；私有 fork 是否可见取决于令牌或 `gh auth login` 的仓库访问权限。
 
 ### 依赖
 - Python 3.8+
@@ -152,6 +153,8 @@ python list-forks.py --json           # 输出 JSON 状态
 - `list-forks.py --json`
 - `sync-forks.py --json --dry-run`
 - （可选）指定仓库的 `--dry-run` 与 `--add-workflow --dry-run`
+
+如果未配置 `INTEGRATION_GH_TOKEN` 或 `INTEGRATION_EXPECTED_LOGIN`，workflow 会成功退出并记录 skip 原因，不会把缺少集成测试密钥误报为代码失败。
 
 ## 性能基准（热路径）
 提供本地可重复的无网络基准脚本：
