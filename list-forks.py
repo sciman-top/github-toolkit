@@ -62,7 +62,7 @@ def _collect_fork_statuses(forks):
             f"repos/{fork['full_name']}/contents/.github/workflows/sync-fork.yml"
             f"?ref={fork['branch']}"
         )
-        has_workflow = "error" not in wf
+        has_workflow = isinstance(wf, dict) and "error" not in wf
 
         behind_by = None
         compare_head = get_compare_head(fork["parent"], fork["parent_branch"])

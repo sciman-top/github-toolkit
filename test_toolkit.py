@@ -9,7 +9,10 @@ import json
 import os
 import subprocess
 import unittest
-from unittest.mock import Mock, patch
+try:
+    from unittest.mock import Mock, patch
+except OSError:
+    from test_support import Mock, patch
 
 import gh_utils
 from gh_utils import build_fork_record, get_compare_head, get_file_count, paginate
@@ -466,6 +469,32 @@ class TestForkDiscovery(unittest.TestCase):
 
         self.assertIn("Failed to list fork repositories", str(ctx.exception))
 
+    @patch("gh_utils.gh_api")
+    def test_get_fork_repos_raises_on_partial_discovery_error(self, mock_api):
+        first_page = []
+        for i in range(100):
+            first_page.append({
+                "fork": True,
+                "name": f"forked-repo-{i}",
+                "full_name": f"me/forked-repo-{i}",
+                "default_branch": "main",
+                "parent": {
+                    "full_name": f"upstream-owner/forked-repo-{i}",
+                    "default_branch": "main",
+                },
+            })
+        mock_api.side_effect = [
+            first_page,
+            {
+                "error": "gateway timeout",
+                "error_type": "timeout",
+                "retryable": True,
+            },
+        ]
+
+        with self.assertRaises(gh_utils.ForkDiscoveryError):
+            gh_utils.get_fork_repos("me")
+
 
 class TestListForks(unittest.TestCase):
     @patch.object(list_forks, "get_auth_context")
@@ -599,6 +628,39 @@ class TestListForks(unittest.TestCase):
         mock_api.assert_any_call(
             "repos/me/forked-repo/compare/main...upstream-owner:develop"
         )
+
+    @patch.object(list_forks, "get_auth_context")
+    @patch.object(list_forks, "check_gh_cli")
+    def test_json_output_treats_non_dict_workflow_response_as_missing(
+        self, _mock_check, mock_auth_context
+    ):
+        mock_auth_context.return_value = {
+            "username": "me",
+            "auth": {
+                "configured": True,
+                "mode": "env_token",
+                "source": "GH_TOKEN",
+            },
+        }
+        fork = {
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "main",
+            "parent": "upstream-owner/forked-repo",
+            "parent_branch": "main",
+            "parent_owner": "upstream-owner",
+        }
+
+        with patch.object(list_forks, "get_fork_repos", return_value=[fork]):
+            with patch.object(list_forks, "gh_api", side_effect=[[], {"behind_by": 0}]):
+                with patch.object(list_forks.sys, "argv", ["list-forks.py", "--json"]):
+                    with contextlib.redirect_stdout(io.StringIO()) as captured:
+                        exit_code = list_forks.main()
+
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(payload["repos"][0]["workflow_installed"])
+        self.assertEqual(payload["repos"][0]["workflow_status"], "Missing")
 
     @patch.object(list_forks, "get_auth_context")
     @patch.object(list_forks, "check_gh_cli")

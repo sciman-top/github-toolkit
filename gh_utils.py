@@ -437,7 +437,7 @@ def get_fork_repos(username):
         f"users/{username}/repos?type=forks",
         include_error=True,
     )
-    if page_error and not all_repos:
+    if page_error:
         raise ForkDiscoveryError(
             "Failed to list fork repositories from GitHub API.",
             detail=page_error,

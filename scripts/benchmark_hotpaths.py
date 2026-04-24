@@ -13,12 +13,16 @@ import os
 import statistics
 import sys
 import time
-from unittest.mock import patch
 
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
+
+try:
+    from unittest.mock import patch
+except OSError:
+    from test_support import patch
 
 DEFAULT_SIZES = (10, 100, 500)
 DEFAULT_RUNS = 5
