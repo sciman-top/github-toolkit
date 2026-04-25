@@ -770,7 +770,7 @@ class TestListForks(unittest.TestCase):
         }], discovery)
         mock_api.side_effect = [
             {"content": "workflow"},
-            {"behind_by": 4},
+            {"ahead_by": 4, "behind_by": 0},
         ]
 
         with patch.object(list_forks.sys, "argv", ["list-forks.py"]):
@@ -781,6 +781,27 @@ class TestListForks(unittest.TestCase):
         mock_api.assert_any_call(
             "repos/me/forked-repo/compare/main...upstream-owner:develop"
         )
+
+    @patch.object(list_forks, "gh_api")
+    def test_collect_fork_statuses_uses_upstream_ahead_as_behind_count(
+        self, mock_api
+    ):
+        fork = {
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "main",
+            "parent": "upstream-owner/forked-repo",
+            "parent_branch": "main",
+            "parent_owner": "upstream-owner",
+        }
+        mock_api.side_effect = [
+            {"content": "workflow"},
+            {"ahead_by": 3, "behind_by": 0},
+        ]
+
+        rows = list_forks._collect_fork_statuses([fork])
+
+        self.assertEqual(rows[0]["behind_by"], 3)
 
     @patch.object(list_forks, "get_auth_context")
     @patch.object(list_forks, "check_gh_cli")
@@ -817,7 +838,7 @@ class TestListForks(unittest.TestCase):
             "get_fork_repos_with_evidence",
             return_value=([fork], discovery),
         ):
-            with patch.object(list_forks, "gh_api", side_effect=[[], {"behind_by": 0}]):
+            with patch.object(list_forks, "gh_api", side_effect=[[], {"ahead_by": 0}]):
                 with patch.object(list_forks.sys, "argv", ["list-forks.py", "--json"]):
                     with contextlib.redirect_stdout(io.StringIO()) as captured:
                         exit_code = list_forks.main()

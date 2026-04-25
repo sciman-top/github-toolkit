@@ -70,8 +70,8 @@ def _collect_fork_statuses(forks):
             compare = gh_api(
                 f"repos/{fork['full_name']}/compare/{fork['branch']}...{compare_head}"
             )
-            if isinstance(compare, dict) and "behind_by" in compare:
-                behind_by = compare["behind_by"]
+            if isinstance(compare, dict) and "ahead_by" in compare:
+                behind_by = compare["ahead_by"]
 
         rows.append({
             "name": fork["name"],
