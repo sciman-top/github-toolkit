@@ -38,6 +38,7 @@ from gh_utils import (
     get_auth_context,
     get_file_count,
     get_fork_repos,
+    get_fork_repos_with_evidence,
     gh_api,
 )
 
@@ -213,6 +214,24 @@ def _has_workflow_dispatch(workflow_text):
     return False
 
 
+def _missing_workflow_template_markers(workflow_text):
+    """Return current-template markers missing from an existing workflow."""
+    required_markers = (
+        f'cron: "{SYNC_CRON}"',
+        "Resolve upstream",
+        "Create restore point",
+        "Diff guard - inspect deletions",
+        "backup/pre-sync",
+        "critical path deletion detected",
+        "merge-upstream",
+    )
+    return [
+        marker
+        for marker in required_markers
+        if marker not in workflow_text
+    ]
+
+
 def _needs_workflow_update(existing_file):
     """Return (needs_update: bool, reason: str)."""
     if not isinstance(existing_file, dict):
@@ -228,7 +247,14 @@ def _needs_workflow_update(existing_file):
     if not _has_workflow_dispatch(workflow_text):
         return True, "missing workflow_dispatch trigger"
 
-    return False, "already has workflow_dispatch"
+    missing_markers = _missing_workflow_template_markers(workflow_text)
+    if missing_markers:
+        preview = ", ".join(missing_markers[:3])
+        if len(missing_markers) > 3:
+            preview += ", ..."
+        return True, f"workflow template drift: missing {preview}"
+
+    return False, "already matches current workflow template"
 
 def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
                  force=False):
@@ -575,6 +601,7 @@ def _run(parsed):
         "mode": mode,
         "dry_run": dry_run,
         "force": force,
+        "discovery": None,
         "repos": [],
         "summary": {
             "requested": len(specific_repos) if specific_repos else None,
@@ -614,6 +641,10 @@ def _run(parsed):
         print()
 
     if specific_repos:
+        report["discovery"] = {
+            "source": "explicit_args",
+            "requested": unique_specific_repos,
+        }
         if json_output:
             resolve_result, resolve_output = _run_with_captured_stdout(
                 _resolve_specific_forks, username, unique_specific_repos,
@@ -628,7 +659,8 @@ def _run(parsed):
                 unique_specific_repos,
             )
     else:
-        forks = get_fork_repos(username)
+        forks, discovery = get_fork_repos_with_evidence(username)
+        report["discovery"] = discovery
         resolve_errors = False
 
     report["summary"]["resolve_errors"] = int(resolve_errors)

@@ -48,7 +48,8 @@ python sync-forks.py --add-workflow repo-name
 python sync-forks.py --add-workflow --dry-run
 ```
 
-添加后，GitHub Actions 会在每周日 UTC 02:00，也就是北京时间 10:00 自动同步。
+添加后，GitHub Actions 会在每周日 UTC 02:17，也就是北京时间 10:17 自动同步。
+该时间刻意避开 GitHub Actions 整点高峰，降低 scheduled workflow 延迟或被丢弃的概率。
 
 ### 3. 手动同步
 ```powershell

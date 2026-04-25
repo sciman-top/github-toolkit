@@ -16,7 +16,13 @@ except OSError:
     from test_support import Mock, patch
 
 import gh_utils
-from gh_utils import build_fork_record, get_compare_head, get_file_count, paginate
+from gh_utils import (
+    build_fork_record,
+    get_compare_head,
+    get_file_count,
+    get_fork_repos_with_evidence,
+    paginate,
+)
 
 # Load sync-forks module (hyphen in filename prevents normal import)
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -109,10 +115,36 @@ class TestNeedsWorkflowUpdate(unittest.TestCase):
         self.assertTrue(needs)
         self.assertIn("workflow_dispatch", reason)
 
-    def test_has_dispatch_means_no_update(self):
-        text = "on:\n  workflow_dispatch: {}\n"
+    def test_current_template_means_no_update(self):
+        text = sync_forks.WORKFLOW_TEMPLATE.format(cron=sync_forks.SYNC_CRON)
         needs, reason = sync_forks._needs_workflow_update({"content": _encode(text)})
         self.assertFalse(needs)
+        self.assertIn("current workflow template", reason)
+
+    def test_dispatch_only_stale_template_means_update(self):
+        text = """\
+name: Sync Fork
+on:
+  schedule:
+    - cron: "0 2 * * 0"
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    steps:
+      - name: Safety check - compare file counts
+      - name: Merge upstream changes
+"""
+        needs, reason = sync_forks._needs_workflow_update({"content": _encode(text)})
+        self.assertTrue(needs)
+        self.assertIn("workflow template drift", reason)
+        self.assertIn("Create restore point", reason)
+
+    def test_cron_drift_means_update(self):
+        text = sync_forks.WORKFLOW_TEMPLATE.format(cron="30 2 * * 0")
+        needs, reason = sync_forks._needs_workflow_update({"content": _encode(text)})
+        self.assertTrue(needs)
+        self.assertIn("workflow template drift", reason)
 
     def test_unreadable_content_means_update(self):
         needs, reason = sync_forks._needs_workflow_update({"content": "!!bad!!"})
@@ -502,6 +534,35 @@ class TestForkDiscovery(unittest.TestCase):
             )
         )
 
+    @patch("gh_utils.utc_now_iso")
+    @patch("gh_utils.gh_api")
+    def test_get_fork_repos_with_evidence_reports_live_source(
+        self, mock_api, mock_now
+    ):
+        mock_now.return_value = "2026-04-25T10:00:00Z"
+        mock_api.return_value = [{
+            "fork": True,
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "default_branch": "main",
+            "parent": {
+                "full_name": "upstream-owner/forked-repo",
+                "default_branch": "main",
+            },
+        }]
+
+        forks, evidence = get_fork_repos_with_evidence("me")
+
+        self.assertEqual(len(forks), 1)
+        self.assertEqual(evidence["source"], "live_github_api")
+        self.assertEqual(evidence["repo_count"], 1)
+        self.assertEqual(evidence["fork_count"], 1)
+        self.assertEqual(evidence["fetched_at"], "2026-04-25T10:00:00Z")
+        self.assertEqual(
+            evidence["endpoint"],
+            gh_utils.FORK_DISCOVERY_ENDPOINT,
+        )
+
     @patch("gh_utils.gh_api")
     def test_get_fork_repos_raises_on_initial_discovery_error(self, mock_api):
         mock_api.return_value = {
@@ -621,7 +682,19 @@ class TestListForks(unittest.TestCase):
             },
         }
 
-        with patch.object(list_forks, "get_fork_repos", return_value=[]):
+        discovery = {
+            "source": "live_github_api",
+            "endpoint": gh_utils.FORK_DISCOVERY_ENDPOINT,
+            "fetched_at": "2026-04-25T10:00:00Z",
+            "authenticated_user": "me",
+            "repo_count": 5,
+            "fork_count": 0,
+        }
+        with patch.object(
+            list_forks,
+            "get_fork_repos_with_evidence",
+            return_value=([], discovery),
+        ):
             with patch.object(list_forks.sys, "argv", ["list-forks.py", "--json"]):
                 with contextlib.redirect_stdout(io.StringIO()) as captured:
                     exit_code = list_forks.main()
@@ -630,9 +703,11 @@ class TestListForks(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["summary"]["total"], 0)
         self.assertEqual(payload["auth"]["mode"], "env_token")
+        self.assertEqual(payload["discovery"]["source"], "live_github_api")
+        self.assertEqual(payload["discovery"]["repo_count"], 5)
         mock_check.assert_called_once()
 
-    @patch.object(list_forks, "get_fork_repos")
+    @patch.object(list_forks, "get_fork_repos_with_evidence")
     @patch.object(list_forks, "get_auth_context")
     @patch.object(list_forks, "check_gh_cli")
     def test_json_output_handles_fork_discovery_failure(
@@ -663,7 +738,7 @@ class TestListForks(unittest.TestCase):
         self.assertEqual(payload["error_type"], "discovery")
 
     @patch.object(list_forks, "gh_api")
-    @patch.object(list_forks, "get_fork_repos")
+    @patch.object(list_forks, "get_fork_repos_with_evidence")
     @patch.object(list_forks, "get_auth_context")
     @patch.object(list_forks, "check_gh_cli")
     def test_compare_uses_owner_branch_ref(
@@ -677,14 +752,22 @@ class TestListForks(unittest.TestCase):
                 "source": "gh auth login",
             },
         }
-        mock_get_forks.return_value = [{
+        discovery = {
+            "source": "live_github_api",
+            "endpoint": gh_utils.FORK_DISCOVERY_ENDPOINT,
+            "fetched_at": "2026-04-25T10:00:00Z",
+            "authenticated_user": "me",
+            "repo_count": 1,
+            "fork_count": 1,
+        }
+        mock_get_forks.return_value = ([{
             "name": "forked-repo",
             "full_name": "me/forked-repo",
             "branch": "main",
             "parent": "upstream-owner/forked-repo",
             "parent_branch": "develop",
             "parent_owner": "upstream-owner",
-        }]
+        }], discovery)
         mock_api.side_effect = [
             {"content": "workflow"},
             {"behind_by": 4},
@@ -721,7 +804,19 @@ class TestListForks(unittest.TestCase):
             "parent_owner": "upstream-owner",
         }
 
-        with patch.object(list_forks, "get_fork_repos", return_value=[fork]):
+        discovery = {
+            "source": "live_github_api",
+            "endpoint": gh_utils.FORK_DISCOVERY_ENDPOINT,
+            "fetched_at": "2026-04-25T10:00:00Z",
+            "authenticated_user": "me",
+            "repo_count": 1,
+            "fork_count": 1,
+        }
+        with patch.object(
+            list_forks,
+            "get_fork_repos_with_evidence",
+            return_value=([fork], discovery),
+        ):
             with patch.object(list_forks, "gh_api", side_effect=[[], {"behind_by": 0}]):
                 with patch.object(list_forks.sys, "argv", ["list-forks.py", "--json"]):
                     with contextlib.redirect_stdout(io.StringIO()) as captured:
@@ -898,6 +993,8 @@ class TestSyncForksMain(unittest.TestCase):
         self.assertEqual(payload["tool"], "sync-forks")
         self.assertEqual(payload["summary"]["success"], 1)
         self.assertEqual(payload["auth"]["source"], "GH_TOKEN")
+        self.assertEqual(payload["discovery"]["source"], "explicit_args")
+        self.assertEqual(payload["discovery"]["requested"], ["forked-repo"])
         mock_check.assert_called_once()
 
     @patch.object(sync_forks, "get_auth_context")
@@ -1065,7 +1162,7 @@ class TestSyncForksMain(unittest.TestCase):
         self.assertEqual(payload["error_code"], "E_AUTH_CONTEXT_FAILED")
         self.assertEqual(payload["error_type"], "auth")
 
-    @patch.object(sync_forks, "get_fork_repos")
+    @patch.object(sync_forks, "get_fork_repos_with_evidence")
     @patch.object(sync_forks, "get_auth_context")
     @patch.object(sync_forks, "check_gh_cli")
     def test_json_output_returns_structured_fork_discovery_failure(

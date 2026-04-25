@@ -144,7 +144,21 @@ def _bench_sync_all_report(count, runs):
                 "auth": {"configured": True, "mode": "env_token", "source": "GH_TOKEN"},
             },
         ),
-        patch.object(SYNC_FORKS, "get_fork_repos", return_value=forks),
+        patch.object(
+            SYNC_FORKS,
+            "get_fork_repos_with_evidence",
+            return_value=(
+                forks,
+                {
+                    "source": "live_github_api",
+                    "endpoint": "user/repos?affiliation=owner&visibility=all",
+                    "fetched_at": "2026-04-25T10:00:00Z",
+                    "authenticated_user": "bench-user",
+                    "repo_count": count,
+                    "fork_count": count,
+                },
+            ),
+        ),
         patch.object(SYNC_FORKS, "_sync_now_result", return_value=SYNC_FORKS.RESULT_OK),
     ):
 

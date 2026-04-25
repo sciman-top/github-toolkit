@@ -16,7 +16,7 @@ from gh_utils import (
     check_gh_cli,
     get_compare_head,
     get_auth_context,
-    get_fork_repos,
+    get_fork_repos_with_evidence,
     gh_api,
 )
 
@@ -111,7 +111,7 @@ def main():
         auth_context = get_auth_context()
         auth_info = auth_context["auth"]
         username = auth_context["username"]
-        forks = get_fork_repos(username)
+        forks, discovery = get_fork_repos_with_evidence(username)
     except (AuthContextError, ForkDiscoveryError) as exc:
         if parsed["json_output"]:
             print(json.dumps(exc.to_dict("list-forks"), ensure_ascii=False, indent=2))
@@ -126,6 +126,7 @@ def main():
             "tool": "list-forks",
             "user": username,
             "auth": auth_info,
+            "discovery": discovery,
             "summary": {
                 "total": len(rows),
             },
@@ -136,9 +137,19 @@ def main():
 
     if not forks:
         print("No fork repos found.")
+        print(
+            "Discovery: live_github_api "
+            f"{discovery['endpoint']} at {discovery['fetched_at']}"
+        )
         return 0
 
     print(f"Fork repos for {username} ({len(forks)} total):\n")
+    print(
+        "Discovery: live_github_api "
+        f"{discovery['endpoint']} at {discovery['fetched_at']} "
+        f"(repos={discovery['repo_count']}, forks={discovery['fork_count']})"
+    )
+    print()
     print(f"{'Repository':<35} {'Branch':<10} {'Upstream':<35} {'Behind':<8} {'Workflow':<10}")
     print("-" * 103)
 

@@ -25,10 +25,12 @@ import shutil
 import subprocess  # nosec B404
 import sys
 import time
+from datetime import datetime, timezone
 
 # ── Config ────────────────────────────────────────────────────
 DELETION_THRESHOLD = 0.5   # Abort sync if upstream < fork * this
-SYNC_CRON = "0 2 * * 0"   # Every Sunday 02:00 UTC
+SYNC_CRON = "17 2 * * 0"  # Every Sunday 02:17 UTC
+FORK_DISCOVERY_ENDPOINT = "user/repos?affiliation=owner&visibility=all"
 API_TIMEOUT = 30           # Seconds per API call
 MAX_RETRIES = 2            # Retries on transient failures
 RETRY_BASE_DELAY = 2       # Seconds (multiplied by attempt number)
@@ -442,16 +444,25 @@ def build_fork_record(repo):
     }
 
 
-def get_fork_repos(username):
-    """Return list of fork repo dicts with keys:
-    name, full_name, branch, parent, parent_branch.
+def utc_now_iso():
+    """Return a compact UTC timestamp for machine-readable evidence."""
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def get_fork_repos_with_evidence(username):
+    """Return fork repos plus live-discovery evidence.
 
     ``username`` is retained for the existing helper contract; discovery uses
     the authenticated-user repository endpoint so private owned forks are
     visible when the token has access.
     """
     all_repos, page_error = paginate(
-        "user/repos?affiliation=owner&visibility=all",
+        FORK_DISCOVERY_ENDPOINT,
         include_error=True,
     )
     if page_error:
@@ -478,6 +489,23 @@ def get_fork_repos(username):
         fork = build_fork_record({**r, "parent": parent_info})
         if fork:
             forks.append(fork)
+
+    evidence = {
+        "source": "live_github_api",
+        "endpoint": FORK_DISCOVERY_ENDPOINT,
+        "fetched_at": utc_now_iso(),
+        "authenticated_user": username,
+        "repo_count": len(all_repos),
+        "fork_count": len(forks),
+    }
+    return forks, evidence
+
+
+def get_fork_repos(username):
+    """Return list of fork repo dicts with keys:
+    name, full_name, branch, parent, parent_branch.
+    """
+    forks, _evidence = get_fork_repos_with_evidence(username)
     return forks
 
 
