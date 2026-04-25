@@ -1,0 +1,12 @@
+@echo off
+if "%SystemRoot%"=="" set "SystemRoot=C:\Windows"
+if "%WINDIR%"=="" set "WINDIR=%SystemRoot%"
+if "%ComSpec%"=="" set "ComSpec=%SystemRoot%\System32\cmd.exe"
+if "%PROGRAMDATA%"=="" set "PROGRAMDATA=C:\ProgramData"
+if "%ProgramFiles%"=="" set "ProgramFiles=C:\Program Files"
+if "%APPDATA%"=="" if not "%USERPROFILE%"=="" set "APPDATA=%USERPROFILE%\AppData\Roaming"
+if "%LOCALAPPDATA%"=="" if not "%USERPROFILE%"=="" set "LOCALAPPDATA=%USERPROFILE%\AppData\Local"
+echo ;%PATH%; | find /I ";%SystemRoot%\System32;" >nul || set "PATH=%SystemRoot%\System32;%PATH%"
+echo ;%PATH%; | find /I ";%SystemRoot%;" >nul || set "PATH=%SystemRoot%;%PATH%"
+echo ;%PATH%; | find /I ";%SystemRoot%\System32\WindowsPowerShell\v1.0;" >nul || set "PATH=%SystemRoot%\System32\WindowsPowerShell\v1.0;%PATH%"
+if not "%ProgramFiles%"=="" if exist "%ProgramFiles%\GitHub CLI" echo ;%PATH%; | find /I ";%ProgramFiles%\GitHub CLI;" >nul || set "PATH=%ProgramFiles%\GitHub CLI;%PATH%"

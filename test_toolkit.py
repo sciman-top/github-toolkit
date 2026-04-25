@@ -301,6 +301,67 @@ class TestAuthDetection(unittest.TestCase):
         self.assertIn("Not authenticated", ctx.exception.message)
 
 
+class TestWindowsProcessEnvironment(unittest.TestCase):
+    def test_ensure_windows_process_environment_restores_required_vars(self):
+        with patch.object(gh_utils.os, "name", "nt"):
+            with patch.dict(
+                gh_utils.os.environ,
+                {
+                    "USERPROFILE": r"C:\Users\sciman",
+                    "PATH": "",
+                },
+                clear=True,
+            ):
+                repaired = gh_utils.ensure_windows_process_environment()
+
+                self.assertEqual(gh_utils.os.environ["SystemRoot"], r"C:\Windows")
+                self.assertEqual(gh_utils.os.environ["WINDIR"], r"C:\Windows")
+                self.assertEqual(
+                    gh_utils.os.environ["ComSpec"],
+                    r"C:\Windows\System32\cmd.exe",
+                )
+                self.assertEqual(
+                    gh_utils.os.environ["APPDATA"],
+                    r"C:\Users\sciman\AppData\Roaming",
+                )
+                self.assertEqual(
+                    gh_utils.os.environ["LOCALAPPDATA"],
+                    r"C:\Users\sciman\AppData\Local",
+                )
+                self.assertEqual(
+                    gh_utils.os.environ["PROGRAMDATA"],
+                    r"C:\ProgramData",
+                )
+                self.assertEqual(
+                    gh_utils.os.environ["ProgramFiles"],
+                    r"C:\Program Files",
+                )
+                self.assertIn("SystemRoot", repaired)
+
+    def test_windows_environment_scripts_cover_required_variables(self):
+        required = (
+            "SystemRoot",
+            "WINDIR",
+            "ComSpec",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "PROGRAMDATA",
+            "ProgramFiles",
+        )
+        script_paths = (
+            os.path.join(_here, "scripts", "Initialize-WindowsProcessEnvironment.ps1"),
+            os.path.join(_here, "scripts", "Initialize-WindowsProcessEnvironment.cmd"),
+            os.path.join(_here, "scripts", "Verify-WindowsProcessEnvironment.ps1"),
+        )
+
+        for script_path in script_paths:
+            with self.subTest(script=os.path.basename(script_path)):
+                with open(script_path, encoding="utf-8") as handle:
+                    content = handle.read()
+                for name in required:
+                    self.assertIn(name, content)
+
+
 # ── get_file_count ────────────────────────────────────────────
 
 class TestGetFileCount(unittest.TestCase):

@@ -36,6 +36,15 @@ MAX_RETRIES = 2            # Retries on transient failures
 RETRY_BASE_DELAY = 2       # Seconds (multiplied by attempt number)
 MAX_PAGES = 50             # Safety limit for pagination (5000 items)
 AUTH_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+WINDOWS_REQUIRED_ENV_VARS = (
+    "SystemRoot",
+    "WINDIR",
+    "ComSpec",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "ProgramFiles",
+)
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 NETWORK_ERROR_MARKERS = (
     "connection reset",
@@ -70,6 +79,74 @@ ERROR_CODE_BY_ERROR_TYPE = {
     "retry_exhausted": "E_GH_RETRY_EXHAUSTED",
     "unknown": "E_GH_UNKNOWN",
 }
+
+# ── Windows process environment ───────────────────────────────
+
+def _prepend_path_entry(entry):
+    """Prepend a PATH entry if it exists and is not already present."""
+    if not entry or not os.path.isdir(entry):
+        return
+    current = os.environ.get("PATH", "")
+    parts = [p for p in current.split(os.pathsep) if p]
+    if any(os.path.normcase(p) == os.path.normcase(entry) for p in parts):
+        return
+    os.environ["PATH"] = os.pathsep.join([entry] + parts)
+
+
+def ensure_windows_process_environment():
+    """Restore Windows base environment variables commonly stripped by hosts."""
+    if os.name != "nt":
+        return {}
+
+    repaired = {}
+    system_root = (
+        os.environ.get("SystemRoot")
+        or os.environ.get("WINDIR")
+        or os.path.dirname(os.environ.get("ComSpec", ""))
+        or r"C:\Windows"
+    )
+    if os.path.basename(system_root).lower() == "system32":
+        system_root = os.path.dirname(system_root)
+
+    user_profile = os.environ.get("USERPROFILE")
+    if not user_profile:
+        home_drive = os.environ.get("HOMEDRIVE", "")
+        home_path = os.environ.get("HOMEPATH", "")
+        user_profile = f"{home_drive}{home_path}" if home_drive and home_path else None
+
+    defaults = {
+        "SystemRoot": system_root,
+        "WINDIR": system_root,
+        "ComSpec": os.path.join(system_root, "System32", "cmd.exe"),
+        "PROGRAMDATA": os.environ.get("PROGRAMDATA") or r"C:\ProgramData",
+        "ProgramFiles": os.environ.get("ProgramFiles") or r"C:\Program Files",
+    }
+    if user_profile:
+        defaults["APPDATA"] = os.path.join(user_profile, "AppData", "Roaming")
+        defaults["LOCALAPPDATA"] = os.path.join(user_profile, "AppData", "Local")
+
+    for key in WINDOWS_REQUIRED_ENV_VARS:
+        value = defaults.get(key)
+        if value and not os.environ.get(key):
+            os.environ[key] = value
+            repaired[key] = value
+
+    _prepend_path_entry(os.path.join(system_root, "System32"))
+    _prepend_path_entry(system_root)
+    _prepend_path_entry(os.path.join(
+        system_root,
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+    ))
+    _prepend_path_entry(os.path.join(
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        "GitHub CLI",
+    ))
+    return repaired
+
+
+ensure_windows_process_environment()
 
 # ── gh CLI path ───────────────────────────────────────────────
 

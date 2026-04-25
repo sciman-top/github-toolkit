@@ -16,6 +16,7 @@ Fork 仓库自动同步管理工具集，带安全防护机制。
 | `sync-forks.py` | 添加同步 workflow，或执行同步，支持 `--json` |
 | `list-forks.py` | 查看所有 fork 和同步状态，支持 `--json` |
 | `gh_utils.py` | 公共 GitHub 辅助逻辑 |
+| `scripts/Verify-WindowsProcessEnvironment.ps1` | 诊断 Codex/PowerShell 进程环境与 `gh` 可用性 |
 
 ## 安全机制
 同步前会自动做一组保护检查：
@@ -40,6 +41,9 @@ python sync-forks.py --force repo-name
 - 检测或安装 GitHub CLI
 - 浏览器授权登录
 - 配置 workflow 所需权限
+
+`setup.bat` 会先恢复 Windows 基础进程环境变量（`SystemRoot`、`WINDIR`、`ComSpec`、`APPDATA`、`LOCALAPPDATA`、`PROGRAMDATA`、`ProgramFiles`）。
+这是为了避免某些 Agent/Codex shell 缺少基础变量时，`gh` 找不到本地 keyring、配置目录或网络栈，从而被误判为“未登录”。
 
 ### 2. 给 fork 添加自动同步
 ```powershell
@@ -93,6 +97,29 @@ GitHub Actions 使用 `${{ secrets.GITHUB_TOKEN }}`，不会把令牌写进代�
 如果使用环境变量令牌来修改 workflow，请确保令牌具备相应仓库和 workflow 权限。
 fork 发现会使用已认证账号的仓库视图；私有 fork 是否可见取决于令牌或 `gh auth login` 的仓库访问权限。
 
+### Codex / PowerShell 环境诊断
+如果在普通终端里 `gh auth status` 正常，但在 Codex shell 或自动化进程里失败，先运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Verify-WindowsProcessEnvironment.ps1
+```
+
+该诊断会先 dot-source `scripts/Initialize-WindowsProcessEnvironment.ps1`，补齐当前进程缺失的 Windows 基础变量，再检查：
+
+- 必需环境变量是否存在
+- `SystemRoot`、`APPDATA`、`LOCALAPPDATA` 路径是否可读
+- `gh` 是否在 `PATH` 中
+- `gh auth status` 是否可用
+- Python 是否能解析 `api.github.com`
+
+如果只想检查环境变量和 PATH，不访问 GitHub 认证状态：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Verify-WindowsProcessEnvironment.ps1 -SkipGh
+```
+
+Python 入口也会在导入 `gh_utils.py` 时自动补齐同一组 Windows 基础变量，所以直接执行 `python sync-forks.py --json` 或 `python list-forks.py --json` 时也具备同样的防护。
+
 ### 依赖
 - Python 3.8+
 - GitHub CLI (`gh`)
@@ -105,6 +132,7 @@ github-toolkit/
 ├── sync-forks.py      同步与 workflow 管理核心
 ├── list-forks.py      状态查看
 ├── gh_utils.py        GitHub API / CLI 辅助函数
+├── scripts/           诊断、基准与辅助脚本
 └── README.md          本文件
 ```
 
@@ -174,5 +202,6 @@ python scripts/benchmark_hotpaths.py --sizes 10,100,500 --runs 5 --check --outpu
 - 如果上游仓库发生删除或大规模清空，默认会拒绝同步
 - 如果需要调试同步流程，优先使用 `--dry-run`
 - 如果要接入外部脚本，优先使用 `--json`
+- 如果 `gh` 在 Codex shell 中报未登录，先跑 `scripts/Verify-WindowsProcessEnvironment.ps1`
 - 不要把本地认证文件提交到仓库
 - 不要把 `.env`、令牌文件或私钥提交到仓库

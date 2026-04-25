@@ -2,6 +2,8 @@
 chcp 65001 >nul 2>&1
 setlocal enabledelayedexpansion
 
+call "%~dp0scripts\Initialize-WindowsProcessEnvironment.cmd"
+
 echo ============================================
 echo   GitHub Toolkit - Setup
 echo ============================================
