@@ -278,7 +278,7 @@ def get_auth_context():
     """Return username + auth info, or raise AuthContextError on failure."""
     auth_info = detect_auth_mode()
     user = gh_api("user")
-    username = user.get("login")
+    username = user.get("login") if isinstance(user, dict) else None
     if username:
         return {
             "username": username,
@@ -509,6 +509,8 @@ def build_fork_record(repo):
         return None
 
     parent_info = repo.get("parent") or {}
+    if not isinstance(parent_info, dict):
+        parent_info = {}
     parent_full_name = parent_info.get("full_name", "unknown")
 
     return {
@@ -554,13 +556,19 @@ def get_fork_repos_with_evidence(username):
             continue
         if not r.get("fork"):
             continue
-        full_name = r["full_name"]
+        full_name = r.get("full_name")
+        if not full_name:
+            continue
         # List API omits parent info — fetch per-repo for full details
         parent_info = r.get("parent")
+        if not isinstance(parent_info, dict):
+            parent_info = {}
         if not parent_info or not parent_info.get("full_name"):
             detail = gh_api(f"repos/{full_name}")
             if isinstance(detail, dict) and "error" not in detail:
                 parent_info = detail.get("parent") or {}
+                if not isinstance(parent_info, dict):
+                    parent_info = {}
             else:
                 parent_info = {}
         fork = build_fork_record({**r, "parent": parent_info})
@@ -589,9 +597,18 @@ def get_fork_repos(username):
 def get_file_count(repo_name, branch):
     """Return blob count in a repo branch, or None on error/truncation."""
     result = gh_api(f"repos/{repo_name}/git/trees/{branch}?recursive=1")
+    if not isinstance(result, dict):
+        return None
     if "error" in result:
         return None
     if result.get("truncated"):
         print(f"  WARN: Tree for {repo_name} is truncated, file count unreliable.")
         return None
-    return sum(1 for item in result.get("tree", []) if item.get("type") == "blob")
+    tree = result.get("tree", [])
+    if not isinstance(tree, list):
+        return None
+    return sum(
+        1
+        for item in tree
+        if isinstance(item, dict) and item.get("type") == "blob"
+    )

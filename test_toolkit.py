@@ -100,6 +100,16 @@ class TestHasWorkflowDispatch(unittest.TestCase):
             )
         )
 
+    def test_inline_dispatch(self):
+        self.assertTrue(
+            sync_forks._has_workflow_dispatch("on: { workflow_dispatch: {} }\n")
+        )
+
+    def test_similar_key_is_not_dispatch(self):
+        self.assertFalse(
+            sync_forks._has_workflow_dispatch("on:\n  not_workflow_dispatch: {}\n")
+        )
+
 
 # ── _needs_workflow_update ────────────────────────────────────
 
@@ -108,6 +118,15 @@ class TestNeedsWorkflowUpdate(unittest.TestCase):
         needs, reason = sync_forks._needs_workflow_update({"error": "404"})
         self.assertTrue(needs)
         self.assertEqual(reason, "missing file")
+
+    def test_non_not_found_error_means_unverified(self):
+        needs, reason = sync_forks._needs_workflow_update({
+            "error": "gh: Forbidden (HTTP 403)",
+            "error_type": "auth",
+            "status_code": 403,
+        })
+        self.assertTrue(needs)
+        self.assertEqual(reason, "cannot verify existing workflow")
 
     def test_no_dispatch_means_update(self):
         text = "name: test\non: push\n"
@@ -146,6 +165,15 @@ jobs:
         self.assertTrue(needs)
         self.assertIn("workflow template drift", reason)
 
+    def test_stale_merge_upstream_branch_means_update(self):
+        text = sync_forks.WORKFLOW_TEMPLATE.format(cron=sync_forks.SYNC_CRON).replace(
+            "branch=${{ github.event.repository.default_branch }}",
+            "branch=${{ steps.upstream.outputs.branch }}",
+        )
+        needs, reason = sync_forks._needs_workflow_update({"content": _encode(text)})
+        self.assertTrue(needs)
+        self.assertIn("workflow template drift", reason)
+
     def test_unreadable_content_means_update(self):
         needs, reason = sync_forks._needs_workflow_update({"content": "!!bad!!"})
         self.assertTrue(needs)
@@ -155,6 +183,65 @@ jobs:
         needs, reason = sync_forks._needs_workflow_update(["not-a-dict"])
         self.assertTrue(needs)
         self.assertIn("invalid workflow metadata payload", reason)
+
+
+class TestAddSyncWorkflow(unittest.TestCase):
+    @patch.object(sync_forks, "gh_api")
+    def test_lookup_auth_error_fails_closed_even_in_dry_run(self, mock_api):
+        mock_api.return_value = {
+            "error": "gh: Forbidden (HTTP 403)",
+            "error_type": "auth",
+            "status_code": 403,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._add_sync_workflow_result(
+                "me/forked-repo",
+                "main",
+                dry_run=True,
+            )
+
+        self.assertEqual(result, sync_forks.RESULT_ERROR)
+        self.assertIn("Cannot verify existing sync-fork.yml", captured.getvalue())
+        self.assertEqual(mock_api.call_count, 1)
+
+    @patch.object(sync_forks, "gh_api")
+    def test_missing_workflow_can_be_added_in_dry_run(self, mock_api):
+        mock_api.return_value = {
+            "error": "gh: Not Found (HTTP 404)",
+            "error_type": "not_found",
+            "status_code": 404,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._add_sync_workflow_result(
+                "me/forked-repo",
+                "main",
+                dry_run=True,
+            )
+
+        self.assertEqual(result, sync_forks.RESULT_OK)
+        self.assertIn("Would add sync-fork.yml", captured.getvalue())
+
+    @patch.object(sync_forks, "gh_api")
+    def test_invalid_update_response_fails(self, mock_api):
+        mock_api.side_effect = [
+            {
+                "error": "gh: Not Found (HTTP 404)",
+                "error_type": "not_found",
+                "status_code": 404,
+            },
+            [],
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._add_sync_workflow_result(
+                "me/forked-repo",
+                "main",
+            )
+
+        self.assertEqual(result, sync_forks.RESULT_ERROR)
+        self.assertIn("Invalid workflow update response", captured.getvalue())
 
 
 # ── get_file_count ────────────────────────────────────────────
@@ -187,6 +274,19 @@ class TestForkMetadataHelpers(unittest.TestCase):
 
     def test_build_fork_record_rejects_non_forks(self):
         self.assertIsNone(build_fork_record({"fork": False}))
+
+    def test_build_fork_record_handles_malformed_parent(self):
+        record = build_fork_record({
+            "fork": True,
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "default_branch": "main",
+            "parent": "not-a-dict",
+        })
+
+        self.assertEqual(record["parent"], "unknown")
+        self.assertEqual(record["parent_branch"], "main")
+        self.assertIsNone(record["parent_owner"])
 
 
 class TestGhApiErrors(unittest.TestCase):
@@ -394,6 +494,16 @@ class TestGetFileCount(unittest.TestCase):
         mock_api.return_value = {"tree": []}
         self.assertEqual(get_file_count("repo", "main"), 0)
 
+    @patch("gh_utils.gh_api")
+    def test_non_dict_tree_response_returns_none(self, mock_api):
+        mock_api.return_value = []
+        self.assertIsNone(get_file_count("repo", "main"))
+
+    @patch("gh_utils.gh_api")
+    def test_malformed_tree_returns_none(self, mock_api):
+        mock_api.return_value = {"tree": "not-a-list"}
+        self.assertIsNone(get_file_count("repo", "main"))
+
 
 # ── safety_check ──────────────────────────────────────────────
 
@@ -480,6 +590,26 @@ class TestSafetyCheck(unittest.TestCase):
 
     @patch.object(sync_forks, "gh_api")
     @patch.object(sync_forks, "get_file_count")
+    def test_malformed_deletion_count_aborts(self, mock_gfc, mock_api):
+        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 105
+        mock_api.return_value = {"total_deletions": "many", "files": []}
+
+        self.assertFalse(
+            sync_forks.safety_check("f", "main", "u/repo", "main")
+        )
+
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "get_file_count")
+    def test_malformed_files_payload_aborts(self, mock_gfc, mock_api):
+        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 105
+        mock_api.return_value = {"total_deletions": 0, "files": "not-a-list"}
+
+        self.assertFalse(
+            sync_forks.safety_check("f", "main", "u/repo", "main")
+        )
+
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "get_file_count")
     def test_exact_threshold_passes(self, mock_gfc, mock_api):
         # 50 files * 0.5 = 25 threshold, upstream=25 should pass
         mock_gfc.side_effect = lambda repo, _: 50 if repo == "f" else 25
@@ -500,6 +630,47 @@ class TestSafetyCheck(unittest.TestCase):
 
 class TestSyncNowResult(unittest.TestCase):
     @patch.object(sync_forks, "gh_api")
+    def test_restore_point_invalid_head_response_aborts(self, mock_api):
+        mock_api.return_value = []
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._create_restore_point("me/fork", "main")
+
+        self.assertFalse(result)
+        self.assertIn("Cannot read current fork head", captured.getvalue())
+
+    @patch.object(sync_forks, "gh_api")
+    def test_restore_point_invalid_update_response_aborts(self, mock_api):
+        mock_api.side_effect = [
+            {"object": {"sha": "0123456789abcdef"}},
+            [],
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._create_restore_point("me/fork", "main")
+
+        self.assertFalse(result)
+        self.assertIn("Cannot update restore point branch", captured.getvalue())
+
+    @patch.object(sync_forks, "gh_api")
+    def test_restore_point_invalid_create_response_aborts(self, mock_api):
+        mock_api.side_effect = [
+            {"object": {"sha": "0123456789abcdef"}},
+            {
+                "error": "gh: Not Found (HTTP 404)",
+                "error_type": "not_found",
+                "status_code": 404,
+            },
+            [],
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._create_restore_point("me/fork", "main")
+
+        self.assertFalse(result)
+        self.assertIn("Cannot create restore point branch", captured.getvalue())
+
+    @patch.object(sync_forks, "gh_api")
     @patch.object(sync_forks, "safety_check")
     def test_sync_creates_restore_point_before_merge(self, mock_safety, mock_api):
         mock_safety.return_value = sync_forks.SAFE
@@ -515,6 +686,27 @@ class TestSyncNowResult(unittest.TestCase):
         self.assertEqual(mock_api.call_args_list[0].args[0], "repos/me/fork/git/ref/heads/main")
         self.assertEqual(mock_api.call_args_list[1].args[0], "repos/me/fork/git/refs/heads/backup/pre-sync")
         self.assertEqual(mock_api.call_args_list[2].args[0], "repos/me/fork/merge-upstream")
+
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "safety_check")
+    def test_invalid_merge_response_returns_error(self, mock_safety, mock_api):
+        mock_safety.return_value = sync_forks.SAFE
+        mock_api.side_effect = [
+            {"object": {"sha": "0123456789abcdef"}},
+            {"ref": "refs/heads/backup/pre-sync"},
+            [],
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._sync_now_result(
+                "me/fork",
+                "main",
+                "upstream/repo",
+                "main",
+            )
+
+        self.assertEqual(result, sync_forks.RESULT_ERROR)
+        self.assertIn("Invalid merge-upstream response", captured.getvalue())
 
     @patch.object(sync_forks, "gh_api")
     @patch.object(sync_forks, "safety_check")
@@ -663,6 +855,21 @@ class TestForkDiscovery(unittest.TestCase):
         with self.assertRaises(gh_utils.ForkDiscoveryError):
             gh_utils.get_fork_repos("me")
 
+    @patch("gh_utils.gh_api")
+    def test_get_fork_repos_skips_malformed_repo_without_full_name(self, mock_api):
+        mock_api.return_value = [{
+            "fork": True,
+            "name": "forked-repo",
+            "default_branch": "main",
+            "parent": "not-a-dict",
+        }]
+
+        forks, evidence = get_fork_repos_with_evidence("me")
+
+        self.assertEqual(forks, [])
+        self.assertEqual(evidence["repo_count"], 1)
+        self.assertEqual(evidence["fork_count"], 0)
+
 
 class TestWorkflowContracts(unittest.TestCase):
     def test_integration_smoke_does_not_reference_secrets_in_if_conditions(self):
@@ -686,6 +893,18 @@ class TestWorkflowContracts(unittest.TestCase):
             workflow,
         )
         self.assertIn("test_support.py", workflow)
+
+    def test_generated_workflow_syncs_fork_default_branch(self):
+        workflow = sync_forks.WORKFLOW_TEMPLATE.format(cron=sync_forks.SYNC_CRON)
+        merge_lines = [
+            line
+            for line in workflow.splitlines()
+            if "merge-upstream" in line and "-f branch=" in line
+        ]
+
+        self.assertEqual(len(merge_lines), 1)
+        self.assertIn("github.event.repository.default_branch", merge_lines[0])
+        self.assertNotIn("steps.upstream.outputs.branch", merge_lines[0])
 
 
 class TestListForks(unittest.TestCase):
@@ -728,6 +947,16 @@ class TestListForks(unittest.TestCase):
         self.assertIn("Unknown argument", payload["error"])
         self.assertEqual(payload["error_code"], "E_CLI_UNKNOWN_ARGUMENT")
         self.assertEqual(payload["error_type"], "cli")
+
+    def test_unknown_args_return_json_when_json_flag_is_last(self):
+        with patch.object(list_forks.sys, "argv", ["list-forks.py", "--bad-flag", "--json"]):
+            with contextlib.redirect_stdout(io.StringIO()) as captured:
+                exit_code = list_forks.main()
+
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["tool"], "list-forks")
+        self.assertEqual(payload["error_code"], "E_CLI_UNKNOWN_ARGUMENT")
 
     @patch.object(list_forks, "get_auth_context")
     @patch.object(list_forks, "check_gh_cli")
@@ -977,6 +1206,16 @@ class TestSyncForksMain(unittest.TestCase):
         self.assertEqual(payload["error_code"], "E_CLI_UNKNOWN_OPTION")
         self.assertEqual(payload["error_type"], "cli")
 
+    def test_unknown_option_returns_json_when_json_flag_is_last(self):
+        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--bad-flag", "--json"]):
+            with contextlib.redirect_stdout(io.StringIO()) as captured:
+                exit_code = sync_forks.main()
+
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
+        self.assertEqual(payload["tool"], "sync-forks")
+        self.assertEqual(payload["error_code"], "E_CLI_UNKNOWN_OPTION")
+
     @patch.object(sync_forks, "get_auth_context")
     @patch.object(sync_forks, "check_gh_cli")
     def test_force_sync_requires_explicit_confirmation(
@@ -1124,6 +1363,27 @@ class TestSyncForksMain(unittest.TestCase):
                     exit_code = sync_forks.main()
 
         self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
+
+    @patch.object(sync_forks, "get_auth_context")
+    @patch.object(sync_forks, "check_gh_cli")
+    def test_invalid_specific_repo_response_returns_exit_error(
+        self, _mock_check, mock_auth_context
+    ):
+        mock_auth_context.return_value = {
+            "username": "me",
+            "auth": {
+                "configured": True,
+                "mode": "gh_login",
+                "source": "gh auth login",
+            },
+        }
+        with patch.object(sync_forks, "gh_api", return_value=[]):
+            with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "broken"]):
+                with contextlib.redirect_stdout(io.StringIO()) as captured:
+                    exit_code = sync_forks.main()
+
+        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
+        self.assertIn("invalid repository response", captured.getvalue())
 
     @patch.object(sync_forks, "_add_sync_workflow_result")
     @patch.object(sync_forks, "_resolve_specific_forks")

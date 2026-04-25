@@ -25,6 +25,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 
 from gh_utils import (
@@ -58,6 +59,7 @@ RESULT_SAFETY = "safety"
 RESULT_ERROR = "error"
 FORCE_SYNC_ACK_ENV = "SYNC_FORKS_FORCE_ACK"
 FORCE_SYNC_ACK_VALUE = "I_UNDERSTAND"
+WORKFLOW_DISPATCH_RE = re.compile(r"(?<![A-Za-z0-9_-])workflow_dispatch\s*:")
 
 HELP_TEXT = """\
 Usage:
@@ -181,7 +183,8 @@ jobs:
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
         run: |
-          gh api repos/${{{{ github.repository }}}}/merge-upstream -X POST -f branch=${{{{ steps.upstream.outputs.branch }}}}
+          set -euo pipefail
+          gh api repos/${{{{ github.repository }}}}/merge-upstream -X POST -f branch=${{{{ github.event.repository.default_branch }}}}
 '''
 
 
@@ -209,7 +212,7 @@ def _has_workflow_dispatch(workflow_text):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if "workflow_dispatch" in stripped:
+        if WORKFLOW_DISPATCH_RE.search(stripped):
             return True
     return False
 
@@ -224,6 +227,7 @@ def _missing_workflow_template_markers(workflow_text):
         "backup/pre-sync",
         "critical path deletion detected",
         "merge-upstream",
+        "merge-upstream -X POST -f branch=${{ github.event.repository.default_branch }}",
     )
     return [
         marker
@@ -238,6 +242,8 @@ def _needs_workflow_update(existing_file):
         return True, "invalid workflow metadata payload"
 
     if "error" in existing_file:
+        if not _is_not_found_error(existing_file):
+            return True, "cannot verify existing workflow"
         return True, "missing file"
 
     workflow_text = _decode_workflow_content(existing_file)
@@ -255,6 +261,25 @@ def _needs_workflow_update(existing_file):
         return True, f"workflow template drift: missing {preview}"
 
     return False, "already matches current workflow template"
+
+
+def _parse_nonnegative_int(value):
+    """Return value as a non-negative int, or None when malformed."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
+def _short_error(payload, default="invalid response payload"):
+    """Return a bounded, printable error detail for CLI logs."""
+    if isinstance(payload, dict):
+        return str(payload.get("error", default))[:200]
+    return default
+
 
 def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
                  force=False):
@@ -296,12 +321,23 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
         print("  ABORT: Cannot inspect upstream diff safely.")
         return ABORT
 
-    total_deletions = int(compare.get("total_deletions", 0) or 0)
-    deleted_files = [
-        item.get("filename", "")
-        for item in compare.get("files", [])
-        if item.get("status") == "removed"
-    ]
+    total_deletions = _parse_nonnegative_int(compare.get("total_deletions", 0) or 0)
+    if total_deletions is None:
+        print("  ABORT: Compare response deletion count is malformed.")
+        return ABORT
+
+    files = compare.get("files", [])
+    if not isinstance(files, list):
+        print("  ABORT: Compare response files payload is malformed.")
+        return ABORT
+
+    deleted_files = []
+    for item in files:
+        if not isinstance(item, dict):
+            print("  ABORT: Compare response file entry is malformed.")
+            return ABORT
+        if item.get("status") == "removed":
+            deleted_files.append(item.get("filename", ""))
     deletion_limit = 5 + (fork_count // 10)
 
     print(f"  Deletions: {total_deletions} (limit: {deletion_limit})")
@@ -331,6 +367,13 @@ def _add_sync_workflow_result(repo_name, branch, dry_run=False, force=False):
     existing = gh_api(
         f"repos/{repo_name}/contents/.github/workflows/sync-fork.yml?ref={branch}"
     )
+    if not isinstance(existing, dict):
+        print("  FAIL: Cannot verify existing sync-fork.yml: invalid metadata payload")
+        return RESULT_ERROR
+    if "error" in existing and not _is_not_found_error(existing):
+        print(f"  FAIL: Cannot verify existing sync-fork.yml: {existing['error'][:200]}")
+        return RESULT_ERROR
+
     needs_update, reason = _needs_workflow_update(existing)
     has_existing = (
         isinstance(existing, dict)
@@ -339,7 +382,7 @@ def _add_sync_workflow_result(repo_name, branch, dry_run=False, force=False):
     )
 
     if has_existing and not needs_update and not force:
-        print("  SKIP: sync-fork.yml already includes workflow_dispatch")
+        print("  SKIP: sync-fork.yml already matches current workflow template")
         return RESULT_OK
 
     content = WORKFLOW_TEMPLATE.format(cron=SYNC_CRON)
@@ -367,8 +410,11 @@ def _add_sync_workflow_result(repo_name, branch, dry_run=False, force=False):
         payload=payload,
     )
 
+    if not isinstance(result, dict):
+        print("  FAIL: Invalid workflow update response.")
+        return RESULT_ERROR
     if "error" in result:
-        print(f"  FAIL: {result['error'][:200]}")
+        print(f"  FAIL: {_short_error(result)}")
         return RESULT_ERROR
 
     url = result.get("content", {}).get("html_url", "ok")
@@ -382,19 +428,35 @@ def add_sync_workflow(repo_name, branch, _username=None, dry_run=False, force=Fa
     return _add_sync_workflow_result(repo_name, branch, dry_run, force) == RESULT_OK
 
 
-def _is_not_found_error(error_message):
-    """Return True when an error message indicates HTTP 404 / not found."""
-    lowered = (error_message or "").lower()
-    return "not found" in lowered or "http 404" in lowered or "(404)" in lowered
+def _is_not_found_error(error_payload):
+    """Return True when an error payload/message indicates HTTP 404."""
+    if isinstance(error_payload, dict):
+        if (
+            error_payload.get("error_type") == "not_found"
+            or error_payload.get("error_code") == "E_GH_NOT_FOUND"
+            or error_payload.get("status_code") == 404
+        ):
+            return True
+        error_message = error_payload.get("error")
+    else:
+        error_message = error_payload
+
+    lowered = (error_message or "").strip().lower()
+    return (
+        lowered == "404"
+        or "not found" in lowered
+        or "http 404" in lowered
+        or "(404)" in lowered
+    )
 
 
 def _create_restore_point(fork_name, fork_branch):
     """Create or update backup/pre-sync to the current fork branch head."""
     backup_ref = "backup/pre-sync"
     head_ref = gh_api(f"repos/{fork_name}/git/ref/heads/{fork_branch}")
-    if "error" in head_ref:
+    if not isinstance(head_ref, dict) or "error" in head_ref:
         print("  ABORT: Cannot read current fork head for restore point.")
-        print(f"  Detail: {head_ref['error'][:200]}")
+        print(f"  Detail: {_short_error(head_ref)}")
         return False
 
     head_sha = (head_ref.get("object") or {}).get("sha")
@@ -407,13 +469,18 @@ def _create_restore_point(fork_name, fork_branch):
         method="PATCH",
         payload={"sha": head_sha, "force": True},
     )
-    if "error" not in update_result:
+    if isinstance(update_result, dict) and "error" not in update_result:
         print(f"  Restore point updated: {backup_ref} -> {head_sha[:12]}")
         return True
 
-    if not _is_not_found_error(update_result.get("error")):
+    if not isinstance(update_result, dict):
         print("  ABORT: Cannot update restore point branch.")
-        print(f"  Detail: {update_result['error'][:200]}")
+        print(f"  Detail: {_short_error(update_result)}")
+        return False
+
+    if not _is_not_found_error(update_result):
+        print("  ABORT: Cannot update restore point branch.")
+        print(f"  Detail: {_short_error(update_result)}")
         return False
 
     create_result = gh_api(
@@ -421,9 +488,9 @@ def _create_restore_point(fork_name, fork_branch):
         method="POST",
         payload={"ref": f"refs/heads/{backup_ref}", "sha": head_sha},
     )
-    if "error" in create_result:
+    if not isinstance(create_result, dict) or "error" in create_result:
         print("  ABORT: Cannot create restore point branch.")
-        print(f"  Detail: {create_result['error'][:200]}")
+        print(f"  Detail: {_short_error(create_result)}")
         return False
 
     print(f"  Restore point created: {backup_ref} -> {head_sha[:12]}")
@@ -457,6 +524,10 @@ def _sync_now_result(fork_name, fork_branch, upstream_name, upstream_branch,
         payload={"branch": fork_branch},
     )
 
+    if not isinstance(result, dict):
+        print("  FAIL: Invalid merge-upstream response.")
+        return RESULT_ERROR
+
     if "error" in result:
         err = result["error"].lower()
         if "already up to date" in err or "no new commits" in err:
@@ -487,14 +558,18 @@ def _resolve_specific_forks(username, repo_names):
     for name in repo_names:
         full = name if "/" in name else f"{username}/{name}"
         repo = gh_api(f"repos/{full}")
-        if "error" in repo:
-            print(f"Error: {name} — {repo['error'][:100]}")
+        if isinstance(repo, dict) and "error" in repo:
+            print(f"Error: {name} - {_short_error(repo)[:100]}")
+            had_errors = True
+            continue
+        if not isinstance(repo, dict):
+            print(f"Error: {name} - invalid repository response.")
             had_errors = True
             continue
 
         fork = build_fork_record(repo)
         if not fork:
-            print(f"Error: {name} — target repo is not a fork.")
+            print(f"Error: {name} - target repo is not a fork.")
             had_errors = True
             continue
         forks.append(fork)
@@ -529,7 +604,7 @@ def _parse_cli_args(argv):
         "dry_run": False,
         "force": False,
         "add_mode": False,
-        "json_output": False,
+        "json_output": "--json" in argv,
         "specific_repos": [],
         "show_help": False,
         "error": None,

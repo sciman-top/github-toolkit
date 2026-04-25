@@ -31,7 +31,7 @@ Usage:
 def _parse_cli_args(argv):
     """Parse list-forks CLI args."""
     show_help = False
-    json_output = False
+    json_output = "--json" in argv
 
     for arg in argv:
         if arg in {"-h", "--help"}:

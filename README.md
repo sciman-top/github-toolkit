@@ -93,8 +93,8 @@ python sync-forks.py --json
 - Windows: `%APPDATA%\GitHub CLI\hosts.yml`
 - Linux/macOS: `~/.config/gh/hosts.yml`
 
-GitHub Actions 使用 `${{ secrets.GITHUB_TOKEN }}`，不会把令牌写进代码。
-如果使用环境变量令牌来修改 workflow，请确保令牌具备相应仓库和 workflow 权限。
+本仓库的 CI 使用 GitHub Actions 默认令牌；生成到 fork 仓库的同步 workflow 使用 `${{ secrets.SYNC_PAT }}`，不会把令牌写进代码。
+如果使用环境变量令牌或 `SYNC_PAT` 来修改 workflow，请确保令牌具备相应仓库和 workflow 权限。
 fork 发现会使用已认证账号的仓库视图；私有 fork 是否可见取决于令牌或 `gh auth login` 的仓库访问权限。
 
 ### Codex / PowerShell 环境诊断
