@@ -42,8 +42,8 @@ python sync-forks.py --force repo-name
 - 浏览器授权登录
 - 配置 workflow 所需权限
 
-`setup.bat` 会先恢复 Windows 基础进程环境变量（`SystemRoot`、`WINDIR`、`ComSpec`、`APPDATA`、`LOCALAPPDATA`、`PROGRAMDATA`、`ProgramFiles`）。
-这是为了避免某些 Agent/Codex shell 缺少基础变量时，`gh` 找不到本地 keyring、配置目录或网络栈，从而被误判为“未登录”。
+`setup.bat` 会先恢复 Windows 基础进程环境变量（`SystemRoot`、`WINDIR`、`ComSpec`、`APPDATA`、`LOCALAPPDATA`、`PROGRAMDATA`、`ProgramFiles`），并从安全白名单补入代理变量（`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`）。
+这是为了避免某些 Agent/Codex shell 缺少基础变量或代理变量时，`gh` 找不到本地 keyring、配置目录或网络栈，从而被误判为“未登录”或“DNS/网络失败”。
 
 ### 2. 给 fork 添加自动同步
 ```powershell
@@ -104,10 +104,11 @@ fork 发现会使用已认证账号的仓库视图；私有 fork 是否可见取
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Verify-WindowsProcessEnvironment.ps1
 ```
 
-该诊断会先 dot-source `scripts/Initialize-WindowsProcessEnvironment.ps1`，补齐当前进程缺失的 Windows 基础变量，再检查：
+该诊断会先 dot-source `scripts/Initialize-WindowsProcessEnvironment.ps1`，补齐当前进程缺失的 Windows 基础变量和安全白名单代理变量，再检查：
 
 - 必需环境变量是否存在
 - `SystemRoot`、`APPDATA`、`LOCALAPPDATA` 路径是否可读
+- `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 等代理变量是否已进入当前进程（如用户环境或 Codex config 已配置）
 - `gh` 是否在 `PATH` 中
 - `gh auth status` 是否可用
 - Python 是否能解析 `api.github.com`
@@ -118,7 +119,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Verify-WindowsProces
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Verify-WindowsProcessEnvironment.ps1 -SkipGh
 ```
 
-Python 入口也会在导入 `gh_utils.py` 时自动补齐同一组 Windows 基础变量，所以直接执行 `python sync-forks.py --json` 或 `python list-forks.py --json` 时也具备同样的防护。
+Python 入口也会在导入 `gh_utils.py` 时自动补齐同一组 Windows 基础变量和安全白名单代理变量，所以直接执行 `python sync-forks.py --json` 或 `python list-forks.py --json` 时也具备同样的防护。
 
 ### 依赖
 - Python 3.8+

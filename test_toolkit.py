@@ -9,6 +9,7 @@ import json
 import os
 # Tests construct TimeoutExpired only.
 import subprocess  # nosec B404
+import tempfile
 import unittest
 try:
     from unittest.mock import Mock, patch
@@ -438,6 +439,46 @@ class TestWindowsProcessEnvironment(unittest.TestCase):
                 )
                 self.assertIn("SystemRoot", repaired)
 
+    def test_ensure_windows_process_environment_imports_codex_proxy_policy(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with open(os.path.join(tmp_dir, "config.toml"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "\n".join([
+                        "[shell_environment_policy.set]",
+                        'HTTP_PROXY = "http://127.0.0.1:10808"',
+                        'HTTPS_PROXY = "http://127.0.0.1:10808"',
+                        'NO_PROXY = "localhost,127.0.0.1,::1"',
+                        'ANTHROPIC_AUTH_TOKEN = "must-not-propagate"',
+                    ])
+                    + "\n"
+                )
+            with patch.object(gh_utils.os, "name", "nt"):
+                with patch.dict(
+                    gh_utils.os.environ,
+                    {
+                        "CODEX_HOME": tmp_dir,
+                        "USERPROFILE": r"C:\Users\sciman",
+                        "PATH": "",
+                    },
+                    clear=True,
+                ):
+                    repaired = gh_utils.ensure_windows_process_environment()
+
+                    self.assertEqual(
+                        gh_utils.os.environ["HTTP_PROXY"],
+                        "http://127.0.0.1:10808",
+                    )
+                    self.assertEqual(
+                        gh_utils.os.environ["HTTPS_PROXY"],
+                        "http://127.0.0.1:10808",
+                    )
+                    self.assertEqual(
+                        gh_utils.os.environ["NO_PROXY"],
+                        "localhost,127.0.0.1,::1",
+                    )
+                    self.assertNotIn("ANTHROPIC_AUTH_TOKEN", gh_utils.os.environ)
+                    self.assertIn("HTTP_PROXY", repaired)
+
     def test_windows_environment_scripts_cover_required_variables(self):
         required = (
             "SystemRoot",
@@ -447,6 +488,9 @@ class TestWindowsProcessEnvironment(unittest.TestCase):
             "LOCALAPPDATA",
             "PROGRAMDATA",
             "ProgramFiles",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
         )
         script_paths = (
             os.path.join(_here, "scripts", "Initialize-WindowsProcessEnvironment.ps1"),

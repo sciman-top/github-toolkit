@@ -45,6 +45,28 @@ WINDOWS_REQUIRED_ENV_VARS = (
     "PROGRAMDATA",
     "ProgramFiles",
 )
+NETWORK_PROXY_ENV_VARS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
+CODEX_SAFE_ENV_POLICY_VARS = (
+    "COMSPEC",
+    "ComSpec",
+    "WINDIR",
+    "windir",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "ProgramFiles",
+) + NETWORK_PROXY_ENV_VARS
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 NETWORK_ERROR_MARKERS = (
     "connection reset",
@@ -93,18 +115,128 @@ def _prepend_path_entry(entry):
     os.environ["PATH"] = os.pathsep.join([entry] + parts)
 
 
+def _set_default_env_var(name, value, repaired):
+    """Set an environment variable only when the current process lacks it."""
+    if not name or not value or os.environ.get(name):
+        return
+    os.environ[name] = value
+    repaired[name] = value
+
+
+def _ensure_canonical_env_var(name, value, repaired):
+    """Ensure Windows-critical variables exist with their canonical key."""
+    if not name or not value:
+        return
+    existing = os.environ.get(name)
+    if existing == value and name in os.environ and "%" not in existing:
+        repaired.setdefault(name, value)
+        return
+    os.environ[name] = value
+    repaired.setdefault(name, value)
+
+
+def _codex_config_candidates():
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        yield os.path.join(codex_home, "config.toml")
+    user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    if user_profile:
+        yield os.path.join(user_profile, ".codex", "config.toml")
+
+
+def _read_codex_shell_environment_policy_set():
+    """Read safe env values from Codex config.toml without importing secrets."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        return {}
+
+    for config_path in _codex_config_candidates():
+        if not os.path.isfile(config_path):
+            continue
+        try:
+            with open(config_path, "rb") as handle:
+                data = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        policy = data.get("shell_environment_policy")
+        if not isinstance(policy, dict):
+            continue
+        policy_set = policy.get("set")
+        if not isinstance(policy_set, dict):
+            continue
+        return {
+            name: value
+            for name, value in policy_set.items()
+            if name in CODEX_SAFE_ENV_POLICY_VARS
+            and isinstance(value, str)
+            and value.strip()
+        }
+    return {}
+
+
+def _read_windows_registry_environment():
+    """Read allowlisted User/Machine env vars for reduced agent processes."""
+    try:
+        import winreg
+    except ImportError:
+        return {}
+
+    roots = (
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+    )
+    values = {}
+    for root, subkey in roots:
+        try:
+            key = winreg.OpenKey(root, subkey)
+        except OSError:
+            continue
+        try:
+            for name in CODEX_SAFE_ENV_POLICY_VARS:
+                if name in values:
+                    continue
+                try:
+                    value, _kind = winreg.QueryValueEx(key, name)
+                except OSError:
+                    continue
+                if isinstance(value, str) and value.strip():
+                    values[name] = value
+        finally:
+            winreg.CloseKey(key)
+    return values
+
+
+def _restore_safe_codex_shell_environment_policy(repaired):
+    """Restore non-secret Codex/Windows env values into this process."""
+    sources = (
+        _read_codex_shell_environment_policy_set(),
+        _read_windows_registry_environment(),
+    )
+    for source in sources:
+        for name, value in source.items():
+            _set_default_env_var(name, value, repaired)
+
+
+def _resolved_windows_root():
+    for name in ("SystemRoot", "WINDIR"):
+        value = os.environ.get(name)
+        if value and "%" not in value:
+            return value
+    return r"C:\Windows"
+
+
 def ensure_windows_process_environment():
     """Restore Windows base environment variables commonly stripped by hosts."""
     if os.name != "nt":
         return {}
 
     repaired = {}
-    system_root = (
-        os.environ.get("SystemRoot")
-        or os.environ.get("WINDIR")
-        or os.path.dirname(os.environ.get("ComSpec", ""))
-        or r"C:\Windows"
-    )
+    _restore_safe_codex_shell_environment_policy(repaired)
+    system_root = _resolved_windows_root()
     if os.path.basename(system_root).lower() == "system32":
         system_root = os.path.dirname(system_root)
 
@@ -126,10 +258,13 @@ def ensure_windows_process_environment():
         defaults["LOCALAPPDATA"] = os.path.join(user_profile, "AppData", "Local")
 
     for key in WINDOWS_REQUIRED_ENV_VARS:
-        value = defaults.get(key)
-        if value and not os.environ.get(key):
-            os.environ[key] = value
-            repaired[key] = value
+        value = os.environ.get(key) or defaults.get(key)
+        if isinstance(value, str) and "%" in value:
+            value = defaults.get(key)
+        if key in {"SystemRoot", "WINDIR", "ComSpec"}:
+            _ensure_canonical_env_var(key, value, repaired)
+        else:
+            _set_default_env_var(key, value, repaired)
 
     _prepend_path_entry(os.path.join(system_root, "System32"))
     _prepend_path_entry(system_root)

@@ -28,6 +28,17 @@ foreach ($name in $required) {
     [void]$checks.Add((New-Check -Name $name -Ok (-not [string]::IsNullOrWhiteSpace($value)) -Message $value))
 }
 
+foreach ($name in @("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")) {
+    $processValue = [Environment]::GetEnvironmentVariable($name, "Process")
+    $configuredValue = [Environment]::GetEnvironmentVariable($name, "User")
+    if ([string]::IsNullOrWhiteSpace($configuredValue)) {
+        $configuredValue = [Environment]::GetEnvironmentVariable($name, "Machine")
+    }
+    $ok = [string]::IsNullOrWhiteSpace($configuredValue) -or -not [string]::IsNullOrWhiteSpace($processValue)
+    $message = if ([string]::IsNullOrWhiteSpace($configuredValue)) { "not configured" } else { "configured" }
+    [void]$checks.Add((New-Check -Name $name -Ok $ok -Message $message))
+}
+
 foreach ($pathName in @("SystemRoot", "APPDATA", "LOCALAPPDATA")) {
     $value = [Environment]::GetEnvironmentVariable($pathName, "Process")
     [void]$checks.Add((New-Check -Name "$pathName path" -Ok ((-not [string]::IsNullOrWhiteSpace($value)) -and (Test-Path -LiteralPath $value)) -Message $value))
