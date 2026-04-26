@@ -18,7 +18,9 @@ except OSError:
 
 import gh_utils
 from gh_utils import (
+    build_compare_endpoint,
     build_fork_record,
+    encode_compare_ref,
     get_compare_head,
     get_file_count,
     get_fork_repos_with_evidence,
@@ -106,9 +108,27 @@ class TestHasWorkflowDispatch(unittest.TestCase):
             sync_forks._has_workflow_dispatch("on: { workflow_dispatch: {} }\n")
         )
 
+    def test_array_dispatch(self):
+        self.assertTrue(
+            sync_forks._has_workflow_dispatch("on: [push, workflow_dispatch]\n")
+        )
+
+    def test_sequence_dispatch(self):
+        self.assertTrue(
+            sync_forks._has_workflow_dispatch("on:\n  - push\n  - workflow_dispatch\n")
+        )
+
     def test_similar_key_is_not_dispatch(self):
         self.assertFalse(
             sync_forks._has_workflow_dispatch("on:\n  not_workflow_dispatch: {}\n")
+        )
+
+    def test_dispatch_text_outside_on_block_is_ignored(self):
+        self.assertFalse(
+            sync_forks._has_workflow_dispatch(
+                "on:\n  push:\n\njobs:\n  test:\n    steps:\n"
+                "      - run: echo workflow_dispatch:\n"
+            )
         )
 
 
@@ -254,6 +274,25 @@ class TestForkMetadataHelpers(unittest.TestCase):
             "upstream-owner:main",
         )
 
+    def test_encode_compare_ref_preserves_owner_separator(self):
+        self.assertEqual(
+            encode_compare_ref("upstream-owner:feature/branch"),
+            "upstream-owner:feature%2Fbranch",
+        )
+
+    def test_build_compare_endpoint_encodes_branch_slashes(self):
+        self.assertEqual(
+            build_compare_endpoint(
+                "me/forked-repo",
+                "release/2026-q2",
+                "upstream-owner:feature/branch",
+            ),
+            (
+                "repos/me/forked-repo/compare/"
+                "release%2F2026-q2...upstream-owner:feature%2Fbranch"
+            ),
+        )
+
     def test_get_compare_head_rejects_invalid_input(self):
         self.assertIsNone(get_compare_head("missing-slash", "main"))
         self.assertIsNone(get_compare_head("upstream-owner/repo", ""))
@@ -349,6 +388,16 @@ class TestGhApiErrors(unittest.TestCase):
         self.assertIn("repos/me/example", result["error"])
         self.assertIn("<html>gateway</html>", result["detail"])
 
+    @patch("gh_utils.subprocess.run")
+    def test_gh_api_sends_empty_payload(self, mock_run):
+        mock_run.return_value = Mock(returncode=0, stderr="", stdout='{"ok": true}')
+
+        result = gh_utils.gh_api("repos/me/example/dispatches", method="POST", payload={})
+
+        self.assertEqual(result, {"ok": True})
+        self.assertIn("--input", mock_run.call_args.args[0])
+        self.assertEqual(mock_run.call_args.kwargs["input"], "{}")
+
 
 class TestAuthDetection(unittest.TestCase):
     @patch.dict("os.environ", {"GH_TOKEN": "token-value"}, clear=False)  # nosec
@@ -357,6 +406,16 @@ class TestAuthDetection(unittest.TestCase):
         self.assertTrue(result["configured"])
         self.assertEqual(result["mode"], "env_token")
         self.assertEqual(result["source"], "GH_TOKEN")
+
+    @patch.dict("os.environ", {"GH_TOKEN": "  ", "GITHUB_TOKEN": ""}, clear=True)
+    @patch("gh_utils.subprocess.run")
+    def test_detect_auth_mode_ignores_blank_env_tokens(self, mock_run):
+        mock_run.return_value = Mock(returncode=0, stderr="", stdout="")
+
+        result = gh_utils.detect_auth_mode()
+
+        self.assertTrue(result["configured"])
+        self.assertEqual(result["mode"], "gh_login")
 
     @patch.dict("os.environ", {}, clear=True)
     @patch("gh_utils.subprocess.run")
@@ -637,6 +696,16 @@ class TestSafetyCheck(unittest.TestCase):
     def test_malformed_deletion_count_aborts(self, mock_gfc, mock_api):
         mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 105
         mock_api.return_value = {"total_deletions": "many", "files": []}
+
+        self.assertFalse(
+            sync_forks.safety_check("f", "main", "u/repo", "main")
+        )
+
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "get_file_count")
+    def test_boolean_deletion_count_aborts(self, mock_gfc, mock_api):
+        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 105
+        mock_api.return_value = {"total_deletions": True, "files": []}
 
         self.assertFalse(
             sync_forks.safety_check("f", "main", "u/repo", "main")
@@ -950,6 +1019,14 @@ class TestWorkflowContracts(unittest.TestCase):
         self.assertIn("github.event.repository.default_branch", merge_lines[0])
         self.assertNotIn("steps.upstream.outputs.branch", merge_lines[0])
 
+    def test_generated_workflow_url_encodes_compare_refs(self):
+        workflow = sync_forks.WORKFLOW_TEMPLATE.format(cron=sync_forks.SYNC_CRON)
+
+        self.assertIn("BASE_REF:", workflow)
+        self.assertIn("HEAD_REF:", workflow)
+        self.assertIn("urllib.parse import quote", workflow)
+        self.assertIn("compare/${COMPARE_BASE}...${COMPARE_HEAD}", workflow)
+
 
 class TestListForks(unittest.TestCase):
     @patch.object(list_forks, "get_auth_context")
@@ -1114,6 +1191,29 @@ class TestListForks(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         mock_api.assert_any_call(
             "repos/me/forked-repo/compare/main...upstream-owner:develop"
+        )
+
+    @patch.object(list_forks, "gh_api")
+    def test_compare_endpoint_encodes_branch_slashes(self, mock_api):
+        fork = {
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "release/2026-q2",
+            "parent": "upstream-owner/forked-repo",
+            "parent_branch": "feature/branch",
+            "parent_owner": "upstream-owner",
+        }
+        mock_api.side_effect = [
+            {"content": "workflow"},
+            {"ahead_by": 4, "behind_by": 0},
+        ]
+
+        rows = list_forks._collect_fork_statuses([fork])
+
+        self.assertEqual(rows[0]["behind_by"], 4)
+        mock_api.assert_any_call(
+            "repos/me/forked-repo/compare/"
+            "release%2F2026-q2...upstream-owner:feature%2Fbranch"
         )
 
     @patch.object(list_forks, "gh_api")

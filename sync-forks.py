@@ -33,12 +33,12 @@ from gh_utils import (
     DELETION_THRESHOLD,
     ForkDiscoveryError,
     SYNC_CRON,
+    build_compare_endpoint,
     build_fork_record,
     check_gh_cli,
     get_compare_head,
     get_auth_context,
     get_file_count,
-    get_fork_repos,
     get_fork_repos_with_evidence,
     gh_api,
 )
@@ -59,7 +59,12 @@ RESULT_SAFETY = "safety"
 RESULT_ERROR = "error"
 FORCE_SYNC_ACK_ENV = "SYNC_FORKS_FORCE_ACK"
 FORCE_SYNC_ACK_VALUE = "I_UNDERSTAND"
-WORKFLOW_DISPATCH_RE = re.compile(r"(?<![A-Za-z0-9_-])workflow_dispatch\s*:")
+WORKFLOW_DISPATCH_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])workflow_dispatch(?![A-Za-z0-9_-])"
+)
+WORKFLOW_DISPATCH_KEY_RE = re.compile(
+    r"^(?:-\s*)?workflow_dispatch(?:\s*:|\s*$)"
+)
 
 HELP_TEXT = """\
 Usage:
@@ -160,10 +165,14 @@ jobs:
         if: steps.upstream.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
+          BASE_REF: ${{{{ github.event.repository.default_branch }}}}
+          HEAD_REF: ${{{{ steps.upstream.outputs.owner }}}}:${{{{ steps.upstream.outputs.branch }}}}
         run: |
           set -euo pipefail
           FORK_FILES=$(git ls-tree -r --name-only HEAD | wc -l | tr -d '[:space:]')
-          COMPARE_JSON=$(gh api "repos/${{{{ github.repository }}}}/compare/${{{{ github.event.repository.default_branch }}}}...${{{{ steps.upstream.outputs.owner }}}}:${{{{ steps.upstream.outputs.branch }}}}")
+          COMPARE_BASE=$(python3 -c 'import os; from urllib.parse import quote; print(quote(os.environ["BASE_REF"], safe=":"))')
+          COMPARE_HEAD=$(python3 -c 'import os; from urllib.parse import quote; print(quote(os.environ["HEAD_REF"], safe=":"))')
+          COMPARE_JSON=$(gh api "repos/${{{{ github.repository }}}}/compare/${{COMPARE_BASE}}...${{COMPARE_HEAD}}")
           TOTAL_DELETIONS=$(printf '%s' "$COMPARE_JSON" | jq -r '.total_deletions // 0')
           DELETED_FILES=$(printf '%s' "$COMPARE_JSON" | jq -r '.files[]? | select(.status == "removed") | .filename')
           DELETE_LIMIT=$(( 5 + (FORK_FILES / 10) ))
@@ -208,11 +217,29 @@ def _has_workflow_dispatch(workflow_text):
     """Best-effort trigger detection without YAML parser dependency."""
     if not workflow_text:
         return False
+    in_on_block = False
+    on_indent = None
     for line in workflow_text.splitlines():
-        stripped = line.strip()
+        line_without_comment = line.split("#", 1)[0].rstrip()
+        stripped = line_without_comment.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if WORKFLOW_DISPATCH_RE.search(stripped):
+        indent = len(line_without_comment) - len(line_without_comment.lstrip())
+
+        if in_on_block and indent <= on_indent:
+            in_on_block = False
+            on_indent = None
+
+        if stripped.startswith("on:"):
+            on_value = stripped[3:].strip()
+            if WORKFLOW_DISPATCH_TOKEN_RE.search(on_value):
+                return True
+            if not on_value:
+                in_on_block = True
+                on_indent = indent
+            continue
+
+        if in_on_block and WORKFLOW_DISPATCH_KEY_RE.search(stripped):
             return True
     return False
 
@@ -265,6 +292,8 @@ def _needs_workflow_update(existing_file):
 
 def _parse_nonnegative_int(value):
     """Return value as a non-negative int, or None when malformed."""
+    if isinstance(value, bool):
+        return None
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -311,12 +340,11 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
         return ABORT
 
     compare_head = get_compare_head(upstream_name, upstream_branch)
-    if not compare_head:
+    compare_endpoint = build_compare_endpoint(fork_name, fork_branch, compare_head)
+    if not compare_endpoint:
         print("  ABORT: Upstream metadata is incomplete, cannot inspect diff safely.")
         return ABORT
-    compare = gh_api(
-        f"repos/{fork_name}/compare/{fork_branch}...{compare_head}"
-    )
+    compare = gh_api(compare_endpoint)
     if not isinstance(compare, dict) or "error" in compare:
         print("  ABORT: Cannot inspect upstream diff safely.")
         return ABORT

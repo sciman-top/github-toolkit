@@ -26,6 +26,7 @@ import subprocess  # nosec B404
 import sys
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 # ── Config ────────────────────────────────────────────────────
 DELETION_THRESHOLD = 0.5   # Abort sync if upstream < fork * this
@@ -360,7 +361,7 @@ class ForkDiscoveryError(RuntimeError):
 def detect_auth_mode(timeout=5):
     """Detect which supported authentication mode is currently active."""
     for env_var in AUTH_ENV_VARS:
-        if os.environ.get(env_var):
+        if os.environ.get(env_var, "").strip():
             return {
                 "configured": True,
                 "mode": "env_token",
@@ -528,14 +529,14 @@ def gh_api(endpoint, method="GET", payload=None, timeout=API_TIMEOUT):
         return _build_error_result("gh CLI not found", error_type="environment")
 
     cmd = [GH, "api", endpoint, "-X", method]
-    if payload:
+    if payload is not None:
         cmd += ["--input", "-"]
 
     for attempt in range(MAX_RETRIES + 1):
         try:
             result = subprocess.run(
                 cmd,
-                input=json.dumps(payload) if payload else None,
+                input=json.dumps(payload) if payload is not None else None,
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
@@ -630,6 +631,22 @@ def get_compare_head(repo_full_name, branch):
     if not owner or not branch:
         return None
     return f"{owner}:{branch}"
+
+
+def encode_compare_ref(ref):
+    """URL-encode a GitHub compare ref while preserving owner:branch syntax."""
+    if not ref:
+        return None
+    return quote(ref, safe=":")
+
+
+def build_compare_endpoint(repo_full_name, base_ref, head_ref):
+    """Return a GitHub compare endpoint with branch-safe ref encoding."""
+    encoded_base = encode_compare_ref(base_ref)
+    encoded_head = encode_compare_ref(head_ref)
+    if not repo_full_name or not encoded_base or not encoded_head:
+        return None
+    return f"repos/{repo_full_name}/compare/{encoded_base}...{encoded_head}"
 
 
 def build_fork_record(repo):

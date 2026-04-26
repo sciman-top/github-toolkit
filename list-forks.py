@@ -12,6 +12,7 @@ import sys
 
 from gh_utils import (
     AuthContextError,
+    build_compare_endpoint,
     ForkDiscoveryError,
     check_gh_cli,
     get_compare_head,
@@ -66,10 +67,13 @@ def _collect_fork_statuses(forks):
 
         behind_by = None
         compare_head = get_compare_head(fork["parent"], fork["parent_branch"])
-        if compare_head:
-            compare = gh_api(
-                f"repos/{fork['full_name']}/compare/{fork['branch']}...{compare_head}"
-            )
+        compare_endpoint = build_compare_endpoint(
+            fork["full_name"],
+            fork["branch"],
+            compare_head,
+        )
+        if compare_endpoint:
+            compare = gh_api(compare_endpoint)
             if isinstance(compare, dict) and "ahead_by" in compare:
                 behind_by = compare["ahead_by"]
 

@@ -1,0 +1,10 @@
+# Runtime caches and generated backups
+__pycache__/
+*.pyc
+backup/
+docs/runtime-probe-*.txt
+
+# Local credentials and logs
+.env
+hosts.yml
+*.log
