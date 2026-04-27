@@ -24,7 +24,7 @@
   "build_commands": [
     {
       "id": "build",
-      "command": "python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py",
+      "command": "python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py .claude/hooks/governed-pre-tool-use.py",
       "required": true
     }
   ],
@@ -233,39 +233,6 @@
       "global_to_repo_mapping"
     ]
   },
-  "quick_gate_commands": [
-    {
-      "command": "python -m unittest test_toolkit.py",
-      "id": "test",
-      "required": true,
-      "timeout_seconds": 180,
-      "satisfies_gate_ids": [
-        "test",
-        "contract"
-      ]
-    }
-  ],
-  "full_gate_commands": [
-    {
-      "id": "build",
-      "command": "python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py",
-      "required": true,
-      "timeout_seconds": 600,
-      "satisfies_gate_ids": [
-        "build"
-      ]
-    },
-    {
-      "command": "python -m unittest test_toolkit.py",
-      "id": "test",
-      "required": true,
-      "timeout_seconds": 600,
-      "satisfies_gate_ids": [
-        "test",
-        "contract"
-      ]
-    }
-  ],
   "gate_timeout_seconds": 300,
   "learning_assistance_policy": {
     "enabled": true,
@@ -315,5 +282,38 @@
       "For bugs, prefer a short expected/actual/repro/logs checklist before long explanations.",
       "When budget pressure or verbosity overrun appears, compress to stage summary or handoff refs instead of expanding the lesson."
     ]
-  }
+  },
+  "quick_gate_commands": [
+    {
+      "command": "python -m unittest test_toolkit.py",
+      "id": "test",
+      "required": true,
+      "timeout_seconds": 180,
+      "satisfies_gate_ids": [
+        "test",
+        "contract"
+      ]
+    }
+  ],
+  "full_gate_commands": [
+    {
+      "id": "build",
+      "command": "python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py .claude/hooks/governed-pre-tool-use.py",
+      "required": true,
+      "timeout_seconds": 600,
+      "satisfies_gate_ids": [
+        "build"
+      ]
+    },
+    {
+      "command": "python -m unittest test_toolkit.py",
+      "id": "test",
+      "required": true,
+      "timeout_seconds": 600,
+      "satisfies_gate_ids": [
+        "test",
+        "contract"
+      ]
+    }
+  ]
 }
