@@ -481,7 +481,7 @@ def _classify_gh_error(stderr):
     lowered = message.lower()
     status_code = _extract_status_code(message)
 
-    if "rate limit" in lowered:
+    if "rate limit" in lowered or status_code == 429:
         return _build_error_result(
             message, error_type="rate_limit", status_code=status_code or 429,
             retryable=True,
@@ -592,15 +592,30 @@ def paginate(endpoint, per_page=100, include_error=False):
             if "error" in data:
                 page_error = data
                 break
-            # Single-item response (unusual but defensive)
-            results.append(data)
+            page_error = _build_error_result(
+                f"Invalid paginated response for endpoint: {endpoint}",
+                error_type="invalid_response",
+                detail=repr(data)[:200],
+            )
             break
         if not data:
             break
         if not isinstance(data, list):
+            page_error = _build_error_result(
+                f"Invalid paginated response for endpoint: {endpoint}",
+                error_type="invalid_response",
+                detail=repr(data)[:200],
+            )
             break
         results.extend(data)
         if len(data) < per_page:
+            break
+        if page == MAX_PAGES:
+            page_error = _build_error_result(
+                f"Pagination limit exceeded for endpoint: {endpoint}",
+                error_type="invalid_response",
+                detail=f"max_pages={MAX_PAGES}, per_page={per_page}",
+            )
             break
     if include_error:
         return results, page_error
@@ -640,6 +655,13 @@ def encode_compare_ref(ref):
     return quote(ref, safe=":")
 
 
+def encode_url_component(value):
+    """URL-encode one path or query component."""
+    if not value:
+        return None
+    return quote(value, safe="")
+
+
 def build_compare_endpoint(repo_full_name, base_ref, head_ref):
     """Return a GitHub compare endpoint with branch-safe ref encoding."""
     encoded_base = encode_compare_ref(base_ref)
@@ -663,14 +685,14 @@ def build_fork_record(repo):
     parent_info = repo.get("parent") or {}
     if not isinstance(parent_info, dict):
         parent_info = {}
-    parent_full_name = parent_info.get("full_name", "unknown")
+    parent_full_name = parent_info.get("full_name") or "unknown"
 
     return {
         "name": name,
         "full_name": full_name,
         "branch": branch,
         "parent": parent_full_name,
-        "parent_branch": parent_info.get("default_branch", branch),
+        "parent_branch": parent_info.get("default_branch") or branch,
         "parent_owner": get_repo_owner(parent_full_name),
     }
 
@@ -703,6 +725,9 @@ def get_fork_repos_with_evidence(username):
         )
 
     forks = []
+    parent_detail_cache = {}
+    parent_detail_lookup_count = 0
+    parent_detail_cache_hit_count = 0
     for r in all_repos:
         if not isinstance(r, dict):
             continue
@@ -716,13 +741,33 @@ def get_fork_repos_with_evidence(username):
         if not isinstance(parent_info, dict):
             parent_info = {}
         if not parent_info or not parent_info.get("full_name"):
-            detail = gh_api(f"repos/{full_name}")
-            if isinstance(detail, dict) and "error" not in detail:
-                parent_info = detail.get("parent") or {}
-                if not isinstance(parent_info, dict):
-                    parent_info = {}
+            if full_name in parent_detail_cache:
+                parent_detail_cache_hit_count += 1
+                parent_info = parent_detail_cache[full_name]
             else:
-                parent_info = {}
+                detail = gh_api(f"repos/{full_name}")
+                parent_detail_lookup_count += 1
+                if isinstance(detail, dict) and "error" not in detail:
+                    parent_info = detail.get("parent") or {}
+                    if not isinstance(parent_info, dict):
+                        parent_info = {}
+                    if not parent_info.get("full_name"):
+                        raise ForkDiscoveryError(
+                            "Fork repository metadata is missing parent information.",
+                            detail={
+                                "repo": full_name,
+                                "response": detail,
+                            },
+                        )
+                    parent_detail_cache[full_name] = parent_info
+                else:
+                    raise ForkDiscoveryError(
+                        "Failed to inspect fork repository metadata.",
+                        detail={
+                            "repo": full_name,
+                            "response": detail,
+                        },
+                    )
         fork = build_fork_record({**r, "parent": parent_info})
         if fork:
             forks.append(fork)
@@ -734,6 +779,8 @@ def get_fork_repos_with_evidence(username):
         "authenticated_user": username,
         "repo_count": len(all_repos),
         "fork_count": len(forks),
+        "parent_detail_lookup_count": parent_detail_lookup_count,
+        "parent_detail_cache_hit_count": parent_detail_cache_hit_count,
     }
     return forks, evidence
 
@@ -748,7 +795,10 @@ def get_fork_repos(username):
 
 def get_file_count(repo_name, branch):
     """Return blob count in a repo branch, or None on error/truncation."""
-    result = gh_api(f"repos/{repo_name}/git/trees/{branch}?recursive=1")
+    encoded_branch = encode_url_component(branch)
+    if not repo_name or not encoded_branch:
+        return None
+    result = gh_api(f"repos/{repo_name}/git/trees/{encoded_branch}?recursive=1")
     if not isinstance(result, dict):
         return None
     if "error" in result:

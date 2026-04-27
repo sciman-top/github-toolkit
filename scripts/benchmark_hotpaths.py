@@ -13,11 +13,14 @@ import os
 import statistics
 import sys
 import time
+from urllib.parse import parse_qs, urlsplit
 
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
+
+import gh_utils  # noqa: E402
 
 def _load_patch_factory():
     try:
@@ -34,6 +37,7 @@ DEFAULT_SIZES = (10, 100, 500)
 DEFAULT_RUNS = 5
 MAX_MEAN_MS = {
     "collect_fork_statuses": {10: 200, 100: 1500, 500: 7000},
+    "fork_discovery_hydration": {10: 250, 100: 1800, 500: 8000},
     "sync_all_report": {10: 200, 100: 1500, 500: 7000},
     "sync_specific_deduped": {10: 250, 100: 1800, 500: 8000},
 }
@@ -83,6 +87,24 @@ def _build_forks(count):
     return forks
 
 
+def _build_repo_list_payload(count, include_parent=False):
+    repos = []
+    for i in range(count):
+        repo = {
+            "fork": True,
+            "name": f"fork-{i}",
+            "full_name": f"bench-user/fork-{i}",
+            "default_branch": "main",
+        }
+        if include_parent:
+            repo["parent"] = {
+                "full_name": f"upstream-owner/repo-{i}",
+                "default_branch": "main",
+            }
+        repos.append(repo)
+    return repos
+
+
 def _measure_ms(task, runs):
     durations = []
     for _ in range(runs):
@@ -123,6 +145,59 @@ def _bench_collect_fork_statuses(count, runs):
             if len(rows) != count:
                 raise RuntimeError(
                     f"collect_fork_statuses mismatch: expected={count}, got={len(rows)}"
+                )
+
+        return _measure_ms(task, runs)
+
+
+def _bench_fork_discovery_hydration(count, runs):
+    repos = _build_repo_list_payload(count, include_parent=False)
+
+    def fake_gh_api(endpoint, *_args, **_kwargs):
+        if endpoint.startswith(gh_utils.FORK_DISCOVERY_ENDPOINT):
+            query = parse_qs(urlsplit(endpoint).query)
+            page = int(query.get("page", ["1"])[0])
+            per_page = int(query.get("per_page", ["100"])[0])
+            start = (page - 1) * per_page
+            end = start + per_page
+            return repos[start:end]
+        prefix = "repos/bench-user/fork-"
+        if endpoint.startswith(prefix):
+            suffix = endpoint[len(prefix):]
+            index = int(suffix)
+            return {
+                "fork": True,
+                "name": f"fork-{index}",
+                "full_name": f"bench-user/fork-{index}",
+                "default_branch": "main",
+                "parent": {
+                    "full_name": f"upstream-owner/repo-{index}",
+                    "default_branch": "main",
+                },
+            }
+        return {
+            "error": f"unexpected benchmark endpoint: {endpoint}",
+            "error_type": "benchmark",
+            "error_code": "E_BENCH_UNEXPECTED_ENDPOINT",
+            "retryable": False,
+            "status_code": None,
+        }
+
+    with (
+        patch.object(gh_utils, "gh_api", side_effect=fake_gh_api),
+        patch.object(gh_utils, "utc_now_iso", return_value="2026-04-27T00:00:00Z"),
+    ):
+
+        def task():
+            forks, evidence = gh_utils.get_fork_repos_with_evidence("bench-user")
+            if len(forks) != count:
+                raise RuntimeError(
+                    f"fork_discovery_hydration mismatch: expected={count}, got={len(forks)}"
+                )
+            if evidence["parent_detail_lookup_count"] != count:
+                raise RuntimeError(
+                    "parent detail lookup count mismatch: "
+                    f"expected={count}, got={evidence['parent_detail_lookup_count']}"
                 )
 
         return _measure_ms(task, runs)
@@ -234,6 +309,7 @@ def _run_benchmarks(sizes, runs):
             {
                 "size": size,
                 "collect_fork_statuses": _bench_collect_fork_statuses(size, runs),
+                "fork_discovery_hydration": _bench_fork_discovery_hydration(size, runs),
                 "sync_all_report": _bench_sync_all_report(size, runs),
                 "sync_specific_deduped": _bench_sync_specific_deduped(size, runs),
             }

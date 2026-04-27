@@ -36,6 +36,7 @@ from gh_utils import (
     build_compare_endpoint,
     build_fork_record,
     check_gh_cli,
+    encode_url_component,
     get_compare_head,
     get_auth_context,
     get_file_count,
@@ -392,8 +393,14 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
 
 def _add_sync_workflow_result(repo_name, branch, dry_run=False, force=False):
     """Add or update sync-fork.yml in a repo. Return operation result."""
+    encoded_branch = encode_url_component(branch)
+    if not repo_name or not encoded_branch:
+        print("  FAIL: Cannot verify existing sync-fork.yml: invalid repo or branch")
+        return RESULT_ERROR
+
     existing = gh_api(
-        f"repos/{repo_name}/contents/.github/workflows/sync-fork.yml?ref={branch}"
+        f"repos/{repo_name}/contents/.github/workflows/sync-fork.yml"
+        f"?ref={encoded_branch}"
     )
     if not isinstance(existing, dict):
         print("  FAIL: Cannot verify existing sync-fork.yml: invalid metadata payload")

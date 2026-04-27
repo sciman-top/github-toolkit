@@ -13,6 +13,7 @@ import sys
 from gh_utils import (
     AuthContextError,
     build_compare_endpoint,
+    encode_url_component,
     ForkDiscoveryError,
     check_gh_cli,
     get_compare_head,
@@ -59,9 +60,10 @@ def _collect_fork_statuses(forks):
     """Collect fork status rows for text and JSON renderers."""
     rows = []
     for fork in forks:
+        encoded_branch = encode_url_component(fork["branch"])
         wf = gh_api(
             f"repos/{fork['full_name']}/contents/.github/workflows/sync-fork.yml"
-            f"?ref={fork['branch']}"
+            f"?ref={encoded_branch}"
         )
         has_workflow = isinstance(wf, dict) and "error" not in wf
 

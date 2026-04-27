@@ -1,8 +1,8 @@
 # CLAUDE.md — github-toolkit（Claude 项目级）
 **项目**: github-toolkit
-**承接来源**: `GlobalUser/CLAUDE.md v9.43`
+**承接来源**: `GlobalUser/CLAUDE.md v9.44`
 **适用范围**: 项目级（仓库根）
-**最后更新**: 2026-04-26
+**最后更新**: 2026-04-27
 
 ## 1. 阅读指引
 - 本文件只写本仓事实、门禁命令、证据位置和回滚入口，不重写全局 `R/E` 语义。
@@ -22,6 +22,7 @@
 - 每次改动先声明：当前落点 -> 目标归宿 -> 验证方式。
 - 默认中文沟通、中文解释、中文汇报；代码标识符、命令、日志、报错和 GitHub API 字段保留英文原文。
 - 全局规则给风险、语言、N/A 和门禁语义；本文件给 github-toolkit 的脚本边界、真实命令、删除保护、证据与回滚入口。
+- 项目规则只保留本仓不可由代码/CI自动推断且会改变执行、风险或验收的事实；长流程下沉到子文档或工具专属规则。
 - 小步闭环，优先根因修复；止血补丁必须标明回收时点。
 
 ### A.3 N/A 分类与字段
@@ -43,6 +44,7 @@
 - 诊断优先执行 `claude --version`、`claude --help`；交互场景可用 `/memory` 查加载链，非交互不可用时按 `platform_na` 记录。
 - auto memory / local memory 只作辅助上下文；与代码、项目规则或证据冲突时以仓库事实为准。
 - Claude 权限/安全或重复验证要求应固化到 `.claude/settings*.json` permissions、hooks、CI 或本仓门禁；不要只依赖自然语言规则。
+- 需要禁止读取敏感文件、限制工具或固定沙箱时，优先用 `.claude/settings*.json` 的 `permissions.deny` / `sandbox`；不要把硬安全边界只写成提醒。
 - 替代命令仅用于补证据，不得改变本仓门禁顺序与阻断语义。
 
 ## C. 项目差异（领域与技术）
@@ -87,6 +89,8 @@
 - 与全局职责互补，不重叠、不缺失。
 - 协同链完整：`规则 -> 落点 -> 命令 -> 证据 -> 回滚`。
 - `Global Rule -> Repo Action`：
+  - `R6`: 本仓门禁命令是硬门禁；quick/fast 只能作为已声明的日常反馈切片，交付前仍按 full gate 或固定顺序收口。
+  - `R8`: 证据与回滚字段是最小留痕；缺字段必须按 N/A 口径说明。
   - `E4`: hotspot 复核 GitHub API 参数、删除保护、dry-run/force 确认和 `gh` 认证状态。
   - `E5`: Python、`gh`、workflow token 或第三方依赖变化必须记录供应链/工具基线；新增依赖前先说明必要性。
   - `E6`: GitHub API 字段、workflow YAML、同步状态 JSON 或持久配置结构变化必须记录兼容性和回滚。

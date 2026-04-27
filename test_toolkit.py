@@ -21,6 +21,7 @@ from gh_utils import (
     build_compare_endpoint,
     build_fork_record,
     encode_compare_ref,
+    encode_url_component,
     get_compare_head,
     get_file_count,
     get_fork_repos_with_evidence,
@@ -245,6 +246,40 @@ class TestAddSyncWorkflow(unittest.TestCase):
         self.assertIn("Would add sync-fork.yml", captured.getvalue())
 
     @patch.object(sync_forks, "gh_api")
+    def test_lookup_encodes_branch_ref(self, mock_api):
+        mock_api.return_value = {
+            "error": "gh: Not Found (HTTP 404)",
+            "error_type": "not_found",
+            "status_code": 404,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = sync_forks._add_sync_workflow_result(
+                "me/forked-repo",
+                "feature/branch",
+                dry_run=True,
+            )
+
+        self.assertEqual(result, sync_forks.RESULT_OK)
+        mock_api.assert_any_call(
+            "repos/me/forked-repo/contents/.github/workflows/sync-fork.yml"
+            "?ref=feature%2Fbranch"
+        )
+
+    @patch.object(sync_forks, "gh_api")
+    def test_invalid_branch_fails_without_api_call(self, mock_api):
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._add_sync_workflow_result(
+                "me/forked-repo",
+                "",
+                dry_run=True,
+            )
+
+        self.assertEqual(result, sync_forks.RESULT_ERROR)
+        self.assertIn("invalid repo or branch", captured.getvalue())
+        mock_api.assert_not_called()
+
+    @patch.object(sync_forks, "gh_api")
     def test_invalid_update_response_fails(self, mock_api):
         mock_api.side_effect = [
             {
@@ -278,6 +313,12 @@ class TestForkMetadataHelpers(unittest.TestCase):
         self.assertEqual(
             encode_compare_ref("upstream-owner:feature/branch"),
             "upstream-owner:feature%2Fbranch",
+        )
+
+    def test_encode_url_component_encodes_slashes(self):
+        self.assertEqual(
+            encode_url_component("release/2026-q2"),
+            "release%2F2026-q2",
         )
 
     def test_build_compare_endpoint_encodes_branch_slashes(self):
@@ -328,6 +369,22 @@ class TestForkMetadataHelpers(unittest.TestCase):
         self.assertEqual(record["parent_branch"], "main")
         self.assertIsNone(record["parent_owner"])
 
+    def test_build_fork_record_defaults_empty_parent_fields(self):
+        record = build_fork_record({
+            "fork": True,
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "default_branch": "main",
+            "parent": {
+                "full_name": None,
+                "default_branch": None,
+            },
+        })
+
+        self.assertEqual(record["parent"], "unknown")
+        self.assertEqual(record["parent_branch"], "main")
+        self.assertIsNone(record["parent_owner"])
+
 
 class TestGhApiErrors(unittest.TestCase):
     def test_classify_rate_limit_as_retryable(self):
@@ -335,6 +392,13 @@ class TestGhApiErrors(unittest.TestCase):
         self.assertEqual(result["error_type"], "rate_limit")
         self.assertEqual(result["error_code"], "E_GH_RATE_LIMIT")
         self.assertEqual(result["status_code"], 403)
+        self.assertTrue(result["retryable"])
+
+    def test_classify_http_429_as_rate_limit(self):
+        result = gh_utils._classify_gh_error("gh: Too Many Requests (HTTP 429)")
+        self.assertEqual(result["error_type"], "rate_limit")
+        self.assertEqual(result["error_code"], "E_GH_RATE_LIMIT")
+        self.assertEqual(result["status_code"], 429)
         self.assertTrue(result["retryable"])
 
     def test_classify_not_found_as_non_retryable(self):
@@ -578,6 +642,21 @@ class TestGetFileCount(unittest.TestCase):
             ]
         }
         self.assertEqual(get_file_count("repo", "main"), 2)
+
+    @patch("gh_utils.gh_api")
+    def test_branch_ref_is_encoded(self, mock_api):
+        mock_api.return_value = {"tree": []}
+
+        self.assertEqual(get_file_count("repo", "feature/branch"), 0)
+
+        mock_api.assert_any_call(
+            "repos/repo/git/trees/feature%2Fbranch?recursive=1"
+        )
+
+    @patch("gh_utils.gh_api")
+    def test_missing_branch_returns_none_without_api_call(self, mock_api):
+        self.assertIsNone(get_file_count("repo", ""))
+        mock_api.assert_not_called()
 
     @patch("gh_utils.gh_api")
     def test_error_returns_none(self, mock_api):
@@ -884,6 +963,36 @@ class TestPaginate(unittest.TestCase):
         self.assertEqual(items, [])
         self.assertEqual(error["error_type"], "rate_limit")
 
+    @patch("gh_utils.gh_api")
+    def test_include_error_returns_invalid_response_for_non_list(self, mock_api):
+        mock_api.return_value = "unexpected string"
+
+        items, error = paginate("users/u/repos", include_error=True)
+
+        self.assertEqual(items, [])
+        self.assertEqual(error["error_type"], "invalid_response")
+
+    @patch("gh_utils.gh_api")
+    def test_include_error_returns_invalid_response_for_non_error_dict(self, mock_api):
+        mock_api.return_value = {"name": "not-a-list-page"}
+
+        items, error = paginate("users/u/repos", include_error=True)
+
+        self.assertEqual(items, [])
+        self.assertEqual(error["error_type"], "invalid_response")
+
+    @patch("gh_utils.gh_api")
+    def test_include_error_reports_pagination_limit(self, mock_api):
+        page = [{"name": f"r{i}"} for i in range(100)]
+        mock_api.side_effect = [page, page]
+
+        with patch.object(gh_utils, "MAX_PAGES", 2):
+            items, error = paginate("users/u/repos", include_error=True)
+
+        self.assertEqual(len(items), 200)
+        self.assertEqual(error["error_type"], "invalid_response")
+        self.assertIn("Pagination limit exceeded", error["error"])
+
 
 class TestForkDiscovery(unittest.TestCase):
     @patch("gh_utils.gh_api")
@@ -924,6 +1033,8 @@ class TestForkDiscovery(unittest.TestCase):
         self.assertEqual(evidence["repo_count"], 1)
         self.assertEqual(evidence["fork_count"], 1)
         self.assertEqual(evidence["fetched_at"], "2026-04-25T10:00:00Z")
+        self.assertEqual(evidence["parent_detail_lookup_count"], 0)
+        self.assertEqual(evidence["parent_detail_cache_hit_count"], 0)
         self.assertEqual(
             evidence["endpoint"],
             gh_utils.FORK_DISCOVERY_ENDPOINT,
@@ -967,6 +1078,87 @@ class TestForkDiscovery(unittest.TestCase):
 
         with self.assertRaises(gh_utils.ForkDiscoveryError):
             gh_utils.get_fork_repos("me")
+
+    @patch("gh_utils.gh_api")
+    def test_get_fork_repos_raises_when_parent_detail_lookup_fails(self, mock_api):
+        mock_api.side_effect = [
+            [{
+                "fork": True,
+                "name": "forked-repo",
+                "full_name": "me/forked-repo",
+                "default_branch": "main",
+            }],
+            {
+                "error": "gh: Forbidden (HTTP 403)",
+                "error_type": "auth",
+                "status_code": 403,
+            },
+        ]
+
+        with self.assertRaises(gh_utils.ForkDiscoveryError) as ctx:
+            gh_utils.get_fork_repos("me")
+
+        self.assertIn("Failed to inspect fork repository metadata", str(ctx.exception))
+        self.assertEqual(ctx.exception.detail["repo"], "me/forked-repo")
+
+    @patch("gh_utils.gh_api")
+    def test_get_fork_repos_raises_when_detail_lacks_parent(self, mock_api):
+        mock_api.side_effect = [
+            [{
+                "fork": True,
+                "name": "forked-repo",
+                "full_name": "me/forked-repo",
+                "default_branch": "main",
+            }],
+            {
+                "fork": True,
+                "name": "forked-repo",
+                "full_name": "me/forked-repo",
+                "default_branch": "main",
+            },
+        ]
+
+        with self.assertRaises(gh_utils.ForkDiscoveryError) as ctx:
+            gh_utils.get_fork_repos("me")
+
+        self.assertIn("missing parent information", str(ctx.exception))
+        self.assertEqual(ctx.exception.detail["repo"], "me/forked-repo")
+
+    @patch("gh_utils.gh_api")
+    def test_get_fork_repos_caches_parent_detail_lookup(self, mock_api):
+        mock_api.side_effect = [
+            [
+                {
+                    "fork": True,
+                    "name": "forked-repo",
+                    "full_name": "me/forked-repo",
+                    "default_branch": "main",
+                },
+                {
+                    "fork": True,
+                    "name": "forked-repo",
+                    "full_name": "me/forked-repo",
+                    "default_branch": "main",
+                },
+            ],
+            {
+                "fork": True,
+                "name": "forked-repo",
+                "full_name": "me/forked-repo",
+                "default_branch": "main",
+                "parent": {
+                    "full_name": "upstream-owner/forked-repo",
+                    "default_branch": "main",
+                },
+            },
+        ]
+
+        forks, evidence = get_fork_repos_with_evidence("me")
+
+        self.assertEqual(len(forks), 2)
+        self.assertEqual(evidence["parent_detail_lookup_count"], 1)
+        self.assertEqual(evidence["parent_detail_cache_hit_count"], 1)
+        self.assertEqual(mock_api.call_count, 2)
 
     @patch("gh_utils.gh_api")
     def test_get_fork_repos_skips_malformed_repo_without_full_name(self, mock_api):
@@ -1211,6 +1403,10 @@ class TestListForks(unittest.TestCase):
         rows = list_forks._collect_fork_statuses([fork])
 
         self.assertEqual(rows[0]["behind_by"], 4)
+        mock_api.assert_any_call(
+            "repos/me/forked-repo/contents/.github/workflows/sync-fork.yml"
+            "?ref=release%2F2026-q2"
+        )
         mock_api.assert_any_call(
             "repos/me/forked-repo/compare/"
             "release%2F2026-q2...upstream-owner:feature%2Fbranch"
