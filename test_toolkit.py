@@ -42,6 +42,13 @@ _list_spec = importlib.util.spec_from_file_location(
 list_forks = importlib.util.module_from_spec(_list_spec)
 _list_spec.loader.exec_module(list_forks)
 
+_claude_hook_spec = importlib.util.spec_from_file_location(
+    "governed_pre_tool_use",
+    os.path.join(_here, ".claude", "hooks", "governed-pre-tool-use.py"),
+)
+claude_hook = importlib.util.module_from_spec(_claude_hook_spec)
+_claude_hook_spec.loader.exec_module(claude_hook)
+
 
 def _encode(text):
     """Base64-encode a string for GitHub contents API simulation."""
@@ -462,6 +469,18 @@ class TestGhApiErrors(unittest.TestCase):
         self.assertIn("--input", mock_run.call_args.args[0])
         self.assertEqual(mock_run.call_args.kwargs["input"], "{}")
 
+    @patch.object(gh_utils, "GH", "gh")
+    @patch("gh_utils.subprocess.run")
+    def test_gh_api_os_error_reports_environment_error(self, mock_run):
+        mock_run.side_effect = OSError("permission denied")
+
+        result = gh_utils.gh_api("repos/me/example")
+
+        self.assertEqual(result["error_type"], "environment")
+        self.assertEqual(result["error_code"], "E_GH_ENVIRONMENT")
+        self.assertFalse(result["retryable"])
+        self.assertIn("Cannot execute gh CLI", result["error"])
+
 
 class TestAuthDetection(unittest.TestCase):
     @patch.dict("os.environ", {"GH_TOKEN": "token-value"}, clear=False)  # nosec
@@ -501,6 +520,18 @@ class TestAuthDetection(unittest.TestCase):
 
         self.assertFalse(result["configured"])
         self.assertEqual(result["mode"], "unconfigured")
+
+    @patch.object(gh_utils, "GH", "gh")
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("gh_utils.subprocess.run")
+    def test_detect_auth_mode_reports_gh_launch_failure(self, mock_run):
+        mock_run.side_effect = OSError("permission denied")
+
+        result = gh_utils.detect_auth_mode()
+
+        self.assertFalse(result["configured"])
+        self.assertEqual(result["mode"], "unavailable")
+        self.assertIn("OSError", result["source"])
 
     @patch("gh_utils.gh_api")
     @patch("gh_utils.detect_auth_mode")
@@ -627,6 +658,31 @@ class TestWindowsProcessEnvironment(unittest.TestCase):
                     content = handle.read()
                 for name in required:
                     self.assertIn(name, content)
+
+
+class TestGovernedClaudeHook(unittest.TestCase):
+    def test_blocks_bare_windows_powershell_command(self):
+        self.assertTrue(claude_hook._uses_direct_windows_powershell("powershell"))
+        self.assertTrue(claude_hook._uses_direct_windows_powershell("powershell.exe"))
+
+    def test_blocks_quoted_windows_powershell_path(self):
+        command = (
+            '& "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" '
+            "-NoProfile"
+        )
+        self.assertTrue(claude_hook._uses_direct_windows_powershell(command))
+
+    def test_allows_pwsh_command(self):
+        self.assertFalse(
+            claude_hook._uses_direct_windows_powershell(
+                "pwsh -NoProfile -Command Get-Location"
+            )
+        )
+
+    def test_blocks_sensitive_read_paths(self):
+        self.assertTrue(claude_hook._is_sensitive_path("C:/tmp/.env"))
+        self.assertTrue(claude_hook._is_sensitive_path("C:/tmp/id_ed25519.pub"))
+        self.assertFalse(claude_hook._is_sensitive_path("docs/readme.md"))
 
 
 # ── get_file_count ────────────────────────────────────────────

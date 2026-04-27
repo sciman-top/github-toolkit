@@ -395,6 +395,12 @@ def detect_auth_mode(timeout=5):
             "mode": "unknown",
             "source": "gh auth status timeout",
         }
+    except OSError as exc:
+        return {
+            "configured": False,
+            "mode": "unavailable",
+            "source": f"gh auth status failed: {exc.__class__.__name__}",
+        }
 
     if result.returncode == 0:
         return {
@@ -556,6 +562,11 @@ def gh_api(endpoint, method="GET", payload=None, timeout=API_TIMEOUT):
                 f"API timeout ({timeout}s): {endpoint}",
                 error_type="timeout",
                 retryable=True,
+            )
+        except OSError as exc:
+            return _build_error_result(
+                f"Cannot execute gh CLI: {exc}",
+                error_type="environment",
             )
 
         if result.returncode != 0:

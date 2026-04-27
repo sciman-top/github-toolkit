@@ -8,6 +8,11 @@ from typing import Any
 
 
 DIRECT_WINDOWS_POWERSHELL_PATTERNS = (
+    re.compile(
+        r"(^|[\s;&|()])(?:&\s*)?(?:['\"]?[^'\"\s]*[\\/])?"
+        r"powershell(?:\.exe)?['\"]?(?=$|[\s;&|()])",
+        re.IGNORECASE,
+    ),
     re.compile(r"(^|\s)&\s*powershell(?:\.exe)?\b", re.IGNORECASE),
     re.compile(
         r"\bpowershell(?:\.exe)?\s+-(NoProfile|ExecutionPolicy|File|Command)\b",
@@ -56,6 +61,10 @@ def _is_sensitive_path(path_text: str) -> bool:
     return ".env." in lowered or "id_rsa" in lowered or "id_ed25519" in lowered
 
 
+def _uses_direct_windows_powershell(command: str) -> bool:
+    return any(pattern.search(command) for pattern in DIRECT_WINDOWS_POWERSHELL_PATTERNS)
+
+
 def _block(reason: str) -> int:
     print(reason, file=sys.stderr)
     return 2
@@ -72,7 +81,7 @@ def main() -> int:
 
     if tool_name == "Bash":
         command = str(tool_input.get("command") or "")
-        if any(pattern.search(command) for pattern in DIRECT_WINDOWS_POWERSHELL_PATTERNS):
+        if _uses_direct_windows_powershell(command):
             return _block(
                 "Blocked by governed Claude Code hook: use pwsh / PowerShell 7 or a repo helper "
                 "instead of direct powershell.exe invocation."

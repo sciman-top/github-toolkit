@@ -55,9 +55,10 @@
 - `test_toolkit.py`、`test_support.py`：回归测试与受限环境 mock fallback。
 - `scripts/Verify-WindowsProcessEnvironment.ps1`：Codex/PowerShell/`gh` 环境诊断。
 - `scripts/benchmark_hotpaths.py`：fork 列表/同步热点基准。
+- `.claude/hooks/governed-pre-tool-use.py`：Claude Code 工具前置安全拦截（敏感文件读取、direct `powershell.exe` 调用）。
 
 ### C.2 门禁命令与顺序（硬门禁）
-- build：`python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py`
+- build：`python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py .claude/hooks/governed-pre-tool-use.py`
 - test：`python -m unittest test_toolkit.py`
 - contract/invariant：`python -m unittest test_toolkit.py`
 - hotspot：复核本次改动的 GitHub API 参数、删除保护、dry-run/force 确认边界；触及性能路径时运行 `python scripts/benchmark_hotpaths.py --sizes 10,100,500 --runs 5 --check`。
