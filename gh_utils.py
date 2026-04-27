@@ -18,6 +18,7 @@ remains a future option if the repository adopts a stricter auth posture.
 """
 
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -230,6 +231,10 @@ def _resolved_windows_root():
     return r"C:\Windows"
 
 
+def _windows_join(*parts):
+    return ntpath.join(*parts)
+
+
 def ensure_windows_process_environment():
     """Restore Windows base environment variables commonly stripped by hosts."""
     if os.name != "nt":
@@ -238,8 +243,8 @@ def ensure_windows_process_environment():
     repaired = {}
     _restore_safe_codex_shell_environment_policy(repaired)
     system_root = _resolved_windows_root()
-    if os.path.basename(system_root).lower() == "system32":
-        system_root = os.path.dirname(system_root)
+    if ntpath.basename(system_root).lower() == "system32":
+        system_root = ntpath.dirname(system_root)
 
     user_profile = os.environ.get("USERPROFILE")
     if not user_profile:
@@ -250,13 +255,13 @@ def ensure_windows_process_environment():
     defaults = {
         "SystemRoot": system_root,
         "WINDIR": system_root,
-        "ComSpec": os.path.join(system_root, "System32", "cmd.exe"),
+        "ComSpec": _windows_join(system_root, "System32", "cmd.exe"),
         "PROGRAMDATA": os.environ.get("PROGRAMDATA") or r"C:\ProgramData",
         "ProgramFiles": os.environ.get("ProgramFiles") or r"C:\Program Files",
     }
     if user_profile:
-        defaults["APPDATA"] = os.path.join(user_profile, "AppData", "Roaming")
-        defaults["LOCALAPPDATA"] = os.path.join(user_profile, "AppData", "Local")
+        defaults["APPDATA"] = _windows_join(user_profile, "AppData", "Roaming")
+        defaults["LOCALAPPDATA"] = _windows_join(user_profile, "AppData", "Local")
 
     for key in WINDOWS_REQUIRED_ENV_VARS:
         value = os.environ.get(key) or defaults.get(key)
@@ -267,15 +272,15 @@ def ensure_windows_process_environment():
         else:
             _set_default_env_var(key, value, repaired)
 
-    _prepend_path_entry(os.path.join(system_root, "System32"))
+    _prepend_path_entry(_windows_join(system_root, "System32"))
     _prepend_path_entry(system_root)
-    _prepend_path_entry(os.path.join(
+    _prepend_path_entry(_windows_join(
         system_root,
         "System32",
         "WindowsPowerShell",
         "v1.0",
     ))
-    _prepend_path_entry(os.path.join(
+    _prepend_path_entry(_windows_join(
         os.environ.get("ProgramFiles", r"C:\Program Files"),
         "GitHub CLI",
     ))
