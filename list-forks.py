@@ -56,6 +56,19 @@ def _print_help():
     print(HELP_TEXT.rstrip())
 
 
+def _parse_nonnegative_int(value):
+    """Return value as a non-negative int, or None when malformed."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
 def _collect_fork_statuses(forks):
     """Collect fork status rows for text and JSON renderers."""
     rows = []
@@ -77,7 +90,7 @@ def _collect_fork_statuses(forks):
         if compare_endpoint:
             compare = gh_api(compare_endpoint)
             if isinstance(compare, dict) and "ahead_by" in compare:
-                behind_by = compare["ahead_by"]
+                behind_by = _parse_nonnegative_int(compare["ahead_by"])
 
         rows.append({
             "name": fork["name"],

@@ -852,6 +852,19 @@ class TestSafetyCheck(unittest.TestCase):
 
     @patch.object(sync_forks, "gh_api")
     @patch.object(sync_forks, "get_file_count")
+    def test_removed_filename_malformed_aborts(self, mock_gfc, mock_api):
+        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 105
+        mock_api.return_value = {
+            "total_deletions": 1,
+            "files": [{"status": "removed", "filename": None}],
+        }
+
+        self.assertFalse(
+            sync_forks.safety_check("f", "main", "u/repo", "main")
+        )
+
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "get_file_count")
     def test_exact_threshold_passes(self, mock_gfc, mock_api):
         # 50 files * 0.5 = 25 threshold, upstream=25 should pass
         mock_gfc.side_effect = lambda repo, _: 50 if repo == "f" else 25
@@ -1483,6 +1496,24 @@ class TestListForks(unittest.TestCase):
 
         self.assertEqual(rows[0]["behind_by"], 3)
 
+    @patch.object(list_forks, "gh_api")
+    def test_collect_fork_statuses_ignores_malformed_ahead_by(self, mock_api):
+        fork = {
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "main",
+            "parent": "upstream-owner/forked-repo",
+            "parent_branch": "main",
+            "parent_owner": "upstream-owner",
+        }
+        mock_api.side_effect = [
+            {"content": "workflow"},
+            {"ahead_by": True, "behind_by": 0},
+        ]
+
+        rows = list_forks._collect_fork_statuses([fork])
+        self.assertIsNone(rows[0]["behind_by"])
+
     @patch.object(list_forks, "get_auth_context")
     @patch.object(list_forks, "check_gh_cli")
     def test_json_output_treats_non_dict_workflow_response_as_missing(
@@ -1998,6 +2029,27 @@ class TestSyncForksHelpers(unittest.TestCase):
         rows, summary = sync_forks._verify_schedule_readiness(forks)
         self.assertEqual(rows[0]["next_action"], "none")
         self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["errors"], 0)
+
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_schedule_readiness_handles_malformed_run_item(self, mock_api):
+        forks = [{
+            "name": "fork-a",
+            "full_name": "me/fork-a",
+            "branch": "main",
+            "parent": "upstream/a",
+            "parent_branch": "main",
+        }]
+        mock_api.side_effect = [
+            {"path": ".github/workflows/sync-fork.yml"},
+            {"name": "SYNC_PAT"},
+            {"workflow_runs": [None]},
+        ]
+
+        rows, summary = sync_forks._verify_schedule_readiness(forks)
+        self.assertEqual(rows[0]["next_action"], "wait_or_trigger_smoke_run")
+        self.assertIsNone(rows[0]["last_scheduled_run"])
+        self.assertEqual(summary["ready"], 0)
         self.assertEqual(summary["errors"], 0)
 
 

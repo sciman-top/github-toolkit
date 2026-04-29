@@ -367,7 +367,11 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
             print("  ABORT: Compare response file entry is malformed.")
             return ABORT
         if item.get("status") == "removed":
-            deleted_files.append(item.get("filename", ""))
+            filename = item.get("filename")
+            if not isinstance(filename, str) or not filename.strip():
+                print("  ABORT: Compare response removed filename is malformed.")
+                return ABORT
+            deleted_files.append(filename)
     deletion_limit = 5 + (fork_count // 10)
 
     print(f"  Deletions: {total_deletions} (limit: {deletion_limit})")
@@ -737,13 +741,14 @@ def _build_verify_schedule_row(fork):
         runs = scheduled_runs.get("workflow_runs")
         if isinstance(runs, list) and runs:
             last = runs[0]
-            row["last_scheduled_run"] = {
-                "status": last.get("status"),
-                "conclusion": last.get("conclusion"),
-                "created_at": last.get("created_at"),
-                "updated_at": last.get("updated_at"),
-                "html_url": last.get("html_url"),
-            }
+            if isinstance(last, dict):
+                row["last_scheduled_run"] = {
+                    "status": last.get("status"),
+                    "conclusion": last.get("conclusion"),
+                    "created_at": last.get("created_at"),
+                    "updated_at": last.get("updated_at"),
+                    "html_url": last.get("html_url"),
+                }
     elif not _is_not_found_error(scheduled_runs):
         row["result"] = RESULT_ERROR
         row["scheduled_run_error"] = _short_error(scheduled_runs)
