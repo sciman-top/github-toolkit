@@ -73,6 +73,7 @@ Usage:
 
 Options:
   --add-workflow   Add or update sync-fork.yml instead of syncing now
+  --verify-schedule Verify workflow/secret/scheduled-run readiness
   --dry-run        Preview planned changes without modifying repos
   --force          Bypass safety checks (sync needs explicit confirmation)
   --json           Emit a machine-readable JSON summary
@@ -639,6 +640,7 @@ def _parse_cli_args(argv):
         "dry_run": False,
         "force": False,
         "add_mode": False,
+        "verify_schedule": False,
         "json_output": "--json" in argv,
         "specific_repos": [],
         "show_help": False,
@@ -659,6 +661,9 @@ def _parse_cli_args(argv):
                 continue
             if arg == "--add-workflow":
                 parsed["add_mode"] = True
+                continue
+            if arg == "--verify-schedule":
+                parsed["verify_schedule"] = True
                 continue
             if arg == "--json":
                 parsed["json_output"] = True
@@ -689,21 +694,126 @@ def _print_help():
     print(HELP_TEXT.rstrip())
 
 
+def _build_verify_schedule_row(fork):
+    """Collect schedule-readiness details for one fork repository."""
+    full_name = fork["full_name"]
+    branch = fork["branch"]
+    encoded_branch = encode_url_component(branch)
+
+    row = {
+        "name": fork["name"],
+        "full_name": full_name,
+        "branch": branch,
+        "upstream": fork["parent"],
+        "upstream_branch": fork["parent_branch"],
+        "workflow_installed": False,
+        "secret_sync_pat_present": False,
+        "last_scheduled_run": None,
+        "result": RESULT_OK,
+    }
+
+    workflow = gh_api(
+        "repos/"
+        f"{full_name}/contents/.github/workflows/sync-fork.yml?ref={encoded_branch}"
+    )
+    if isinstance(workflow, dict) and "error" not in workflow:
+        row["workflow_installed"] = True
+    elif not _is_not_found_error(workflow):
+        row["result"] = RESULT_ERROR
+        row["workflow_error"] = _short_error(workflow)
+
+    secret = gh_api(f"repos/{full_name}/actions/secrets/SYNC_PAT")
+    if isinstance(secret, dict) and "error" not in secret:
+        row["secret_sync_pat_present"] = True
+    elif not _is_not_found_error(secret):
+        row["result"] = RESULT_ERROR
+        row["secret_error"] = _short_error(secret)
+
+    scheduled_runs = gh_api(
+        "repos/"
+        f"{full_name}/actions/workflows/sync-fork.yml/runs?event=schedule&per_page=1"
+    )
+    if isinstance(scheduled_runs, dict) and "error" not in scheduled_runs:
+        runs = scheduled_runs.get("workflow_runs")
+        if isinstance(runs, list) and runs:
+            last = runs[0]
+            row["last_scheduled_run"] = {
+                "status": last.get("status"),
+                "conclusion": last.get("conclusion"),
+                "created_at": last.get("created_at"),
+                "updated_at": last.get("updated_at"),
+                "html_url": last.get("html_url"),
+            }
+    elif not _is_not_found_error(scheduled_runs):
+        row["result"] = RESULT_ERROR
+        row["scheduled_run_error"] = _short_error(scheduled_runs)
+
+    if row["result"] == RESULT_ERROR:
+        row["next_action"] = "investigate_api_errors"
+    elif not row["workflow_installed"]:
+        row["next_action"] = "install_sync_workflow"
+    elif not row["secret_sync_pat_present"]:
+        row["next_action"] = "set_sync_pat_secret"
+    elif row["last_scheduled_run"] is None:
+        row["next_action"] = "wait_or_trigger_smoke_run"
+    elif row["last_scheduled_run"].get("conclusion") != "success":
+        row["next_action"] = "inspect_last_scheduled_failure"
+    else:
+        row["next_action"] = "none"
+
+    return row
+
+
+def _verify_schedule_readiness(forks):
+    """Return readiness rows and summary counts for schedule verification mode."""
+    rows = []
+    summary = {
+        "total": len(forks),
+        "ready": 0,
+        "missing_workflow": 0,
+        "missing_secret": 0,
+        "scheduled_run_missing_or_unhealthy": 0,
+        "errors": 0,
+    }
+
+    for fork in forks:
+        row = _build_verify_schedule_row(fork)
+        rows.append(row)
+
+        if row["result"] == RESULT_ERROR:
+            summary["errors"] += 1
+            continue
+        if not row["workflow_installed"]:
+            summary["missing_workflow"] += 1
+        if not row["secret_sync_pat_present"]:
+            summary["missing_secret"] += 1
+        run = row["last_scheduled_run"] or {}
+        if run.get("conclusion") != "success":
+            summary["scheduled_run_missing_or_unhealthy"] += 1
+        if row["next_action"] == "none":
+            summary["ready"] += 1
+
+    return rows, summary
+
+
 def _run(parsed):
     """Execute the sync-forks workflow and return (exit_code, report)."""
-    dry_run = parsed["dry_run"]
-    force = parsed["force"]
-    add_mode = parsed["add_mode"]
-    specific_repos = parsed["specific_repos"]
+    dry_run = parsed.get("dry_run", False)
+    force = parsed.get("force", False)
+    add_mode = parsed.get("add_mode", False)
+    verify_schedule = parsed.get("verify_schedule", False)
+    specific_repos = parsed.get("specific_repos", [])
     unique_specific_repos = _dedupe_preserve_order(specific_repos)
-    json_output = parsed["json_output"]
+    json_output = parsed.get("json_output", False)
 
     check_gh_cli()
     auth_context = get_auth_context()
     auth_info = auth_context["auth"]
     username = auth_context["username"]
 
-    mode = "add-workflow" if add_mode else "sync"
+    mode = "verify-schedule" if verify_schedule else (
+        "add-workflow" if add_mode else "sync"
+    )
     report = {
         "tool": "sync-forks",
         "user": username,
@@ -724,7 +834,10 @@ def _run(parsed):
     }
 
     force_ack = os.environ.get(FORCE_SYNC_ACK_ENV, "").strip()
-    if force and not dry_run and not add_mode and force_ack != FORCE_SYNC_ACK_VALUE:
+    if (
+        force and not dry_run and not add_mode and not verify_schedule
+        and force_ack != FORCE_SYNC_ACK_VALUE
+    ):
         report.update({
             "error": "force_confirmation_required",
             "error_code": "E_FORCE_CONFIRMATION_REQUIRED",
@@ -738,7 +851,9 @@ def _run(parsed):
             print(f"ERROR: {report['message']}")
         return EXIT_ERROR, report
 
-    text_mode = "ADD-WORKFLOW" if add_mode else "SYNC"
+    text_mode = "VERIFY-SCHEDULE" if verify_schedule else (
+        "ADD-WORKFLOW" if add_mode else "SYNC"
+    )
     if dry_run:
         text_mode += " (DRY-RUN)"
     if force:
@@ -787,6 +902,26 @@ def _run(parsed):
             print(message)
         exit_code = EXIT_ERROR if (specific_repos or resolve_errors) else EXIT_OK
         return exit_code, report
+
+    if verify_schedule:
+        rows, verify_summary = _verify_schedule_readiness(forks)
+        report["repos"] = rows
+        report["summary"].update(verify_summary)
+        report["message"] = (
+            "Schedule readiness verified: "
+            f"ready {verify_summary['ready']}/{verify_summary['total']}."
+        )
+        if not json_output:
+            print(report["message"])
+        if verify_summary["errors"]:
+            return EXIT_ERROR, report
+        if (
+            verify_summary["missing_workflow"]
+            or verify_summary["missing_secret"]
+            or verify_summary["scheduled_run_missing_or_unhealthy"]
+        ):
+            return EXIT_SAFETY, report
+        return EXIT_OK, report
 
     if not json_output:
         print(f"Found {len(forks)} fork repo(s):\n")

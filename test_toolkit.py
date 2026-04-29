@@ -1954,6 +1954,180 @@ class TestSyncForksHelpers(unittest.TestCase):
             ["fork-a", "fork-b", "fork-c"],
         )
 
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_schedule_readiness_counts_missing_items(self, mock_api):
+        forks = [{
+            "name": "fork-a",
+            "full_name": "me/fork-a",
+            "branch": "main",
+            "parent": "upstream/a",
+            "parent_branch": "main",
+        }]
+        mock_api.side_effect = [
+            {"error": "404", "error_type": "not_found", "status_code": 404},
+            {"error": "404", "error_type": "not_found", "status_code": 404},
+            {"workflow_runs": []},
+        ]
+
+        rows, summary = sync_forks._verify_schedule_readiness(forks)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["next_action"], "install_sync_workflow")
+        self.assertFalse(rows[0]["workflow_installed"])
+        self.assertFalse(rows[0]["secret_sync_pat_present"])
+        self.assertEqual(summary["ready"], 0)
+        self.assertEqual(summary["missing_workflow"], 1)
+        self.assertEqual(summary["missing_secret"], 1)
+        self.assertEqual(summary["scheduled_run_missing_or_unhealthy"], 1)
+        self.assertEqual(summary["errors"], 0)
+
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_schedule_readiness_counts_ready_repo(self, mock_api):
+        forks = [{
+            "name": "fork-a",
+            "full_name": "me/fork-a",
+            "branch": "main",
+            "parent": "upstream/a",
+            "parent_branch": "main",
+        }]
+        mock_api.side_effect = [
+            {"path": ".github/workflows/sync-fork.yml"},
+            {"name": "SYNC_PAT"},
+            {"workflow_runs": [{
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-04-29T00:00:00Z",
+                "updated_at": "2026-04-29T00:01:00Z",
+                "html_url": "https://example.com/run/1",
+            }]},
+        ]
+
+        rows, summary = sync_forks._verify_schedule_readiness(forks)
+        self.assertEqual(rows[0]["next_action"], "none")
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["errors"], 0)
+
+
+class TestSyncForksVerifyScheduleMode(unittest.TestCase):
+    @patch.object(sync_forks, "_verify_schedule_readiness")
+    @patch.object(sync_forks, "get_fork_repos_with_evidence")
+    @patch.object(sync_forks, "get_auth_context")
+    @patch.object(sync_forks, "check_gh_cli")
+    def test_verify_schedule_json_returns_exit_safety_when_not_ready(
+        self, _mock_check, mock_auth_context, mock_get_forks, mock_verify
+    ):
+        mock_auth_context.return_value = {
+            "username": "me",
+            "auth": {
+                "configured": True,
+                "mode": "gh_login",
+                "source": "gh auth login",
+            },
+        }
+        mock_get_forks.return_value = ([{
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "main",
+            "parent": "upstream-owner/forked-repo",
+            "parent_branch": "main",
+            "parent_owner": "upstream-owner",
+        }], {
+            "source": "live_github_api",
+            "endpoint": "user/repos?affiliation=owner&visibility=all",
+            "fetched_at": "2026-04-29T00:00:00Z",
+            "authenticated_user": "me",
+            "repo_count": 1,
+            "fork_count": 1,
+            "parent_detail_lookup_count": 0,
+            "parent_detail_cache_hit_count": 0,
+        })
+        mock_verify.return_value = ([{
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "main",
+            "upstream": "upstream-owner/forked-repo",
+            "upstream_branch": "main",
+            "workflow_installed": False,
+            "secret_sync_pat_present": False,
+            "last_scheduled_run": None,
+            "result": sync_forks.RESULT_OK,
+            "next_action": "install_sync_workflow",
+        }], {
+            "total": 1,
+            "ready": 0,
+            "missing_workflow": 1,
+            "missing_secret": 1,
+            "scheduled_run_missing_or_unhealthy": 1,
+            "errors": 0,
+        })
+
+        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--json", "--verify-schedule"]):
+            with contextlib.redirect_stdout(io.StringIO()) as captured:
+                exit_code = sync_forks.main()
+
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(exit_code, sync_forks.EXIT_SAFETY)
+        self.assertEqual(payload["mode"], "verify-schedule")
+        self.assertEqual(payload["summary"]["ready"], 0)
+        self.assertEqual(payload["summary"]["missing_workflow"], 1)
+
+    @patch.object(sync_forks, "_verify_schedule_readiness")
+    @patch.object(sync_forks, "get_fork_repos_with_evidence")
+    @patch.object(sync_forks, "get_auth_context")
+    @patch.object(sync_forks, "check_gh_cli")
+    def test_verify_schedule_json_returns_exit_error_when_api_errors(
+        self, _mock_check, mock_auth_context, mock_get_forks, mock_verify
+    ):
+        mock_auth_context.return_value = {
+            "username": "me",
+            "auth": {
+                "configured": True,
+                "mode": "gh_login",
+                "source": "gh auth login",
+            },
+        }
+        mock_get_forks.return_value = ([{
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "main",
+            "parent": "upstream-owner/forked-repo",
+            "parent_branch": "main",
+            "parent_owner": "upstream-owner",
+        }], {
+            "source": "live_github_api",
+            "endpoint": "user/repos?affiliation=owner&visibility=all",
+            "fetched_at": "2026-04-29T00:00:00Z",
+            "authenticated_user": "me",
+            "repo_count": 1,
+            "fork_count": 1,
+            "parent_detail_lookup_count": 0,
+            "parent_detail_cache_hit_count": 0,
+        })
+        mock_verify.return_value = ([{
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "main",
+            "upstream": "upstream-owner/forked-repo",
+            "upstream_branch": "main",
+            "workflow_installed": False,
+            "secret_sync_pat_present": False,
+            "last_scheduled_run": None,
+            "result": sync_forks.RESULT_ERROR,
+            "next_action": "investigate_api_errors",
+        }], {
+            "total": 1,
+            "ready": 0,
+            "missing_workflow": 0,
+            "missing_secret": 0,
+            "scheduled_run_missing_or_unhealthy": 0,
+            "errors": 1,
+        })
+
+        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--json", "--verify-schedule"]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = sync_forks.main()
+
+        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
+
 
 if __name__ == "__main__":
     unittest.main()
