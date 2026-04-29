@@ -1,6 +1,7 @@
 param(
     [switch]$Json,
-    [switch]$SkipGh
+    [switch]$SkipGh,
+    [switch]$SkipPythonWriteProbe
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,6 +20,16 @@ function New-Check {
         ok = $Ok
         message = $Message
     }
+}
+
+function Invoke-CheckedCommand {
+    param(
+        [string]$Name,
+        [scriptblock]$Command
+    )
+
+    $output = (& $Command 2>&1) | Out-String
+    [void]$checks.Add((New-Check -Name $Name -Ok ($LASTEXITCODE -eq 0) -Message $output.Trim()))
 }
 
 $checks = [System.Collections.Generic.List[object]]::new()
@@ -58,6 +69,15 @@ $python = Get-Command python -ErrorAction SilentlyContinue
 if ($python) {
     $dnsOutput = (& python -c "import socket; print(socket.getaddrinfo('api.github.com', 443)[0][4][0])" 2>&1) | Out-String
     [void]$checks.Add((New-Check -Name "python dns" -Ok ($LASTEXITCODE -eq 0) -Message $dnsOutput.Trim()))
+
+    if (-not $SkipPythonWriteProbe) {
+        Invoke-CheckedCommand -Name "python write probe (workspace)" -Command {
+            python -c "from pathlib import Path; p = Path('.governed-ai') / 'write-probe.tmp'; p.parent.mkdir(parents=True, exist_ok=True); p.write_text('ok', encoding='utf-8'); p.unlink(); print('ok')"
+        }
+        Invoke-CheckedCommand -Name "python py_compile probe" -Command {
+            python -m py_compile gh_utils.py
+        }
+    }
 }
 
 $ok = @($checks | Where-Object { -not $_.ok }).Count -eq 0

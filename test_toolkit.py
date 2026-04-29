@@ -9,12 +9,11 @@ import json
 import os
 # Tests construct TimeoutExpired only.
 import subprocess  # nosec B404
-import tempfile
 import unittest
 try:
     from unittest.mock import Mock, patch
 except OSError:
-    from test_support import Mock, patch
+    from test_support import Mock, patch  # type: ignore[assignment]
 
 import gh_utils
 from gh_utils import (
@@ -30,24 +29,23 @@ from gh_utils import (
 
 # Load sync-forks module (hyphen in filename prevents normal import)
 _here = os.path.dirname(os.path.abspath(__file__))
-_spec = importlib.util.spec_from_file_location(
-    "sync_forks", os.path.join(_here, "sync-forks.py")
-)
-sync_forks = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(sync_forks)
 
-_list_spec = importlib.util.spec_from_file_location(
-    "list_forks", os.path.join(_here, "list-forks.py")
-)
-list_forks = importlib.util.module_from_spec(_list_spec)
-_list_spec.loader.exec_module(list_forks)
 
-_claude_hook_spec = importlib.util.spec_from_file_location(
+def _load_module(module_name, module_path):
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load module spec: {module_name} -> {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+sync_forks = _load_module("sync_forks", os.path.join(_here, "sync-forks.py"))
+list_forks = _load_module("list_forks", os.path.join(_here, "list-forks.py"))
+claude_hook = _load_module(
     "governed_pre_tool_use",
     os.path.join(_here, ".claude", "hooks", "governed-pre-tool-use.py"),
 )
-claude_hook = importlib.util.module_from_spec(_claude_hook_spec)
-_claude_hook_spec.loader.exec_module(claude_hook)
 
 
 def _encode(text):
@@ -594,23 +592,19 @@ class TestWindowsProcessEnvironment(unittest.TestCase):
                 self.assertIn("SystemRoot", repaired)
 
     def test_ensure_windows_process_environment_imports_codex_proxy_policy(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            with open(os.path.join(tmp_dir, "config.toml"), "w", encoding="utf-8") as handle:
-                handle.write(
-                    "\n".join([
-                        "[shell_environment_policy.set]",
-                        'HTTP_PROXY = "http://127.0.0.1:10808"',
-                        'HTTPS_PROXY = "http://127.0.0.1:10808"',
-                        'NO_PROXY = "localhost,127.0.0.1,::1"',
-                        'ANTHROPIC_AUTH_TOKEN = "must-not-propagate"',
-                    ])
-                    + "\n"
-                )
+        with patch.object(
+            gh_utils,
+            "_read_codex_shell_environment_policy_set",
+            return_value={
+                "HTTP_PROXY": "http://127.0.0.1:10808",
+                "HTTPS_PROXY": "http://127.0.0.1:10808",
+                "NO_PROXY": "localhost,127.0.0.1,::1",
+            },
+        ):
             with patch.object(gh_utils.os, "name", "nt"):
                 with patch.dict(
                     gh_utils.os.environ,
                     {
-                        "CODEX_HOME": tmp_dir,
                         "USERPROFILE": r"C:\Users\sciman",
                         "PATH": "",
                     },

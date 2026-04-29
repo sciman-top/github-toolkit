@@ -112,11 +112,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Verify-WindowsProces
 - `gh` 是否在 `PATH` 中
 - `gh auth status` 是否可用
 - Python 是否能解析 `api.github.com`
+- Python 是否具备工作区写入/删除能力
+- `python -m py_compile gh_utils.py` 是否可执行（用于识别 `.pyc` 原子写入权限阻塞）
 
 如果只想检查环境变量和 PATH，不访问 GitHub 认证状态：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Verify-WindowsProcessEnvironment.ps1 -SkipGh
+```
+
+如果只想跳过 Python 写入与 `py_compile` 探针（例如只做网络/认证排查）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Verify-WindowsProcessEnvironment.ps1 -SkipPythonWriteProbe
 ```
 
 Python 入口也会在导入 `gh_utils.py` 时自动补齐同一组 Windows 基础变量和安全白名单代理变量，所以直接执行 `python sync-forks.py --json` 或 `python list-forks.py --json` 时也具备同样的防护。
