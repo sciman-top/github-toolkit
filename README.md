@@ -78,6 +78,8 @@ python sync-forks.py --json --verify-schedule
 - `last_scheduled_run`：最近一次 schedule run 的状态
 - `next_action`：下一步建议，例如 `none`、`install_sync_workflow`、`update_sync_workflow`、`set_sync_pat_secret`
 
+非 JSON 模式会输出每个 fork 的 readiness 明细表，便于直接查看 `next_action`。
+
 ## 配置与认证
 ### 认证方式
 本项目支持两种认证方式，优先级如下：

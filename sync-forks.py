@@ -929,6 +929,7 @@ def _run_verify_schedule_mode(report, forks, json_output):
         f"ready {verify_summary['ready']}/{verify_summary['total']}."
     )
     if not json_output:
+        _print_verify_schedule_rows(rows)
         print(report["message"])
     if verify_summary["errors"]:
         return EXIT_ERROR, report
@@ -940,6 +941,42 @@ def _run_verify_schedule_mode(report, forks, json_output):
     ):
         return EXIT_SAFETY, report
     return EXIT_OK, report
+
+
+def _format_bool_status(value):
+    """Return a compact status label for text tables."""
+    return "yes" if value else "no"
+
+
+def _format_last_scheduled_run(row):
+    """Return a compact last scheduled run label for text tables."""
+    run = row.get("last_scheduled_run")
+    if not isinstance(run, dict):
+        return "-"
+    conclusion = run.get("conclusion") or run.get("status")
+    return str(conclusion) if conclusion else "-"
+
+
+def _print_verify_schedule_rows(rows):
+    """Print per-repo readiness rows for text-mode diagnostics."""
+    if not rows:
+        return
+    print("Schedule readiness details:")
+    print(
+        f"{'Repository':<35} {'Workflow':<10} {'Current':<8} "
+        f"{'Secret':<7} {'Last':<10} {'Next action'}"
+    )
+    print("-" * 92)
+    for row in rows:
+        print(
+            f"{row['full_name']:<35} "
+            f"{_format_bool_status(row.get('workflow_installed')):<10} "
+            f"{_format_bool_status(row.get('workflow_current')):<8} "
+            f"{_format_bool_status(row.get('secret_sync_pat_present')):<7} "
+            f"{_format_last_scheduled_run(row):<10} "
+            f"{row.get('next_action') or '-'}"
+        )
+    print()
 
 
 def _print_fork_overview(forks, json_output):

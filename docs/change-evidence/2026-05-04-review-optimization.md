@@ -27,6 +27,7 @@
 - Fixed verify-schedule mode exit semantics so `summary.workflow_needs_update > 0` returns `EXIT_SAFETY` instead of reporting success.
 - Added regression coverage for `workflow_needs_update` mode-level safety exit behavior.
 - Added synthetic benchmark coverage for `verify_schedule_readiness` and documented the benchmark scope in `README.md`.
+- Added text-mode per-repo readiness details for `--verify-schedule`, including workflow, template currency, secret, last scheduled state, and `next_action`.
 
 ## Verification
 - `python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py .claude/hooks/governed-pre-tool-use.py`
@@ -37,7 +38,7 @@
   - passed as contract/invariant, `Ran 147 tests ... OK`
 - `python scripts/benchmark_hotpaths.py --sizes 10,100,500 --runs 5 --check`
   - passed, `threshold_check.violations=[]`
-  - final 500-row mean timings after benchmark expansion: `collect_fork_statuses=13.111ms`, `fork_discovery_hydration=7.444ms`, `sync_all_report=7.691ms`, `sync_specific_deduped=8.927ms`, `verify_schedule_readiness=41.397ms`
+  - final 500-row mean timings after benchmark expansion: `collect_fork_statuses=11.774ms`, `fork_discovery_hydration=6.137ms`, `sync_all_report=6.51ms`, `sync_specific_deduped=5.732ms`, `verify_schedule_readiness=34.42ms`
 - `python -m ruff check .`
   - passed, `All checks passed!`
 - `python -m mypy gh_utils.py list-forks.py sync-forks.py scripts/benchmark_hotpaths.py`
@@ -50,6 +51,8 @@
 - Refactor shape check:
   - `_run()` reduced from 186 lines to 48 lines
   - extracted helpers: `_resolve_run_forks=23 lines`, `_run_verify_schedule_mode=21 lines`, `_run_mutating_or_dryrun_mode=32 lines`
+- `python sync-forks.py --verify-schedule`
+  - text mode now prints per-repo readiness details before the summary
 
 ## Rollback
 - Local rollback: revert this task's diff for `gh_utils.py`, `list-forks.py`, `sync-forks.py`, `test_toolkit.py`, `README.md`, and this evidence file.
