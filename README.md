@@ -13,7 +13,7 @@ Fork 仓库自动同步管理工具集，带安全防护机制。
 | 脚本 | 用途 |
 |------|------|
 | `setup.bat` | 检测/安装 `gh` CLI，完成登录和权限准备 |
-| `sync-forks.py` | 添加同步 workflow，或执行同步，支持 `--json` |
+| `sync-forks.py` | 添加同步 workflow、检查定时同步 readiness，或执行同步，支持 `--json` |
 | `list-forks.py` | 查看所有 fork 和同步状态，支持 `--json` |
 | `gh_utils.py` | 公共 GitHub 辅助逻辑 |
 | `scripts/Verify-WindowsProcessEnvironment.ps1` | 诊断 Codex/PowerShell 进程环境与 `gh` 可用性 |
@@ -67,7 +67,16 @@ python sync-forks.py --json
 ```powershell
 python list-forks.py
 python list-forks.py --json
+python sync-forks.py --json --verify-schedule
 ```
+
+`--verify-schedule` 是只读检查，用于确认 fork 上的同步 workflow、`SYNC_PAT` secret 和最近一次定时运行是否满足自动同步条件。JSON 输出会包含：
+
+- `workflow_installed`：目标 fork 是否存在 `.github/workflows/sync-fork.yml`
+- `workflow_current` / `workflow_update_reason`：现有 workflow 是否匹配当前安全模板；缺少 `workflow_dispatch` 或模板漂移时会建议 `update_sync_workflow`
+- `secret_sync_pat_present`：目标 fork 是否存在 `SYNC_PAT`
+- `last_scheduled_run`：最近一次 schedule run 的状态
+- `next_action`：下一步建议，例如 `none`、`install_sync_workflow`、`update_sync_workflow`、`set_sync_pat_secret`
 
 ## 配置与认证
 ### 认证方式
@@ -149,6 +158,7 @@ github-toolkit/
 ```powershell
 python sync-forks.py                  # 立即同步所有 fork
 python sync-forks.py --add-workflow   # 添加或更新同步 workflow
+python sync-forks.py --verify-schedule --json  # 只读检查定时同步 readiness
 python sync-forks.py --dry-run        # 预览模式
 python sync-forks.py --json           # 输出 JSON 摘要
 python sync-forks.py --force          # 跳过安全检查（需设置 SYNC_FORKS_FORCE_ACK）

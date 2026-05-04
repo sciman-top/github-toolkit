@@ -42,6 +42,7 @@ from gh_utils import (
     get_file_count,
     get_fork_repos_with_evidence,
     gh_api,
+    parse_nonnegative_int,
 )
 
 # ── Exit codes ────────────────────────────────────────────────
@@ -292,19 +293,6 @@ def _needs_workflow_update(existing_file):
     return False, "already matches current workflow template"
 
 
-def _parse_nonnegative_int(value):
-    """Return value as a non-negative int, or None when malformed."""
-    if isinstance(value, bool):
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    if parsed < 0:
-        return None
-    return parsed
-
-
 def _short_error(payload, default="invalid response payload"):
     """Return a bounded, printable error detail for CLI logs."""
     if isinstance(payload, dict):
@@ -351,7 +339,7 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
         print("  ABORT: Cannot inspect upstream diff safely.")
         return ABORT
 
-    total_deletions = _parse_nonnegative_int(compare.get("total_deletions", 0) or 0)
+    total_deletions = parse_nonnegative_int(compare.get("total_deletions", 0) or 0)
     if total_deletions is None:
         print("  ABORT: Compare response deletion count is malformed.")
         return ABORT
@@ -711,6 +699,8 @@ def _build_verify_schedule_row(fork):
         "upstream": fork["parent"],
         "upstream_branch": fork["parent_branch"],
         "workflow_installed": False,
+        "workflow_current": False,
+        "workflow_update_reason": None,
         "secret_sync_pat_present": False,
         "last_scheduled_run": None,
         "result": RESULT_OK,
@@ -722,9 +712,15 @@ def _build_verify_schedule_row(fork):
     )
     if isinstance(workflow, dict) and "error" not in workflow:
         row["workflow_installed"] = True
+        needs_update, reason = _needs_workflow_update(workflow)
+        row["workflow_current"] = not needs_update
+        if needs_update:
+            row["workflow_update_reason"] = reason
     elif not _is_not_found_error(workflow):
         row["result"] = RESULT_ERROR
         row["workflow_error"] = _short_error(workflow)
+    else:
+        row["workflow_update_reason"] = "missing file"
 
     secret = gh_api(f"repos/{full_name}/actions/secrets/SYNC_PAT")
     if isinstance(secret, dict) and "error" not in secret:
@@ -757,6 +753,8 @@ def _build_verify_schedule_row(fork):
         row["next_action"] = "investigate_api_errors"
     elif not row["workflow_installed"]:
         row["next_action"] = "install_sync_workflow"
+    elif not row["workflow_current"]:
+        row["next_action"] = "update_sync_workflow"
     elif not row["secret_sync_pat_present"]:
         row["next_action"] = "set_sync_pat_secret"
     elif row["last_scheduled_run"] is None:
@@ -776,6 +774,7 @@ def _verify_schedule_readiness(forks):
         "total": len(forks),
         "ready": 0,
         "missing_workflow": 0,
+        "workflow_needs_update": 0,
         "missing_secret": 0,
         "scheduled_run_missing_or_unhealthy": 0,
         "errors": 0,
@@ -790,6 +789,8 @@ def _verify_schedule_readiness(forks):
             continue
         if not row["workflow_installed"]:
             summary["missing_workflow"] += 1
+        elif not row["workflow_current"]:
+            summary["workflow_needs_update"] += 1
         if not row["secret_sync_pat_present"]:
             summary["missing_secret"] += 1
         run = row["last_scheduled_run"] or {}

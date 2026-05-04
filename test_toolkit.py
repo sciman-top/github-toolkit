@@ -25,6 +25,7 @@ from gh_utils import (
     get_file_count,
     get_fork_repos_with_evidence,
     paginate,
+    parse_nonnegative_int,
 )
 
 # Load sync-forks module (hyphen in filename prevents normal import)
@@ -389,6 +390,17 @@ class TestForkMetadataHelpers(unittest.TestCase):
         self.assertEqual(record["parent"], "unknown")
         self.assertEqual(record["parent_branch"], "main")
         self.assertIsNone(record["parent_owner"])
+
+    def test_parse_nonnegative_int_accepts_int_like_values(self):
+        self.assertEqual(parse_nonnegative_int(0), 0)
+        self.assertEqual(parse_nonnegative_int("42"), 42)
+
+    def test_parse_nonnegative_int_rejects_malformed_values(self):
+        self.assertIsNone(parse_nonnegative_int(True))
+        self.assertIsNone(parse_nonnegative_int(False))
+        self.assertIsNone(parse_nonnegative_int("-1"))
+        self.assertIsNone(parse_nonnegative_int("not-int"))
+        self.assertIsNone(parse_nonnegative_int(None))
 
 
 class TestGhApiErrors(unittest.TestCase):
@@ -2014,8 +2026,11 @@ class TestSyncForksHelpers(unittest.TestCase):
             "parent": "upstream/a",
             "parent_branch": "main",
         }]
+        current_workflow = sync_forks.WORKFLOW_TEMPLATE.format(
+            cron=sync_forks.SYNC_CRON
+        )
         mock_api.side_effect = [
-            {"path": ".github/workflows/sync-fork.yml"},
+            {"content": _encode(current_workflow)},
             {"name": "SYNC_PAT"},
             {"workflow_runs": [{
                 "status": "completed",
@@ -2028,7 +2043,41 @@ class TestSyncForksHelpers(unittest.TestCase):
 
         rows, summary = sync_forks._verify_schedule_readiness(forks)
         self.assertEqual(rows[0]["next_action"], "none")
+        self.assertTrue(rows[0]["workflow_current"])
         self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["workflow_needs_update"], 0)
+        self.assertEqual(summary["errors"], 0)
+
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_schedule_readiness_flags_stale_workflow(self, mock_api):
+        forks = [{
+            "name": "fork-a",
+            "full_name": "me/fork-a",
+            "branch": "main",
+            "parent": "upstream/a",
+            "parent_branch": "main",
+        }]
+        stale_workflow = "name: Sync Fork\non:\n  push:\n"
+        mock_api.side_effect = [
+            {"content": _encode(stale_workflow)},
+            {"name": "SYNC_PAT"},
+            {"workflow_runs": [{
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-04-29T00:00:00Z",
+                "updated_at": "2026-04-29T00:01:00Z",
+                "html_url": "https://example.com/run/1",
+            }]},
+        ]
+
+        rows, summary = sync_forks._verify_schedule_readiness(forks)
+        self.assertTrue(rows[0]["workflow_installed"])
+        self.assertFalse(rows[0]["workflow_current"])
+        self.assertIn("workflow_dispatch", rows[0]["workflow_update_reason"])
+        self.assertEqual(rows[0]["next_action"], "update_sync_workflow")
+        self.assertEqual(summary["ready"], 0)
+        self.assertEqual(summary["missing_workflow"], 0)
+        self.assertEqual(summary["workflow_needs_update"], 1)
         self.assertEqual(summary["errors"], 0)
 
     @patch.object(sync_forks, "gh_api")
@@ -2040,8 +2089,11 @@ class TestSyncForksHelpers(unittest.TestCase):
             "parent": "upstream/a",
             "parent_branch": "main",
         }]
+        current_workflow = sync_forks.WORKFLOW_TEMPLATE.format(
+            cron=sync_forks.SYNC_CRON
+        )
         mock_api.side_effect = [
-            {"path": ".github/workflows/sync-fork.yml"},
+            {"content": _encode(current_workflow)},
             {"name": "SYNC_PAT"},
             {"workflow_runs": [None]},
         ]

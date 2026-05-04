@@ -1,102 +1,28 @@
-# GEMINI.md — github-toolkit（Gemini 项目级）
+# GEMINI.md — github-toolkit（Gemini 项目级 wrapper）
 **项目**: github-toolkit
-**承接来源**: `GlobalUser/GEMINI.md v9.50`
+**承接来源**: `GlobalUser/GEMINI.md v9.52`
+**共同项目规则**: `AGENTS.md`（下方独立 import 行）
 **适用范围**: 项目级（仓库根）
-**最后更新**: 2026-05-03
+**最后更新**: 2026-05-04
+
+@AGENTS.md
 
 ## 1. 阅读指引
-- 本文件只写本仓事实、门禁命令、证据位置和回滚入口，不重写全局 `R/E` 语义。
-- 固定结构：`1 / A / B / C / D`。
-- 裁决链：`运行事实/代码 > 项目级文件 > 全局文件 > 临时上下文`。
-- 自包含约束：执行规则以本文件正文为准，不依赖外部子文档或治理脚本作为前置条件。
-- 渐进披露边界：根文件保留本仓边界、门禁、阻断、证据和回滚；长 GitHub API 排障、批量同步样例和历史证据放入 `docs/` 或按需 imports。
-
-## A. 项目基线
-### A.1 事实边界
-- 本仓是 Python GitHub fork/tooling 辅助仓，核心脚本为 `gh_utils.py`、`sync-forks.py`、`list-forks.py`、`test_toolkit.py`、`test_support.py`。
-- 真实同步必须保留 `--dry-run` / 显式确认边界；`--force` 需要 `SYNC_FORKS_FORCE_ACK=I_UNDERSTAND`。
-- 同步保护包括 upstream 可达性、文件数量阈值、关键路径删除保护和 `backup/pre-sync` 恢复点。
-- `GH_TOKEN` / `GITHUB_TOKEN` / `gh auth login` 是认证输入；不得把真实 token 写入仓库文件、日志或证据正文。
-
-### A.2 执行锚点
-- 每次改动先声明：当前落点 -> 目标归宿 -> 验证方式。
-- 默认中文沟通、中文解释、中文汇报；代码标识符、命令、日志、报错和 GitHub API 字段保留英文原文。
-- 全局规则给风险、语言、N/A 和门禁语义；本文件给 github-toolkit 的脚本边界、真实命令、删除保护、证据与回滚入口。
-- 项目规则只保留本仓不可由代码/CI自动推断且会改变执行、风险或验收的事实；长流程下沉到子文档或工具专属规则。
-- 规则文件、门禁、profile、baseline 或同步脚本修改前，必须先比对控制仓 `governed-ai-coding-runtime/rules/manifest.json`、源文件、用户目录/目标仓已分发副本、目标仓真实 gate/profile/CI/script/README 差异和当前工具官方加载模型；发现漂移先整合再同步，不盲目覆盖。
-- 小步闭环，优先根因修复；止血补丁必须标明回收时点。
-
-### A.3 N/A 分类与字段
-- `platform_na`：平台能力缺失、命令不存在、非交互限制或认证上下文不可用。
-- `gate_na`：门禁步骤客观不可执行（含脚本缺失、GitHub 认证不可用、纯文档/注释/排版改动）。
-- 两类 N/A 均必须记录：`reason`、`alternative_verification`、`evidence_link`、`expires_at`。
-- N/A 不得改变门禁顺序：`build -> test -> contract/invariant -> hotspot`。
-
-### A.4 触发式澄清协议
-- 默认执行：`direct_fix`（先修复、后验证）。
-- 触发条件：同一 `issue_id` 连续失败达到阈值（默认 `2`），或同步风险/用户期望持续冲突。
-- 一次最多 3 个澄清问题；确认后恢复 `direct_fix` 并清零失败计数。
-- 留痕字段：`issue_id`、`attempt_count`、`clarification_mode`、`clarification_questions`、`clarification_answers`。
+- 本文件通过上方 import 承接 github-toolkit 的共同项目规则，只追加 Gemini CLI 差异。
+- `AGENTS.md` 中的 `## B. Codex 平台差异` 只适用于 Codex；Gemini 以本文件后续 `## B. Gemini 平台差异` 为准。
+- 不在本文件复制项目事实、门禁、证据、回滚或 `Global Rule -> Repo Action`；若共同规则要变，先改控制仓 `rules/projects/github-toolkit/codex/AGENTS.md` 源文件并同步。
+- 合并后的有效上下文必须能推出：当前落点、目标归宿、门禁顺序、证据路径和回滚入口。
 
 ## B. Gemini 平台差异
-- 用户规则：`~/.gemini/GEMINI.md`；项目/工作区规则按 Gemini CLI 层级加载和按需发现执行。
-- 启用 Trusted Folders 时，未受信目录可能进入 safe mode；遇到项目配置、环境变量、自动记忆或工具自动批准未生效，先记录 trust 状态或替代证据。
-- 可用 `@file.md` imports 组织长内容；只有本机 `settings.json` 明确配置上下文文件名时，才把其他文件名视为 Gemini 上下文文件，具体键名以当前 schema/help 为准。
-- 用 `.geminiignore` 排除临时日志、缓存、本机认证材料和大体积运行态输出；修改后用 `/memory show` 核查完整上下文；来源与刷新命令先看当前 `/memory` help，支持则用 `/memory list` / `/memory refresh`，否则记录版本并用 `/memory reload` 兜底。
-- 不假定 `GEMINI.override.md` 存在；诊断优先执行 `gemini --version`、`gemini --help`。
-- 交互场景用 `/memory show` 查完整上下文；来源与刷新命令先看当前 `/memory` help，支持则用 `/memory list` / `/memory refresh`，否则记录版本并用 `/memory reload` 兜底；非交互不可用时按 `platform_na` 记录。
-- `GEMINI.md` 是上下文规则；确定性验证、安全拦截和回滚能力应落到本仓门禁、MCP/扩展、checkpoint/restore 或 CI。
-- 替代命令仅用于补证据，不得改变本仓门禁顺序与阻断语义。
+- Gemini CLI 默认读取 `GEMINI.md`；本文件用 `AGENTS.md` import 承接共同规则，下面只写 Gemini 差异。
+- 从仓库根或明确工作目录启动，并用 footer、`/memory show` 或当前可用的 `/memory` 帮助确认本文件与 `AGENTS.md` import 已加载。
+- 修改 `.geminiignore`、`context.fileName`、policy 或 settings 后，必须重启 Gemini CLI 或用 `/memory reload`（若当前 help 显示 refresh 则用 refresh）复核实际加载；不支持时记录 `platform_na` 和替代证据。
+- 如果 `context.fileName` 已配置同时加载 `AGENTS.md` 与 `GEMINI.md`，必须用 `/memory show` 证明没有重复加载；如重复，先调整 import 或配置再继续。
+- 不要用 `/memory add` 写入项目临时规则；它会追加到全局 `~/.gemini/GEMINI.md`。
+- 启用 Trusted Folders 时，未受信目录可能禁用项目 settings、`.env`、extensions、工具自动批准和自动 memory；先确认 trust 状态再判断规则失效。
+- 权限和危险命令拦截优先使用 approval mode、policy engine、hooks、checkpoint/restore 或 CI；`GEMINI.md` 只写行为和验收。
+- `checkpoint/restore` 只有在当前 settings 已启用时才能作为回滚证据；否则按 `AGENTS.md` 使用 Git、备份或补丁回滚。
+- `plan` 适合研究和契约收口；转执行前重新确认风险、门禁和回滚。`yolo` 不作为默认模式。
 
-## C. 项目差异（领域与技术）
-### C.1 模块职责
-- `gh_utils.py`：GitHub CLI/API、认证、同步保护与 Windows 环境补齐。
-- `sync-forks.py`：workflow 安装、手动同步、dry-run、force 确认与 JSON 输出。
-- `list-forks.py`：fork 枚举与同步状态输出。
-- `test_toolkit.py`、`test_support.py`：回归测试与受限环境 mock fallback。
-- `scripts/Verify-WindowsProcessEnvironment.ps1`：Codex/PowerShell/`gh` 环境诊断。
-- `scripts/benchmark_hotpaths.py`：fork 列表/同步热点基准。
-- `.claude/hooks/governed-pre-tool-use.py`：Claude Code 工具前置安全拦截（敏感文件读取、direct `powershell.exe` 调用）。
-
-### C.2 门禁命令与顺序（硬门禁）
-- build：`python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py .claude/hooks/governed-pre-tool-use.py`
-- test：`python -m unittest test_toolkit.py`
-- contract/invariant：`python -m unittest test_toolkit.py`
-- hotspot：复核本次改动的 GitHub API 参数、删除保护、dry-run/force 确认边界；触及性能路径时运行 `python scripts/benchmark_hotpaths.py --sizes 10,100,500 --runs 5 --check`。
-- fixed order：`build -> test -> contract/invariant -> hotspot`
-
-### C.3 失败分流与阻断
-- build 失败：阻断，先修语法、导入和脚本路径。
-- test 失败：阻断，先修回归失败再继续。
-- contract/invariant 失败：高风险阻断，禁止真实同步或发布。
-- hotspot 未收敛：阻断；涉及真实 GitHub 写操作时必须先 dry-run 并记录恢复入口。
-
-### C.4 证据与回滚
-- 证据目录：`docs/change-evidence/`（不存在则创建）。
-- 最低字段：规则 ID、风险等级、执行命令、关键输出、是否触发真实 GitHub 写操作、回滚动作。
-- 回滚优先使用 git 历史；真实同步变更还必须记录 `backup/pre-sync` 或等价恢复点。
-
-### C.5 CI 与本地入口
-- 本地门禁以 C.2 命令为准。
-- `setup.bat` 只负责本机 `gh` / 登录准备，不替代门禁。
-- Codex/PowerShell 环境异常先运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Verify-WindowsProcessEnvironment.ps1`。
-
-### C.6 Git 提交与推送边界
-- `整理提交全部` 的“全部”仅指：`本次任务相关 + 应被版本管理 + 通过 .gitignore 的文件`。
-- 默认不纳入：真实 token、临时日志、缓存、运行态探针、本机 `gh` 配置和敏感输出。
-- `push` 仅推送既有 commit 历史；文件筛选必须在 `git add/commit` 前完成。
-
-## D. 维护校验清单
-- 仅落地本仓事实，不复述全局规则正文。
-- 与全局职责互补，不重叠、不缺失。
-- 协同链完整：`规则 -> 落点 -> 命令 -> 证据 -> 回滚`。
-- 协同有效性抽查：仅凭全局 + 项目规则，必须能推出本仓当前落点、目标归宿、硬门禁、证据路径和回滚入口。
-- `Global Rule -> Repo Action`：
-  - `R6`: 本仓门禁命令是硬门禁；quick/fast 只能作为已声明的日常反馈切片，交付前仍按 full gate 或固定顺序收口。
-  - `R8`: 证据与回滚字段是最小留痕；缺字段必须按 N/A 口径说明。
-  - `E4`: hotspot 复核 GitHub API 参数、删除保护、dry-run/force 确认和 `gh` 认证状态。
-  - `E5`: Python、`gh`、workflow token 或第三方依赖变化必须记录供应链/工具基线；新增依赖前先说明必要性。
-  - `E6`: GitHub API 字段、workflow YAML、同步状态 JSON 或持久配置结构变化必须记录兼容性和回滚。
-- 本文件属于控制仓 `governed-ai-coding-runtime/rules/manifest.json` 管理的规则家族；目标仓现场修改必须回写控制仓源文件后再同步。
-- 子文档只承载细节，不替代根文件中的硬门禁和项目事实。
-- 三文件同构约束：`A/C/D` 必须语义一致，仅 `B` 允许平台差异。
+## D. 维护校验
+- 本 wrapper 不改写 `AGENTS.md` 的 A/C/D 项目事实；如发现共同规则与 Gemini 差异冲突，先按代码、gate 和 `AGENTS.md` 事实定位，再回写控制仓源文件。

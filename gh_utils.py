@@ -678,6 +678,19 @@ def encode_url_component(value):
     return quote(value, safe="")
 
 
+def parse_nonnegative_int(value):
+    """Return value as a non-negative int, or None when malformed."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
 def build_compare_endpoint(repo_full_name, base_ref, head_ref):
     """Return a GitHub compare endpoint with branch-safe ref encoding."""
     encoded_base = encode_compare_ref(base_ref)
