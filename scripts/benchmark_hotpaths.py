@@ -7,6 +7,7 @@ CPU-side loop/serialization overhead for core paths.
 """
 
 import argparse
+import base64
 import importlib.util
 import json
 import os
@@ -40,6 +41,7 @@ MAX_MEAN_MS = {
     "fork_discovery_hydration": {10: 250, 100: 1800, 500: 8000},
     "sync_all_report": {10: 200, 100: 1500, 500: 7000},
     "sync_specific_deduped": {10: 250, 100: 1800, 500: 8000},
+    "verify_schedule_readiness": {10: 250, 100: 1800, 500: 8000},
 }
 
 
@@ -302,6 +304,55 @@ def _bench_sync_specific_deduped(count, runs):
         return _measure_ms(task, runs)
 
 
+def _bench_verify_schedule_readiness(count, runs):
+    forks = _build_forks(count)
+    workflow_text = SYNC_FORKS.WORKFLOW_TEMPLATE.format(cron=SYNC_FORKS.SYNC_CRON)
+    workflow_payload = {
+        "content": base64.b64encode(workflow_text.encode()).decode(),
+    }
+    scheduled_runs_payload = {
+        "workflow_runs": [{
+            "status": "completed",
+            "conclusion": "success",
+            "created_at": "2026-04-29T00:00:00Z",
+            "updated_at": "2026-04-29T00:01:00Z",
+            "html_url": "https://example.com/run/1",
+        }],
+    }
+
+    def fake_gh_api(endpoint, *_args, **_kwargs):
+        if "/contents/.github/workflows/sync-fork.yml" in endpoint:
+            return workflow_payload
+        if "/actions/secrets/SYNC_PAT" in endpoint:
+            return {"name": "SYNC_PAT"}
+        if "/actions/workflows/sync-fork.yml/runs" in endpoint:
+            return scheduled_runs_payload
+        return {
+            "error": f"unexpected benchmark endpoint: {endpoint}",
+            "error_type": "benchmark",
+            "error_code": "E_BENCH_UNEXPECTED_ENDPOINT",
+            "retryable": False,
+            "status_code": None,
+        }
+
+    with patch.object(SYNC_FORKS, "gh_api", side_effect=fake_gh_api):
+
+        def task():
+            rows, summary = SYNC_FORKS._verify_schedule_readiness(forks)
+            if len(rows) != count:
+                raise RuntimeError(
+                    "verify_schedule_readiness row mismatch: "
+                    f"expected={count}, got={len(rows)}"
+                )
+            if summary["ready"] != count:
+                raise RuntimeError(
+                    "verify_schedule_readiness ready mismatch: "
+                    f"expected={count}, got={summary['ready']}"
+                )
+
+        return _measure_ms(task, runs)
+
+
 def _run_benchmarks(sizes, runs):
     results = []
     for size in sizes:
@@ -312,6 +363,7 @@ def _run_benchmarks(sizes, runs):
                 "fork_discovery_hydration": _bench_fork_discovery_hydration(size, runs),
                 "sync_all_report": _bench_sync_all_report(size, runs),
                 "sync_specific_deduped": _bench_sync_specific_deduped(size, runs),
+                "verify_schedule_readiness": _bench_verify_schedule_readiness(size, runs),
             }
         )
     return results

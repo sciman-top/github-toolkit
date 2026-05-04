@@ -23,6 +23,10 @@
   - Keeps missing workflow as `next_action=install_sync_workflow`.
 - Added regression tests for the shared parser and stale workflow readiness handling.
 - Documented `--verify-schedule` and its readiness fields in `README.md`.
+- Refactored `sync-forks.py._run()` from a monolithic mixed-mode function into focused helpers for mode naming, report construction, fork resolution, verify-schedule handling, and sync/add-workflow operation reporting.
+- Fixed verify-schedule mode exit semantics so `summary.workflow_needs_update > 0` returns `EXIT_SAFETY` instead of reporting success.
+- Added regression coverage for `workflow_needs_update` mode-level safety exit behavior.
+- Added synthetic benchmark coverage for `verify_schedule_readiness` and documented the benchmark scope in `README.md`.
 
 ## Verification
 - `python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py .claude/hooks/governed-pre-tool-use.py`
@@ -33,7 +37,7 @@
   - passed as contract/invariant, `Ran 147 tests ... OK`
 - `python scripts/benchmark_hotpaths.py --sizes 10,100,500 --runs 5 --check`
   - passed, `threshold_check.violations=[]`
-  - final 500-row mean timings: `collect_fork_statuses=10.99ms`, `fork_discovery_hydration=6.137ms`, `sync_all_report=5.082ms`, `sync_specific_deduped=5.263ms`
+  - final 500-row mean timings after benchmark expansion: `collect_fork_statuses=13.111ms`, `fork_discovery_hydration=7.444ms`, `sync_all_report=7.691ms`, `sync_specific_deduped=8.927ms`, `verify_schedule_readiness=41.397ms`
 - `python -m ruff check .`
   - passed, `All checks passed!`
 - `python -m mypy gh_utils.py list-forks.py sync-forks.py scripts/benchmark_hotpaths.py`
@@ -43,6 +47,9 @@
   - auth mode: `gh_login`; no token value was printed
 - `git diff --check`
   - passed; Git reported only CRLF conversion warnings for touched Python files
+- Refactor shape check:
+  - `_run()` reduced from 186 lines to 48 lines
+  - extracted helpers: `_resolve_run_forks=23 lines`, `_run_verify_schedule_mode=21 lines`, `_run_mutating_or_dryrun_mode=32 lines`
 
 ## Rollback
 - Local rollback: revert this task's diff for `gh_utils.py`, `list-forks.py`, `sync-forks.py`, `test_toolkit.py`, `README.md`, and this evidence file.

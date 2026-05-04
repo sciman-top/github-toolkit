@@ -211,6 +211,8 @@ python list-forks.py --json           # 输出 JSON 状态
 python scripts/benchmark_hotpaths.py --sizes 10,100,500 --runs 5 --check
 ```
 
+该基准覆盖 fork 状态收集、fork discovery hydration、全量 sync report、指定仓库去重 sync report，以及 `--verify-schedule` readiness 行构建。
+
 可选输出到文件：
 
 ```powershell

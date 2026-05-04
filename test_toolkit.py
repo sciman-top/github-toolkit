@@ -2172,6 +2172,75 @@ class TestSyncForksVerifyScheduleMode(unittest.TestCase):
     @patch.object(sync_forks, "get_fork_repos_with_evidence")
     @patch.object(sync_forks, "get_auth_context")
     @patch.object(sync_forks, "check_gh_cli")
+    def test_verify_schedule_json_returns_exit_safety_when_workflow_needs_update(
+        self, _mock_check, mock_auth_context, mock_get_forks, mock_verify
+    ):
+        mock_auth_context.return_value = {
+            "username": "me",
+            "auth": {
+                "configured": True,
+                "mode": "gh_login",
+                "source": "gh auth login",
+            },
+        }
+        mock_get_forks.return_value = ([{
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "main",
+            "parent": "upstream-owner/forked-repo",
+            "parent_branch": "main",
+            "parent_owner": "upstream-owner",
+        }], {
+            "source": "live_github_api",
+            "endpoint": "user/repos?affiliation=owner&visibility=all",
+            "fetched_at": "2026-04-29T00:00:00Z",
+            "authenticated_user": "me",
+            "repo_count": 1,
+            "fork_count": 1,
+            "parent_detail_lookup_count": 0,
+            "parent_detail_cache_hit_count": 0,
+        })
+        mock_verify.return_value = ([{
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "main",
+            "upstream": "upstream-owner/forked-repo",
+            "upstream_branch": "main",
+            "workflow_installed": True,
+            "workflow_current": False,
+            "workflow_update_reason": "missing workflow_dispatch trigger",
+            "secret_sync_pat_present": True,
+            "last_scheduled_run": {
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-04-29T00:00:00Z",
+                "updated_at": "2026-04-29T00:01:00Z",
+                "html_url": "https://example.com/run/1",
+            },
+            "result": sync_forks.RESULT_OK,
+            "next_action": "update_sync_workflow",
+        }], {
+            "total": 1,
+            "ready": 0,
+            "missing_workflow": 0,
+            "workflow_needs_update": 1,
+            "missing_secret": 0,
+            "scheduled_run_missing_or_unhealthy": 0,
+            "errors": 0,
+        })
+
+        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--json", "--verify-schedule"]):
+            with contextlib.redirect_stdout(io.StringIO()) as captured:
+                exit_code = sync_forks.main()
+
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(exit_code, sync_forks.EXIT_SAFETY)
+        self.assertEqual(payload["summary"]["workflow_needs_update"], 1)
+
+    @patch.object(sync_forks, "_verify_schedule_readiness")
+    @patch.object(sync_forks, "get_fork_repos_with_evidence")
+    @patch.object(sync_forks, "get_auth_context")
+    @patch.object(sync_forks, "check_gh_cli")
     def test_verify_schedule_json_returns_exit_error_when_api_errors(
         self, _mock_check, mock_auth_context, mock_get_forks, mock_verify
     ):

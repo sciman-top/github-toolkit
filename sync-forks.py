@@ -802,25 +802,30 @@ def _verify_schedule_readiness(forks):
     return rows, summary
 
 
-def _run(parsed):
-    """Execute the sync-forks workflow and return (exit_code, report)."""
-    dry_run = parsed.get("dry_run", False)
-    force = parsed.get("force", False)
-    add_mode = parsed.get("add_mode", False)
-    verify_schedule = parsed.get("verify_schedule", False)
-    specific_repos = parsed.get("specific_repos", [])
-    unique_specific_repos = _dedupe_preserve_order(specific_repos)
-    json_output = parsed.get("json_output", False)
+def _mode_name(add_mode, verify_schedule):
+    """Return the machine-readable execution mode name."""
+    if verify_schedule:
+        return "verify-schedule"
+    if add_mode:
+        return "add-workflow"
+    return "sync"
 
-    check_gh_cli()
-    auth_context = get_auth_context()
-    auth_info = auth_context["auth"]
-    username = auth_context["username"]
 
-    mode = "verify-schedule" if verify_schedule else (
-        "add-workflow" if add_mode else "sync"
+def _text_mode_name(add_mode, verify_schedule, dry_run, force):
+    """Return the human-readable mode banner."""
+    text_mode = "VERIFY-SCHEDULE" if verify_schedule else (
+        "ADD-WORKFLOW" if add_mode else "SYNC"
     )
-    report = {
+    if dry_run:
+        text_mode += " (DRY-RUN)"
+    if force:
+        text_mode += " (FORCE)"
+    return text_mode
+
+
+def _build_run_report(username, auth_info, mode, dry_run, force, specific_repos):
+    """Build the common report envelope for every sync-forks mode."""
+    return {
         "tool": "sync-forks",
         "user": username,
         "auth": auth_info,
@@ -839,139 +844,168 @@ def _run(parsed):
         },
     }
 
+
+def _force_sync_confirmation_missing(force, dry_run, add_mode, verify_schedule):
+    """Return True when a real force sync lacks explicit confirmation."""
     force_ack = os.environ.get(FORCE_SYNC_ACK_ENV, "").strip()
-    if (
+    return (
         force and not dry_run and not add_mode and not verify_schedule
         and force_ack != FORCE_SYNC_ACK_VALUE
-    ):
-        report.update({
-            "error": "force_confirmation_required",
-            "error_code": "E_FORCE_CONFIRMATION_REQUIRED",
-            "error_type": "safety",
-            "message": (
-                "Refusing --force sync without explicit confirmation. "
-                f"Set {FORCE_SYNC_ACK_ENV}={FORCE_SYNC_ACK_VALUE} and retry."
-            ),
-        })
-        if not json_output:
-            print(f"ERROR: {report['message']}")
-        return EXIT_ERROR, report
-
-    text_mode = "VERIFY-SCHEDULE" if verify_schedule else (
-        "ADD-WORKFLOW" if add_mode else "SYNC"
     )
-    if dry_run:
-        text_mode += " (DRY-RUN)"
-    if force:
-        text_mode += " (FORCE)"
 
+
+def _reject_unconfirmed_force_sync(report, json_output):
+    """Populate and optionally print the force-confirmation failure."""
+    report.update({
+        "error": "force_confirmation_required",
+        "error_code": "E_FORCE_CONFIRMATION_REQUIRED",
+        "error_type": "safety",
+        "message": (
+            "Refusing --force sync without explicit confirmation. "
+            f"Set {FORCE_SYNC_ACK_ENV}={FORCE_SYNC_ACK_VALUE} and retry."
+        ),
+    })
     if not json_output:
-        print(f"GitHub user: {username}")
-        print(f"Auth: {_format_auth_summary(auth_info)}")
-        print(f"Mode: {text_mode}")
-        print()
+        print(f"ERROR: {report['message']}")
+    return EXIT_ERROR, report
 
-    if specific_repos:
-        report["discovery"] = {
-            "source": "explicit_args",
-            "requested": unique_specific_repos,
-        }
-        if json_output:
-            resolve_result, resolve_output = _run_with_captured_stdout(
-                _resolve_specific_forks, username, unique_specific_repos,
-            )
-            forks, resolve_errors = resolve_result
-            resolve_logs = _split_log_lines(resolve_output)
-            if resolve_logs:
-                report["resolve_logs"] = resolve_logs
-        else:
-            forks, resolve_errors = _resolve_specific_forks(
-                username,
-                unique_specific_repos,
-            )
-    else:
+
+def _print_run_header(username, auth_info, text_mode, json_output):
+    """Print the text-mode run header."""
+    if json_output:
+        return
+    print(f"GitHub user: {username}")
+    print(f"Auth: {_format_auth_summary(auth_info)}")
+    print(f"Mode: {text_mode}")
+    print()
+
+
+def _resolve_run_forks(username, specific_repos, json_output, report):
+    """Resolve the fork list for explicit repo args or live discovery."""
+    unique_specific_repos = _dedupe_preserve_order(specific_repos)
+    if not specific_repos:
         forks, discovery = get_fork_repos_with_evidence(username)
         report["discovery"] = discovery
-        resolve_errors = False
+        return forks, False
 
-    report["summary"]["resolve_errors"] = int(resolve_errors)
-    report["summary"]["matched"] = len(forks)
-
-    if not forks:
-        message = (
-            "No valid fork repos found."
-            if specific_repos else
-            "No fork repos found."
+    report["discovery"] = {
+        "source": "explicit_args",
+        "requested": unique_specific_repos,
+    }
+    if json_output:
+        resolve_result, resolve_output = _run_with_captured_stdout(
+            _resolve_specific_forks, username, unique_specific_repos,
         )
-        report["message"] = message
-        if not json_output:
-            print(message)
-        exit_code = EXIT_ERROR if (specific_repos or resolve_errors) else EXIT_OK
-        return exit_code, report
+        forks, resolve_errors = resolve_result
+        resolve_logs = _split_log_lines(resolve_output)
+        if resolve_logs:
+            report["resolve_logs"] = resolve_logs
+        return forks, resolve_errors
 
-    if verify_schedule:
-        rows, verify_summary = _verify_schedule_readiness(forks)
-        report["repos"] = rows
-        report["summary"].update(verify_summary)
-        report["message"] = (
-            "Schedule readiness verified: "
-            f"ready {verify_summary['ready']}/{verify_summary['total']}."
-        )
-        if not json_output:
-            print(report["message"])
-        if verify_summary["errors"]:
-            return EXIT_ERROR, report
-        if (
-            verify_summary["missing_workflow"]
-            or verify_summary["missing_secret"]
-            or verify_summary["scheduled_run_missing_or_unhealthy"]
-        ):
-            return EXIT_SAFETY, report
-        return EXIT_OK, report
+    return _resolve_specific_forks(username, unique_specific_repos)
 
+
+def _finish_empty_forks(report, specific_repos, resolve_errors, json_output):
+    """Return the no-forks exit result while preserving CLI contract."""
+    message = (
+        "No valid fork repos found."
+        if specific_repos else
+        "No fork repos found."
+    )
+    report["message"] = message
     if not json_output:
-        print(f"Found {len(forks)} fork repo(s):\n")
-        for fork in forks:
-            print(f"  {fork['full_name']}")
-            print(f"    branch: {fork['branch']}, upstream: {fork['parent']}")
-        print()
+        print(message)
+    exit_code = EXIT_ERROR if (specific_repos or resolve_errors) else EXIT_OK
+    return exit_code, report
+
+
+def _run_verify_schedule_mode(report, forks, json_output):
+    """Execute verify-schedule mode and return its exit result."""
+    rows, verify_summary = _verify_schedule_readiness(forks)
+    report["repos"] = rows
+    report["summary"].update(verify_summary)
+    report["message"] = (
+        "Schedule readiness verified: "
+        f"ready {verify_summary['ready']}/{verify_summary['total']}."
+    )
+    if not json_output:
+        print(report["message"])
+    if verify_summary["errors"]:
+        return EXIT_ERROR, report
+    if (
+        verify_summary["missing_workflow"]
+        or verify_summary["workflow_needs_update"]
+        or verify_summary["missing_secret"]
+        or verify_summary["scheduled_run_missing_or_unhealthy"]
+    ):
+        return EXIT_SAFETY, report
+    return EXIT_OK, report
+
+
+def _print_fork_overview(forks, json_output):
+    """Print the text-mode fork overview before mutating operations."""
+    if json_output:
+        return
+    print(f"Found {len(forks)} fork repo(s):\n")
+    for fork in forks:
+        print(f"  {fork['full_name']}")
+        print(f"    branch: {fork['branch']}, upstream: {fork['parent']}")
+    print()
+
+
+def _run_single_repo_operation(fork, add_mode, dry_run, force):
+    """Run the selected operation for one fork and capture operation logs."""
+    operation = _add_sync_workflow_result if add_mode else _sync_now_result
+    operation_args = (
+        (fork["full_name"], fork["branch"], dry_run, force)
+        if add_mode else
+        (
+            fork["full_name"], fork["branch"],
+            fork["parent"], fork["parent_branch"],
+            dry_run, force,
+        )
+    )
+    return _run_with_captured_stdout(operation, *operation_args)
+
+
+def _append_operation_report(report, fork, result, output, json_output):
+    """Append one repo operation result and update summary counters."""
+    repo_report = {
+        "name": fork["name"],
+        "full_name": fork["full_name"],
+        "branch": fork["branch"],
+        "upstream": fork["parent"],
+        "upstream_branch": fork["parent_branch"],
+        "result": result,
+    }
+    if json_output:
+        repo_report["logs"] = _split_log_lines(output)
+    report["repos"].append(repo_report)
+
+    if result == RESULT_OK:
+        report["summary"]["success"] += 1
+    elif result == RESULT_SAFETY:
+        report["summary"]["safety_abort"] += 1
+    else:
+        report["summary"]["failed"] += 1
+
+
+def _run_mutating_or_dryrun_mode(report, forks, add_mode, dry_run, force,
+                                 resolve_errors, json_output):
+    """Run add-workflow or sync mode over all resolved forks."""
+    _print_fork_overview(forks, json_output)
 
     for fork in forks:
         if not json_output:
             print(f"[{fork['name']}]")
 
-        operation = _add_sync_workflow_result if add_mode else _sync_now_result
-        operation_args = (
-            (fork["full_name"], fork["branch"], dry_run, force)
-            if add_mode else
-            (
-                fork["full_name"], fork["branch"],
-                fork["parent"], fork["parent_branch"],
-                dry_run, force,
-            )
+        result, output = _run_single_repo_operation(
+            fork, add_mode, dry_run, force,
         )
-        result, output = _run_with_captured_stdout(operation, *operation_args)
         if not json_output and output:
             print(output, end="")
 
-        repo_report = {
-            "name": fork["name"],
-            "full_name": fork["full_name"],
-            "branch": fork["branch"],
-            "upstream": fork["parent"],
-            "upstream_branch": fork["parent_branch"],
-            "result": result,
-        }
-        if json_output:
-            repo_report["logs"] = _split_log_lines(output)
-        report["repos"].append(repo_report)
-
-        if result == RESULT_OK:
-            report["summary"]["success"] += 1
-        elif result == RESULT_SAFETY:
-            report["summary"]["safety_abort"] += 1
-        else:
-            report["summary"]["failed"] += 1
+        _append_operation_report(report, fork, result, output, json_output)
 
         if not json_output:
             print()
@@ -988,6 +1022,56 @@ def _run(parsed):
     if report["summary"]["safety_abort"]:
         return EXIT_SAFETY, report
     return EXIT_OK, report
+
+
+def _run(parsed):
+    """Execute the sync-forks workflow and return (exit_code, report)."""
+    dry_run = parsed.get("dry_run", False)
+    force = parsed.get("force", False)
+    add_mode = parsed.get("add_mode", False)
+    verify_schedule = parsed.get("verify_schedule", False)
+    specific_repos = parsed.get("specific_repos", [])
+    json_output = parsed.get("json_output", False)
+
+    check_gh_cli()
+    auth_context = get_auth_context()
+    auth_info = auth_context["auth"]
+    username = auth_context["username"]
+
+    mode = _mode_name(add_mode, verify_schedule)
+    report = _build_run_report(
+        username, auth_info, mode, dry_run, force, specific_repos,
+    )
+
+    if _force_sync_confirmation_missing(
+        force, dry_run, add_mode, verify_schedule,
+    ):
+        return _reject_unconfirmed_force_sync(report, json_output)
+
+    _print_run_header(
+        username,
+        auth_info,
+        _text_mode_name(add_mode, verify_schedule, dry_run, force),
+        json_output,
+    )
+
+    forks, resolve_errors = _resolve_run_forks(
+        username, specific_repos, json_output, report,
+    )
+    report["summary"]["resolve_errors"] = int(resolve_errors)
+    report["summary"]["matched"] = len(forks)
+
+    if not forks:
+        return _finish_empty_forks(
+            report, specific_repos, resolve_errors, json_output,
+        )
+
+    if verify_schedule:
+        return _run_verify_schedule_mode(report, forks, json_output)
+
+    return _run_mutating_or_dryrun_mode(
+        report, forks, add_mode, dry_run, force, resolve_errors, json_output,
+    )
 
 
 # ── CLI ───────────────────────────────────────────────────────
