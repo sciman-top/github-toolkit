@@ -28,7 +28,7 @@ Fork 仓库自动同步管理工具集，带安全防护机制。
 - 每次同步前写入 `backup/pre-sync` 恢复点（手动同步与 GitHub Actions 一致）
 - GitHub Actions 定时同步也会执行同样的检查
 
-`--force` 默认需要显式确认环境变量后才能用于真实同步（`--dry-run` 不受此限制）：
+`--force` 默认需要显式确认环境变量后才能执行真实写操作（包括真实同步和强制重写 workflow；`--dry-run` 不受此限制）：
 
 ```powershell
 $env:SYNC_FORKS_FORCE_ACK = "I_UNDERSTAND"
@@ -176,7 +176,7 @@ python list-forks.py --json           # 输出 JSON 状态
 |------------|------|
 | `E_CLI_UNKNOWN_ARGUMENT` | `list-forks.py` 参数错误 |
 | `E_CLI_UNKNOWN_OPTION` | `sync-forks.py` 参数错误 |
-| `E_FORCE_CONFIRMATION_REQUIRED` | 使用 `--force` 同步时缺少显式确认 |
+| `E_FORCE_CONFIRMATION_REQUIRED` | 使用 `--force` 执行真实写操作时缺少显式确认 |
 | `E_AUTH_CONTEXT_FAILED` | 认证存在问题（令牌无效/未登录/权限不足等） |
 | `E_FORK_DISCOVERY_FAILED` | 拉取 fork 列表失败 |
 | `E_GH_TIMEOUT` | GitHub API 调用超时 |

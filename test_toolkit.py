@@ -1663,7 +1663,7 @@ class TestSyncForksMain(unittest.TestCase):
             },
         }
 
-        with patch.dict("os.environ", {}, clear=False):
+        with patch.dict("os.environ", {sync_forks.FORCE_SYNC_ACK_ENV: ""}, clear=False):
             with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--json", "--force", "forked-repo"]):
                 with contextlib.redirect_stdout(io.StringIO()) as captured:
                     exit_code = sync_forks.main()
@@ -1675,6 +1675,37 @@ class TestSyncForksMain(unittest.TestCase):
         self.assertEqual(payload["error_type"], "safety")
         mock_check.assert_called_once()
         mock_auth_context.assert_called_once()
+
+    @patch.object(sync_forks, "_resolve_specific_forks")
+    @patch.object(sync_forks, "get_auth_context")
+    @patch.object(sync_forks, "check_gh_cli")
+    def test_force_add_workflow_requires_explicit_confirmation(
+        self, _mock_check, mock_auth_context, mock_resolve
+    ):
+        mock_auth_context.return_value = {
+            "username": "me",
+            "auth": {
+                "configured": True,
+                "mode": "env_token",
+                "source": "GH_TOKEN",
+            },
+        }
+
+        with patch.dict("os.environ", {sync_forks.FORCE_SYNC_ACK_ENV: ""}, clear=False):
+            with patch.object(
+                sync_forks.sys,
+                "argv",
+                ["sync-forks.py", "--json", "--add-workflow", "--force", "forked-repo"],
+            ):
+                with contextlib.redirect_stdout(io.StringIO()) as captured:
+                    exit_code = sync_forks.main()
+
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
+        self.assertEqual(payload["error"], "force_confirmation_required")
+        self.assertEqual(payload["error_code"], "E_FORCE_CONFIRMATION_REQUIRED")
+        self.assertEqual(payload["error_type"], "safety")
+        mock_resolve.assert_not_called()
 
     @patch.object(sync_forks, "_sync_now_result")
     @patch.object(sync_forks, "_resolve_specific_forks")
@@ -1712,6 +1743,47 @@ class TestSyncForksMain(unittest.TestCase):
 
         self.assertEqual(exit_code, sync_forks.EXIT_OK)
         mock_sync.assert_called_once()
+
+    @patch.object(sync_forks, "_add_sync_workflow_result")
+    @patch.object(sync_forks, "_resolve_specific_forks")
+    @patch.object(sync_forks, "get_auth_context")
+    @patch.object(sync_forks, "check_gh_cli")
+    def test_force_add_workflow_with_confirmation_runs(
+        self, _mock_check, mock_auth_context, mock_resolve, mock_add
+    ):
+        mock_auth_context.return_value = {
+            "username": "me",
+            "auth": {
+                "configured": True,
+                "mode": "env_token",
+                "source": "GH_TOKEN",
+            },
+        }
+        mock_resolve.return_value = ([{
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "main",
+            "parent": "upstream-owner/forked-repo",
+            "parent_branch": "main",
+            "parent_owner": "upstream-owner",
+        }], False)
+        mock_add.return_value = sync_forks.RESULT_OK
+
+        with patch.dict(
+            "os.environ",
+            {sync_forks.FORCE_SYNC_ACK_ENV: sync_forks.FORCE_SYNC_ACK_VALUE},
+            clear=False,
+        ):
+            with patch.object(
+                sync_forks.sys,
+                "argv",
+                ["sync-forks.py", "--add-workflow", "--force", "forked-repo"],
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    exit_code = sync_forks.main()
+
+        self.assertEqual(exit_code, sync_forks.EXIT_OK)
+        mock_add.assert_called_once_with("me/forked-repo", "main", False, True)
 
     @patch.object(sync_forks, "_sync_now_result")
     @patch.object(sync_forks, "_resolve_specific_forks")

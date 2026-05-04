@@ -76,11 +76,12 @@ Options:
   --add-workflow   Add or update sync-fork.yml instead of syncing now
   --verify-schedule Verify workflow/secret/scheduled-run readiness
   --dry-run        Preview planned changes without modifying repos
-  --force          Bypass safety checks (sync needs explicit confirmation)
+  --force          Bypass safety checks or force workflow rewrite
+                   (real writes need explicit confirmation)
   --json           Emit a machine-readable JSON summary
   -h, --help       Show this help message
 
-Force confirmation for real sync:
+Force confirmation for real --force writes:
   set %SYNC_FORKS_FORCE_ACK%=I_UNDERSTAND   (Windows cmd)
   $env:SYNC_FORKS_FORCE_ACK = "I_UNDERSTAND" (PowerShell)
 
@@ -845,23 +846,23 @@ def _build_run_report(username, auth_info, mode, dry_run, force, specific_repos)
     }
 
 
-def _force_sync_confirmation_missing(force, dry_run, add_mode, verify_schedule):
-    """Return True when a real force sync lacks explicit confirmation."""
+def _force_confirmation_missing(force, dry_run, verify_schedule):
+    """Return True when a real force write lacks explicit confirmation."""
     force_ack = os.environ.get(FORCE_SYNC_ACK_ENV, "").strip()
     return (
-        force and not dry_run and not add_mode and not verify_schedule
+        force and not dry_run and not verify_schedule
         and force_ack != FORCE_SYNC_ACK_VALUE
     )
 
 
-def _reject_unconfirmed_force_sync(report, json_output):
+def _reject_unconfirmed_force_write(report, json_output):
     """Populate and optionally print the force-confirmation failure."""
     report.update({
         "error": "force_confirmation_required",
         "error_code": "E_FORCE_CONFIRMATION_REQUIRED",
         "error_type": "safety",
         "message": (
-            "Refusing --force sync without explicit confirmation. "
+            "Refusing real --force write without explicit confirmation. "
             f"Set {FORCE_SYNC_ACK_ENV}={FORCE_SYNC_ACK_VALUE} and retry."
         ),
     })
@@ -1080,10 +1081,10 @@ def _run(parsed):
         username, auth_info, mode, dry_run, force, specific_repos,
     )
 
-    if _force_sync_confirmation_missing(
-        force, dry_run, add_mode, verify_schedule,
+    if _force_confirmation_missing(
+        force, dry_run, verify_schedule,
     ):
-        return _reject_unconfirmed_force_sync(report, json_output)
+        return _reject_unconfirmed_force_write(report, json_output)
 
     _print_run_header(
         username,
