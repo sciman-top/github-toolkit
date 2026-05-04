@@ -2063,6 +2063,59 @@ class TestSyncForksHelpers(unittest.TestCase):
             ["fork-a", "fork-b", "fork-c"],
         )
 
+    def test_mode_write_classification_is_explicit(self):
+        self.assertTrue(
+            sync_forks._mode_writes_remotely(sync_forks.MODE_SYNC, dry_run=False)
+        )
+        self.assertTrue(
+            sync_forks._mode_writes_remotely(
+                sync_forks.MODE_ADD_WORKFLOW,
+                dry_run=False,
+            )
+        )
+        self.assertFalse(
+            sync_forks._mode_writes_remotely(
+                sync_forks.MODE_VERIFY_SCHEDULE,
+                dry_run=False,
+            )
+        )
+        self.assertFalse(
+            sync_forks._mode_writes_remotely(sync_forks.MODE_SYNC, dry_run=True)
+        )
+        with self.assertRaises(ValueError):
+            sync_forks._mode_writes_remotely("new-mode", dry_run=False)
+
+    def test_force_confirmation_uses_mode_write_classification(self):
+        with patch.dict("os.environ", {sync_forks.FORCE_SYNC_ACK_ENV: ""}, clear=False):
+            self.assertTrue(
+                sync_forks._force_confirmation_missing(
+                    True,
+                    sync_forks.MODE_SYNC,
+                    dry_run=False,
+                )
+            )
+            self.assertTrue(
+                sync_forks._force_confirmation_missing(
+                    True,
+                    sync_forks.MODE_ADD_WORKFLOW,
+                    dry_run=False,
+                )
+            )
+            self.assertFalse(
+                sync_forks._force_confirmation_missing(
+                    True,
+                    sync_forks.MODE_VERIFY_SCHEDULE,
+                    dry_run=False,
+                )
+            )
+            self.assertFalse(
+                sync_forks._force_confirmation_missing(
+                    True,
+                    sync_forks.MODE_SYNC,
+                    dry_run=True,
+                )
+            )
+
     @patch.object(sync_forks, "gh_api")
     def test_verify_schedule_readiness_counts_missing_items(self, mock_api):
         forks = [{

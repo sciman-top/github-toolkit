@@ -59,6 +59,9 @@ SKIP = None      # upstream unavailable, skip without error
 RESULT_OK = "ok"
 RESULT_SAFETY = "safety"
 RESULT_ERROR = "error"
+MODE_SYNC = "sync"
+MODE_ADD_WORKFLOW = "add-workflow"
+MODE_VERIFY_SCHEDULE = "verify-schedule"
 FORCE_SYNC_ACK_ENV = "SYNC_FORKS_FORCE_ACK"
 FORCE_SYNC_ACK_VALUE = "I_UNDERSTAND"
 WORKFLOW_DISPATCH_TOKEN_RE = re.compile(
@@ -806,17 +809,26 @@ def _verify_schedule_readiness(forks):
 def _mode_name(add_mode, verify_schedule):
     """Return the machine-readable execution mode name."""
     if verify_schedule:
-        return "verify-schedule"
+        return MODE_VERIFY_SCHEDULE
     if add_mode:
-        return "add-workflow"
-    return "sync"
+        return MODE_ADD_WORKFLOW
+    return MODE_SYNC
 
 
-def _text_mode_name(add_mode, verify_schedule, dry_run, force):
+def _mode_writes_remotely(mode, dry_run):
+    """Return True when the selected mode can perform remote writes."""
+    if dry_run:
+        return False
+    if mode in {MODE_SYNC, MODE_ADD_WORKFLOW}:
+        return True
+    if mode == MODE_VERIFY_SCHEDULE:
+        return False
+    raise ValueError(f"Unclassified execution mode: {mode}")
+
+
+def _text_mode_name(mode, dry_run, force):
     """Return the human-readable mode banner."""
-    text_mode = "VERIFY-SCHEDULE" if verify_schedule else (
-        "ADD-WORKFLOW" if add_mode else "SYNC"
-    )
+    text_mode = mode.upper()
     if dry_run:
         text_mode += " (DRY-RUN)"
     if force:
@@ -846,11 +858,11 @@ def _build_run_report(username, auth_info, mode, dry_run, force, specific_repos)
     }
 
 
-def _force_confirmation_missing(force, dry_run, verify_schedule):
+def _force_confirmation_missing(force, mode, dry_run):
     """Return True when a real force write lacks explicit confirmation."""
     force_ack = os.environ.get(FORCE_SYNC_ACK_ENV, "").strip()
     return (
-        force and not dry_run and not verify_schedule
+        force and _mode_writes_remotely(mode, dry_run)
         and force_ack != FORCE_SYNC_ACK_VALUE
     )
 
@@ -991,8 +1003,9 @@ def _print_fork_overview(forks, json_output):
     print()
 
 
-def _run_single_repo_operation(fork, add_mode, dry_run, force):
+def _run_single_repo_operation(fork, mode, dry_run, force):
     """Run the selected operation for one fork and capture operation logs."""
+    add_mode = mode == MODE_ADD_WORKFLOW
     operation = _add_sync_workflow_result if add_mode else _sync_now_result
     operation_args = (
         (fork["full_name"], fork["branch"], dry_run, force)
@@ -1028,7 +1041,7 @@ def _append_operation_report(report, fork, result, output, json_output):
         report["summary"]["failed"] += 1
 
 
-def _run_mutating_or_dryrun_mode(report, forks, add_mode, dry_run, force,
+def _run_mutating_or_dryrun_mode(report, forks, mode, dry_run, force,
                                  resolve_errors, json_output):
     """Run add-workflow or sync mode over all resolved forks."""
     _print_fork_overview(forks, json_output)
@@ -1038,7 +1051,7 @@ def _run_mutating_or_dryrun_mode(report, forks, add_mode, dry_run, force,
             print(f"[{fork['name']}]")
 
         result, output = _run_single_repo_operation(
-            fork, add_mode, dry_run, force,
+            fork, mode, dry_run, force,
         )
         if not json_output and output:
             print(output, end="")
@@ -1048,7 +1061,7 @@ def _run_mutating_or_dryrun_mode(report, forks, add_mode, dry_run, force,
         if not json_output:
             print()
 
-    action = "updated" if add_mode else "synced"
+    action = "updated" if mode == MODE_ADD_WORKFLOW else "synced"
     report["message"] = (
         f"Done: {report['summary']['success']}/{len(forks)} repos {action}."
     )
@@ -1081,15 +1094,13 @@ def _run(parsed):
         username, auth_info, mode, dry_run, force, specific_repos,
     )
 
-    if _force_confirmation_missing(
-        force, dry_run, verify_schedule,
-    ):
+    if _force_confirmation_missing(force, mode, dry_run):
         return _reject_unconfirmed_force_write(report, json_output)
 
     _print_run_header(
         username,
         auth_info,
-        _text_mode_name(add_mode, verify_schedule, dry_run, force),
+        _text_mode_name(mode, dry_run, force),
         json_output,
     )
 
@@ -1108,7 +1119,7 @@ def _run(parsed):
         return _run_verify_schedule_mode(report, forks, json_output)
 
     return _run_mutating_or_dryrun_mode(
-        report, forks, add_mode, dry_run, force, resolve_errors, json_output,
+        report, forks, mode, dry_run, force, resolve_errors, json_output,
     )
 
 
