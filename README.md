@@ -76,6 +76,7 @@ python sync-forks.py --json --verify-schedule
 - `workflow_current` / `workflow_update_reason`：现有 workflow 是否匹配当前安全模板；缺少 `workflow_dispatch` 或模板漂移时会建议 `update_sync_workflow`
 - `secret_sync_pat_present`：目标 fork 是否存在 `SYNC_PAT`
 - `last_scheduled_run`：最近一次 schedule run 的状态
+- `last_smoke_run`：没有 schedule 历史时，最近一次手动 `workflow_dispatch` smoke run 的状态
 - `next_action`：下一步建议，例如 `none`、`install_sync_workflow`、`update_sync_workflow`、`set_sync_pat_secret`
 
 非 JSON 模式会输出每个 fork 的 readiness 明细表，便于直接查看 `next_action`。

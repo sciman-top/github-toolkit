@@ -2221,6 +2221,7 @@ class TestSyncForksHelpers(unittest.TestCase):
             {"content": _encode(current_workflow)},
             {"name": "SYNC_PAT"},
             {"workflow_runs": [None]},
+            {"workflow_runs": []},
         ]
 
         rows, summary = sync_forks._verify_schedule_readiness(forks)
@@ -2228,6 +2229,38 @@ class TestSyncForksHelpers(unittest.TestCase):
         self.assertIsNone(rows[0]["last_scheduled_run"])
         self.assertEqual(summary["ready"], 0)
         self.assertEqual(summary["errors"], 0)
+
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_schedule_readiness_accepts_successful_smoke_run(self, mock_api):
+        forks = [{
+            "name": "fork-a",
+            "full_name": "me/fork-a",
+            "branch": "main",
+            "parent": "upstream/a",
+            "parent_branch": "main",
+        }]
+        current_workflow = sync_forks.WORKFLOW_TEMPLATE.format(
+            cron=sync_forks.SYNC_CRON
+        )
+        mock_api.side_effect = [
+            {"content": _encode(current_workflow)},
+            {"name": "SYNC_PAT"},
+            {"workflow_runs": []},
+            {"workflow_runs": [{
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-05-10T11:42:40Z",
+                "updated_at": "2026-05-10T11:43:00Z",
+                "html_url": "https://example.com/run/2",
+            }]},
+        ]
+
+        rows, summary = sync_forks._verify_schedule_readiness(forks)
+        self.assertEqual(rows[0]["next_action"], "none")
+        self.assertIsNone(rows[0]["last_scheduled_run"])
+        self.assertEqual(rows[0]["last_smoke_run"]["conclusion"], "success")
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["scheduled_run_missing_or_unhealthy"], 0)
 
 
 class TestSyncForksVerifyScheduleMode(unittest.TestCase):

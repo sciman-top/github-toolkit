@@ -707,6 +707,7 @@ def _build_verify_schedule_row(fork):
         "workflow_update_reason": None,
         "secret_sync_pat_present": False,
         "last_scheduled_run": None,
+        "last_smoke_run": None,
         "result": RESULT_OK,
     }
 
@@ -753,6 +754,34 @@ def _build_verify_schedule_row(fork):
         row["result"] = RESULT_ERROR
         row["scheduled_run_error"] = _short_error(scheduled_runs)
 
+    if (
+        row["result"] == RESULT_OK
+        and row["workflow_installed"]
+        and row["workflow_current"]
+        and row["secret_sync_pat_present"]
+        and row["last_scheduled_run"] is None
+    ):
+        smoke_runs = gh_api(
+            "repos/"
+            f"{full_name}/actions/workflows/sync-fork.yml/runs"
+            "?event=workflow_dispatch&per_page=1"
+        )
+        if isinstance(smoke_runs, dict) and "error" not in smoke_runs:
+            runs = smoke_runs.get("workflow_runs")
+            if isinstance(runs, list) and runs:
+                last = runs[0]
+                if isinstance(last, dict):
+                    row["last_smoke_run"] = {
+                        "status": last.get("status"),
+                        "conclusion": last.get("conclusion"),
+                        "created_at": last.get("created_at"),
+                        "updated_at": last.get("updated_at"),
+                        "html_url": last.get("html_url"),
+                    }
+        elif not _is_not_found_error(smoke_runs):
+            row["result"] = RESULT_ERROR
+            row["smoke_run_error"] = _short_error(smoke_runs)
+
     if row["result"] == RESULT_ERROR:
         row["next_action"] = "investigate_api_errors"
     elif not row["workflow_installed"]:
@@ -762,7 +791,11 @@ def _build_verify_schedule_row(fork):
     elif not row["secret_sync_pat_present"]:
         row["next_action"] = "set_sync_pat_secret"
     elif row["last_scheduled_run"] is None:
-        row["next_action"] = "wait_or_trigger_smoke_run"
+        smoke_run = row["last_smoke_run"] or {}
+        if smoke_run.get("conclusion") == "success":
+            row["next_action"] = "none"
+        else:
+            row["next_action"] = "wait_or_trigger_smoke_run"
     elif row["last_scheduled_run"].get("conclusion") != "success":
         row["next_action"] = "inspect_last_scheduled_failure"
     else:
@@ -798,7 +831,11 @@ def _verify_schedule_readiness(forks):
         if not row["secret_sync_pat_present"]:
             summary["missing_secret"] += 1
         run = row["last_scheduled_run"] or {}
-        if run.get("conclusion") != "success":
+        smoke_run = row["last_smoke_run"] or {}
+        if (
+            run.get("conclusion") != "success"
+            and smoke_run.get("conclusion") != "success"
+        ):
             summary["scheduled_run_missing_or_unhealthy"] += 1
         if row["next_action"] == "none":
             summary["ready"] += 1
