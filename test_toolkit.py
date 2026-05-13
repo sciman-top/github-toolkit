@@ -163,7 +163,7 @@ class TestNeedsWorkflowUpdate(unittest.TestCase):
         self.assertIn("workflow_dispatch", reason)
 
     def test_current_template_means_no_update(self):
-        text = sync_forks.WORKFLOW_TEMPLATE.format(cron=sync_forks.SYNC_CRON)
+        text = sync_forks._render_workflow_template()
         needs, reason = sync_forks._needs_workflow_update({"content": _encode(text)})
         self.assertFalse(needs)
         self.assertIn("current workflow template", reason)
@@ -185,16 +185,16 @@ jobs:
         needs, reason = sync_forks._needs_workflow_update({"content": _encode(text)})
         self.assertTrue(needs)
         self.assertIn("workflow template drift", reason)
-        self.assertIn("Create restore point", reason)
+        self.assertIn("actions/checkout@v6", reason)
 
     def test_cron_drift_means_update(self):
-        text = sync_forks.WORKFLOW_TEMPLATE.format(cron="30 2 * * 0")
+        text = sync_forks._render_workflow_template(cron="30 2 * * 0")
         needs, reason = sync_forks._needs_workflow_update({"content": _encode(text)})
         self.assertTrue(needs)
         self.assertIn("workflow template drift", reason)
 
     def test_stale_merge_upstream_branch_means_update(self):
-        text = sync_forks.WORKFLOW_TEMPLATE.format(cron=sync_forks.SYNC_CRON).replace(
+        text = sync_forks._render_workflow_template().replace(
             "branch=${{ github.event.repository.default_branch }}",
             "branch=${{ steps.upstream.outputs.branch }}",
         )
@@ -956,6 +956,24 @@ class TestSyncNowResult(unittest.TestCase):
 
     @patch.object(sync_forks, "gh_api")
     @patch.object(sync_forks, "safety_check")
+    def test_stable_source_only_repo_skips_default_branch_sync(
+        self, mock_safety, mock_api
+    ):
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._sync_now_result(
+                "sciman-top/cockpit-tools",
+                "main",
+                "jlcodes99/cockpit-tools",
+                "main",
+            )
+
+        self.assertEqual(result, sync_forks.RESULT_OK)
+        self.assertIn("stable-source-only policy", captured.getvalue())
+        mock_safety.assert_not_called()
+        mock_api.assert_not_called()
+
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "safety_check")
     def test_invalid_merge_response_returns_error(self, mock_safety, mock_api):
         mock_safety.return_value = sync_forks.SAFE
         mock_api.side_effect = [
@@ -1275,7 +1293,7 @@ class TestWorkflowContracts(unittest.TestCase):
         self.assertIn("test_support.py", workflow)
 
     def test_generated_workflow_syncs_fork_default_branch(self):
-        workflow = sync_forks.WORKFLOW_TEMPLATE.format(cron=sync_forks.SYNC_CRON)
+        workflow = sync_forks._render_workflow_template()
         merge_lines = [
             line
             for line in workflow.splitlines()
@@ -1286,8 +1304,16 @@ class TestWorkflowContracts(unittest.TestCase):
         self.assertIn("github.event.repository.default_branch", merge_lines[0])
         self.assertNotIn("steps.upstream.outputs.branch", merge_lines[0])
 
+    def test_generated_workflow_has_stable_source_guard(self):
+        workflow = sync_forks._render_workflow_template()
+
+        self.assertIn("Stable source policy guard", workflow)
+        self.assertIn("STABLE_SOURCE_ONLY_REPOS", workflow)
+        self.assertIn("sciman-top/cockpit-tools", workflow)
+        self.assertIn("steps.stable_source_policy.outputs.skip != 'true'", workflow)
+
     def test_generated_workflow_url_encodes_compare_refs(self):
-        workflow = sync_forks.WORKFLOW_TEMPLATE.format(cron=sync_forks.SYNC_CRON)
+        workflow = sync_forks._render_workflow_template()
 
         self.assertIn("BASE_REF:", workflow)
         self.assertIn("HEAD_REF:", workflow)
@@ -2080,6 +2106,12 @@ class TestSyncForksHelpers(unittest.TestCase):
             )
         )
         self.assertFalse(
+            sync_forks._mode_writes_remotely(
+                sync_forks.MODE_VERIFY_RELEASES,
+                dry_run=False,
+            )
+        )
+        self.assertFalse(
             sync_forks._mode_writes_remotely(sync_forks.MODE_SYNC, dry_run=True)
         )
         with self.assertRaises(ValueError):
@@ -2111,10 +2143,111 @@ class TestSyncForksHelpers(unittest.TestCase):
             self.assertFalse(
                 sync_forks._force_confirmation_missing(
                     True,
+                    sync_forks.MODE_VERIFY_RELEASES,
+                    dry_run=False,
+                )
+            )
+            self.assertFalse(
+                sync_forks._force_confirmation_missing(
+                    True,
                     sync_forks.MODE_SYNC,
                     dry_run=True,
                 )
             )
+
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_release_retention_accepts_latest_assets_only(self, mock_api):
+        forks = [{
+            "name": "cockpit-tools",
+            "full_name": "sciman-top/cockpit-tools",
+            "branch": "main",
+            "parent": "jlcodes99/cockpit-tools",
+            "parent_branch": "main",
+        }]
+        upstream_latest = {
+            "tag_name": "v2",
+            "draft": False,
+            "prerelease": False,
+            "assets": [{"name": "tool.msi"}],
+        }
+        fork_latest = {
+            "tag_name": "v2",
+            "draft": False,
+            "prerelease": False,
+            "assets": [{"name": "tool.msi"}],
+        }
+        fork_old = {
+            "tag_name": "v1",
+            "draft": False,
+            "prerelease": False,
+            "assets": [],
+        }
+        mock_api.side_effect = [[upstream_latest], [fork_latest, fork_old]]
+
+        rows, summary = sync_forks._verify_release_retention(forks)
+
+        self.assertEqual(rows[0]["next_action"], "none")
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["latest_stable_assets_required"], 1)
+        self.assertEqual(summary["old_stable_assets_present"], 0)
+
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_release_retention_flags_old_stable_assets(self, mock_api):
+        forks = [{
+            "name": "cockpit-tools",
+            "full_name": "sciman-top/cockpit-tools",
+            "branch": "main",
+            "parent": "jlcodes99/cockpit-tools",
+            "parent_branch": "main",
+        }]
+        upstream_latest = {
+            "tag_name": "v2",
+            "draft": False,
+            "prerelease": False,
+            "assets": [{"name": "tool.exe"}],
+        }
+        fork_latest = {
+            "tag_name": "v2",
+            "draft": False,
+            "prerelease": False,
+            "assets": [{"name": "tool.exe"}],
+        }
+        fork_old = {
+            "tag_name": "v1",
+            "draft": False,
+            "prerelease": False,
+            "assets": [{"name": "old-tool.exe"}],
+        }
+        mock_api.side_effect = [[upstream_latest], [fork_latest, fork_old]]
+
+        rows, summary = sync_forks._verify_release_retention(forks)
+
+        self.assertEqual(rows[0]["next_action"], "prune_old_stable_release_assets")
+        self.assertEqual(summary["ready"], 0)
+        self.assertEqual(summary["old_stable_assets_present"], 1)
+
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_release_retention_ignores_source_only_upstream(self, mock_api):
+        forks = [{
+            "name": "claude-dashboard",
+            "full_name": "sciman-top/claude-dashboard",
+            "branch": "main",
+            "parent": "uppinote20/claude-dashboard",
+            "parent_branch": "main",
+        }]
+        upstream_latest = {
+            "tag_name": "v1",
+            "draft": False,
+            "prerelease": False,
+            "assets": [],
+        }
+        mock_api.side_effect = [[upstream_latest], []]
+
+        rows, summary = sync_forks._verify_release_retention(forks)
+
+        self.assertEqual(rows[0]["release_policy"], "source_only_release_notes")
+        self.assertEqual(rows[0]["next_action"], "none")
+        self.assertEqual(summary["latest_stable_assets_required"], 0)
 
     @patch.object(sync_forks, "gh_api")
     def test_verify_schedule_readiness_counts_missing_items(self, mock_api):
@@ -2151,9 +2284,7 @@ class TestSyncForksHelpers(unittest.TestCase):
             "parent": "upstream/a",
             "parent_branch": "main",
         }]
-        current_workflow = sync_forks.WORKFLOW_TEMPLATE.format(
-            cron=sync_forks.SYNC_CRON
-        )
+        current_workflow = sync_forks._render_workflow_template()
         mock_api.side_effect = [
             {"content": _encode(current_workflow)},
             {"name": "SYNC_PAT"},
@@ -2214,9 +2345,7 @@ class TestSyncForksHelpers(unittest.TestCase):
             "parent": "upstream/a",
             "parent_branch": "main",
         }]
-        current_workflow = sync_forks.WORKFLOW_TEMPLATE.format(
-            cron=sync_forks.SYNC_CRON
-        )
+        current_workflow = sync_forks._render_workflow_template()
         mock_api.side_effect = [
             {"content": _encode(current_workflow)},
             {"name": "SYNC_PAT"},
@@ -2239,9 +2368,7 @@ class TestSyncForksHelpers(unittest.TestCase):
             "parent": "upstream/a",
             "parent_branch": "main",
         }]
-        current_workflow = sync_forks.WORKFLOW_TEMPLATE.format(
-            cron=sync_forks.SYNC_CRON
-        )
+        current_workflow = sync_forks._render_workflow_template()
         mock_api.side_effect = [
             {"content": _encode(current_workflow)},
             {"name": "SYNC_PAT"},

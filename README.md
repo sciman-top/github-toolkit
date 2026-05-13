@@ -27,6 +27,7 @@ Fork 仓库自动同步管理工具集，带安全防护机制。
 - 如果上游文件数低于 fork 的 50%，自动中止同步
 - 每次同步前写入 `backup/pre-sync` 恢复点（手动同步与 GitHub Actions 一致）
 - GitHub Actions 定时同步也会执行同样的检查
+- 对安装型工具可启用 stable-source-only 策略，阻止默认分支被每周 `merge-upstream` 自动覆盖，改为后续镜像稳定版 release/tag
 
 `--force` 默认需要显式确认环境变量后才能执行真实写操作（包括真实同步和强制重写 workflow；`--dry-run` 不受此限制）：
 
@@ -68,6 +69,7 @@ python sync-forks.py --json
 python list-forks.py
 python list-forks.py --json
 python sync-forks.py --json --verify-schedule
+python sync-forks.py --json --verify-releases
 ```
 
 `--verify-schedule` 是只读检查，用于确认 fork 上的同步 workflow、`SYNC_PAT` secret 和最近一次定时运行是否满足自动同步条件。JSON 输出会包含：
@@ -80,6 +82,35 @@ python sync-forks.py --json --verify-schedule
 - `next_action`：下一步建议，例如 `none`、`install_sync_workflow`、`update_sync_workflow`、`set_sync_pat_secret`
 
 非 JSON 模式会输出每个 fork 的 readiness 明细表，便于直接查看 `next_action`。
+
+### 5. 稳定版源码策略
+默认源码同步仍跟随上游默认分支；只有上游 release 带有实际安装/运行资产，且 fork 的新版本可能影响本机使用时，才进入 stable-source-only。
+
+当前策略：
+
+| fork | 源码同步策略 | 原因 |
+|------|--------------|------|
+| `sciman-top/cockpit-tools` | `stable_release_only` | 上游稳定版 release 带 `.exe`、`.msi`、`.deb`、`.rpm`、`.AppImage`、`.dmg`、签名和校验文件；默认分支自动合并可能把本机正在使用的安装版本带到未验证状态 |
+| 其他 fork | `upstream_default_branch` | 当前 release 无安装资产，源码跟随默认分支更适合获取修复 |
+
+stable-source-only 仓库在本地 `sync-forks.py` 和生成的 `sync-fork.yml` 中都会跳过默认分支 `merge-upstream`。这不会删除已有 `backup/pre-sync` 或固定备份分支；后续稳定版更新应通过 release/tag 镜像能力落地，而不是普通默认分支合并。
+
+### 6. Release 保留策略
+Release 镜像遵循 `latest_stable_assets_only`：
+
+- 只把 `draft=false` 且 `prerelease=false` 视为稳定版。
+- 最新稳定版保留安装/打包资产、签名、校验文件和 `latest.json`。
+- 旧稳定版只保留 tag、release 标题和更新说明；不得保留 `.exe`、`.msi`、`.deb`、`.rpm`、`.AppImage`、`.dmg`、`.zip`、`.tar.gz` 等安装/打包资产。
+- `latest.json` 若用于 fork 安装入口，必须指向 `sciman-top/...` 的 fork release 下载地址，并同步更新 `SHA256SUMS.txt` 中 `latest.json` 的 hash。
+
+只读核验命令：
+
+```powershell
+python sync-forks.py --verify-releases --json
+python sync-forks.py --verify-releases cockpit-tools --json
+```
+
+JSON 输出中 `next_action=prune_old_stable_release_assets` 表示旧稳定版仍带资产，需要删除旧资产但保留 release 文案；`next_action=mirror_latest_stable_release` 或 `mirror_latest_stable_assets` 表示最新稳定版还未完整保留安装/打包资产。
 
 ## 配置与认证
 ### 认证方式
@@ -162,6 +193,7 @@ github-toolkit/
 python sync-forks.py                  # 立即同步所有 fork
 python sync-forks.py --add-workflow   # 添加或更新同步 workflow
 python sync-forks.py --verify-schedule --json  # 只读检查定时同步 readiness
+python sync-forks.py --verify-releases --json  # 只读检查 release 资产保留策略
 python sync-forks.py --dry-run        # 预览模式
 python sync-forks.py --json           # 输出 JSON 摘要
 python sync-forks.py --force          # 跳过安全检查（需设置 SYNC_FORKS_FORCE_ACK）

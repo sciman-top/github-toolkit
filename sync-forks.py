@@ -62,8 +62,15 @@ RESULT_ERROR = "error"
 MODE_SYNC = "sync"
 MODE_ADD_WORKFLOW = "add-workflow"
 MODE_VERIFY_SCHEDULE = "verify-schedule"
+MODE_VERIFY_RELEASES = "verify-releases"
 FORCE_SYNC_ACK_ENV = "SYNC_FORKS_FORCE_ACK"
 FORCE_SYNC_ACK_VALUE = "I_UNDERSTAND"
+STABLE_SOURCE_ONLY_REPOS = ("sciman-top/cockpit-tools",)
+STABLE_SOURCE_ONLY_REPOS_TEXT = ",".join(STABLE_SOURCE_ONLY_REPOS)
+INSTALLABLE_RELEASE_ASSET_RE = re.compile(
+    r"\.(?:exe|msi|deb|rpm|appimage|dmg|pkg|zip|tar\.gz)$",
+    re.IGNORECASE,
+)
 WORKFLOW_DISPATCH_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_-])workflow_dispatch(?![A-Za-z0-9_-])"
 )
@@ -78,6 +85,7 @@ Usage:
 Options:
   --add-workflow   Add or update sync-fork.yml instead of syncing now
   --verify-schedule Verify workflow/secret/scheduled-run readiness
+  --verify-releases Verify stable release mirror retention policy
   --dry-run        Preview planned changes without modifying repos
   --force          Bypass safety checks or force workflow rewrite
                    (real writes need explicit confirmation)
@@ -112,7 +120,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           token: ${{{{ secrets.SYNC_PAT }}}}
@@ -141,8 +149,26 @@ jobs:
           echo "branch=$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
           echo "url=$UPSTREAM_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Safety check - compare file counts
+      - name: Stable source policy guard
+        id: stable_source_policy
         if: steps.upstream.outputs.skip != 'true'
+        env:
+          STABLE_SOURCE_ONLY_REPOS: "{stable_source_only_repos}"
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra REPOS <<< "$STABLE_SOURCE_ONLY_REPOS"
+          for repo in "${{REPOS[@]}}"; do
+            repo=$(echo "$repo" | xargs)
+            if [ "$repo" = "${{{{ github.repository }}}}" ]; then
+              echo "::notice::Stable-source-only policy is enabled for $repo. Default-branch merge-upstream is skipped; mirror stable releases/tags instead."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Safety check - compare file counts
+        if: steps.upstream.outputs.skip != 'true' && steps.stable_source_policy.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
         run: |
@@ -161,7 +187,7 @@ jobs:
           echo "Safety check passed."
 
       - name: Create restore point
-        if: steps.upstream.outputs.skip != 'true'
+        if: steps.upstream.outputs.skip != 'true' && steps.stable_source_policy.outputs.skip != 'true'
         run: |
           set -euo pipefail
           BACKUP_BRANCH="backup/pre-sync"
@@ -169,7 +195,7 @@ jobs:
           git push origin "$BACKUP_BRANCH" --force
 
       - name: Diff guard - inspect deletions
-        if: steps.upstream.outputs.skip != 'true'
+        if: steps.upstream.outputs.skip != 'true' && steps.stable_source_policy.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
           BASE_REF: ${{{{ github.event.repository.default_branch }}}}
@@ -195,7 +221,7 @@ jobs:
           fi
 
       - name: Merge upstream changes
-        if: steps.upstream.outputs.skip != 'true'
+        if: steps.upstream.outputs.skip != 'true' && steps.stable_source_policy.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
         run: |
@@ -218,6 +244,14 @@ def _decode_workflow_content(existing_file):
     except (ValueError, TypeError):
         return None
     return raw
+
+
+def _render_workflow_template(cron=SYNC_CRON):
+    """Render the managed fork-sync workflow template."""
+    return WORKFLOW_TEMPLATE.format(
+        cron=cron,
+        stable_source_only_repos=STABLE_SOURCE_ONLY_REPOS_TEXT,
+    )
 
 
 def _has_workflow_dispatch(workflow_text):
@@ -255,7 +289,10 @@ def _missing_workflow_template_markers(workflow_text):
     """Return current-template markers missing from an existing workflow."""
     required_markers = (
         f'cron: "{SYNC_CRON}"',
+        "actions/checkout@v6",
         "Resolve upstream",
+        "Stable source policy guard",
+        "Stable-source-only policy is enabled",
         "Create restore point",
         "Diff guard - inspect deletions",
         "backup/pre-sync",
@@ -302,6 +339,12 @@ def _short_error(payload, default="invalid response payload"):
     if isinstance(payload, dict):
         return str(payload.get("error", default))[:200]
     return default
+
+
+def _is_stable_source_only_repo(full_name):
+    """Return True when normal default-branch sync should be skipped."""
+    stable_repos = {repo.lower() for repo in STABLE_SOURCE_ONLY_REPOS}
+    return str(full_name or "").lower() in stable_repos
 
 
 def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
@@ -417,7 +460,7 @@ def _add_sync_workflow_result(repo_name, branch, dry_run=False, force=False):
         print("  SKIP: sync-fork.yml already matches current workflow template")
         return RESULT_OK
 
-    content = WORKFLOW_TEMPLATE.format(cron=SYNC_CRON)
+    content = _render_workflow_template()
     encoded = base64.b64encode(content.encode()).decode()
 
     if dry_run:
@@ -532,6 +575,14 @@ def _create_restore_point(fork_name, fork_branch):
 def _sync_now_result(fork_name, fork_branch, upstream_name, upstream_branch,
                      dry_run=False, force=False):
     """Perform a one-time sync with safety check. Return operation result."""
+    if _is_stable_source_only_repo(fork_name) and not force:
+        print(
+            "  SKIP: stable-source-only policy is enabled. "
+            "Default-branch merge-upstream is skipped; mirror stable "
+            "releases/tags instead."
+        )
+        return RESULT_OK
+
     if dry_run:
         print(
             f"  [DRY-RUN] Would create/refresh backup/pre-sync and "
@@ -637,6 +688,7 @@ def _parse_cli_args(argv):
         "force": False,
         "add_mode": False,
         "verify_schedule": False,
+        "verify_releases": False,
         "json_output": "--json" in argv,
         "specific_repos": [],
         "show_help": False,
@@ -660,6 +712,9 @@ def _parse_cli_args(argv):
                 continue
             if arg == "--verify-schedule":
                 parsed["verify_schedule"] = True
+                continue
+            if arg == "--verify-releases":
+                parsed["verify_releases"] = True
                 continue
             if arg == "--json":
                 parsed["json_output"] = True
@@ -690,6 +745,162 @@ def _print_help():
     print(HELP_TEXT.rstrip())
 
 
+def _stable_releases(releases):
+    """Return non-draft, non-prerelease releases from a GitHub payload."""
+    if not isinstance(releases, list):
+        return []
+    return [
+        release for release in releases
+        if isinstance(release, dict)
+        and not release.get("draft")
+        and not release.get("prerelease")
+    ]
+
+
+def _asset_names(release):
+    """Return asset names from one release payload."""
+    if not isinstance(release, dict):
+        return []
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        return []
+    return [
+        asset.get("name")
+        for asset in assets
+        if isinstance(asset, dict) and isinstance(asset.get("name"), str)
+    ]
+
+
+def _asset_count(release):
+    """Return the number of assets on one release payload."""
+    if not isinstance(release, dict):
+        return 0
+    assets = release.get("assets")
+    return len(assets) if isinstance(assets, list) else 0
+
+
+def _installable_asset_count(release):
+    """Return installable/package asset count for one release."""
+    return sum(
+        1 for name in _asset_names(release)
+        if INSTALLABLE_RELEASE_ASSET_RE.search(name)
+    )
+
+
+def _find_release_by_tag(releases, tag_name):
+    """Find one release by tag name."""
+    for release in releases:
+        if isinstance(release, dict) and release.get("tag_name") == tag_name:
+            return release
+    return None
+
+
+def _build_verify_releases_row(fork):
+    """Collect stable-release mirror retention details for one fork."""
+    full_name = fork["full_name"]
+    upstream = fork["parent"]
+    source_policy = (
+        "stable_release_only"
+        if _is_stable_source_only_repo(full_name) else
+        "upstream_default_branch"
+    )
+    row = {
+        "name": fork["name"],
+        "full_name": full_name,
+        "upstream": upstream,
+        "source_update_policy": source_policy,
+        "release_policy": "latest_stable_assets_only",
+        "latest_upstream_stable": None,
+        "latest_upstream_asset_count": 0,
+        "latest_upstream_installable_asset_count": 0,
+        "fork_release_count": 0,
+        "fork_latest_stable_asset_count": 0,
+        "old_stable_release_asset_count": 0,
+        "result": RESULT_OK,
+    }
+
+    upstream_releases = gh_api(f"repos/{upstream}/releases?per_page=100")
+    fork_releases = gh_api(f"repos/{full_name}/releases?per_page=100")
+    if not isinstance(upstream_releases, list):
+        row["result"] = RESULT_ERROR
+        row["release_error"] = _short_error(upstream_releases)
+        row["next_action"] = "investigate_release_api_errors"
+        return row
+    if not isinstance(fork_releases, list):
+        row["result"] = RESULT_ERROR
+        row["release_error"] = _short_error(fork_releases)
+        row["next_action"] = "investigate_release_api_errors"
+        return row
+
+    upstream_stable = _stable_releases(upstream_releases)
+    fork_stable = _stable_releases(fork_releases)
+    row["fork_release_count"] = len(fork_releases)
+    if not upstream_stable:
+        row["next_action"] = "none"
+        return row
+
+    latest_upstream = upstream_stable[0]
+    latest_tag = latest_upstream.get("tag_name")
+    row["latest_upstream_stable"] = latest_tag
+    row["latest_upstream_asset_count"] = _asset_count(latest_upstream)
+    row["latest_upstream_installable_asset_count"] = (
+        _installable_asset_count(latest_upstream)
+    )
+
+    latest_fork = _find_release_by_tag(fork_releases, latest_tag)
+    row["fork_latest_stable_asset_count"] = _asset_count(latest_fork)
+    row["old_stable_release_asset_count"] = sum(
+        _asset_count(release)
+        for release in fork_stable
+        if release.get("tag_name") != latest_tag
+    )
+
+    if row["latest_upstream_installable_asset_count"] <= 0:
+        row["release_policy"] = "source_only_release_notes"
+        row["next_action"] = "none"
+    elif latest_fork is None:
+        row["next_action"] = "mirror_latest_stable_release"
+    elif row["fork_latest_stable_asset_count"] <= 0:
+        row["next_action"] = "mirror_latest_stable_assets"
+    elif row["old_stable_release_asset_count"] > 0:
+        row["next_action"] = "prune_old_stable_release_assets"
+    else:
+        row["next_action"] = "none"
+
+    return row
+
+
+def _verify_release_retention(forks):
+    """Return release-retention rows and summary counts."""
+    rows = []
+    summary = {
+        "total": len(forks),
+        "ready": 0,
+        "latest_stable_assets_required": 0,
+        "latest_stable_missing_or_without_assets": 0,
+        "old_stable_assets_present": 0,
+        "errors": 0,
+    }
+    for fork in forks:
+        row = _build_verify_releases_row(fork)
+        rows.append(row)
+        if row["result"] == RESULT_ERROR:
+            summary["errors"] += 1
+            continue
+        if row["latest_upstream_installable_asset_count"] > 0:
+            summary["latest_stable_assets_required"] += 1
+        if row["next_action"] in {
+            "mirror_latest_stable_release",
+            "mirror_latest_stable_assets",
+        }:
+            summary["latest_stable_missing_or_without_assets"] += 1
+        if row["old_stable_release_asset_count"] > 0:
+            summary["old_stable_assets_present"] += 1
+        if row["next_action"] == "none":
+            summary["ready"] += 1
+    return rows, summary
+
+
 def _build_verify_schedule_row(fork):
     """Collect schedule-readiness details for one fork repository."""
     full_name = fork["full_name"]
@@ -702,6 +913,11 @@ def _build_verify_schedule_row(fork):
         "branch": branch,
         "upstream": fork["parent"],
         "upstream_branch": fork["parent_branch"],
+        "source_update_policy": (
+            "stable_release_only"
+            if _is_stable_source_only_repo(full_name) else
+            "upstream_default_branch"
+        ),
         "workflow_installed": False,
         "workflow_current": False,
         "workflow_update_reason": None,
@@ -814,6 +1030,7 @@ def _verify_schedule_readiness(forks):
         "workflow_needs_update": 0,
         "missing_secret": 0,
         "scheduled_run_missing_or_unhealthy": 0,
+        "stable_source_only": 0,
         "errors": 0,
     }
 
@@ -824,6 +1041,8 @@ def _verify_schedule_readiness(forks):
         if row["result"] == RESULT_ERROR:
             summary["errors"] += 1
             continue
+        if row["source_update_policy"] == "stable_release_only":
+            summary["stable_source_only"] += 1
         if not row["workflow_installed"]:
             summary["missing_workflow"] += 1
         elif not row["workflow_current"]:
@@ -843,10 +1062,12 @@ def _verify_schedule_readiness(forks):
     return rows, summary
 
 
-def _mode_name(add_mode, verify_schedule):
+def _mode_name(add_mode, verify_schedule, verify_releases=False):
     """Return the machine-readable execution mode name."""
     if verify_schedule:
         return MODE_VERIFY_SCHEDULE
+    if verify_releases:
+        return MODE_VERIFY_RELEASES
     if add_mode:
         return MODE_ADD_WORKFLOW
     return MODE_SYNC
@@ -858,7 +1079,7 @@ def _mode_writes_remotely(mode, dry_run):
         return False
     if mode in {MODE_SYNC, MODE_ADD_WORKFLOW}:
         return True
-    if mode == MODE_VERIFY_SCHEDULE:
+    if mode in {MODE_VERIFY_SCHEDULE, MODE_VERIFY_RELEASES}:
         return False
     raise ValueError(f"Unclassified execution mode: {mode}")
 
@@ -993,6 +1214,28 @@ def _run_verify_schedule_mode(report, forks, json_output):
     return EXIT_OK, report
 
 
+def _run_verify_releases_mode(report, forks, json_output):
+    """Execute verify-releases mode and return its exit result."""
+    rows, release_summary = _verify_release_retention(forks)
+    report["repos"] = rows
+    report["summary"].update(release_summary)
+    report["message"] = (
+        "Release retention verified: "
+        f"ready {release_summary['ready']}/{release_summary['total']}."
+    )
+    if not json_output:
+        _print_verify_release_rows(rows)
+        print(report["message"])
+    if release_summary["errors"]:
+        return EXIT_ERROR, report
+    if (
+        release_summary["latest_stable_missing_or_without_assets"]
+        or release_summary["old_stable_assets_present"]
+    ):
+        return EXIT_SAFETY, report
+    return EXIT_OK, report
+
+
 def _format_bool_status(value):
     """Return a compact status label for text tables."""
     return "yes" if value else "no"
@@ -1014,16 +1257,39 @@ def _print_verify_schedule_rows(rows):
     print("Schedule readiness details:")
     print(
         f"{'Repository':<35} {'Workflow':<10} {'Current':<8} "
-        f"{'Secret':<7} {'Last':<10} {'Next action'}"
+        f"{'Secret':<7} {'Source policy':<23} {'Last':<10} {'Next action'}"
     )
-    print("-" * 92)
+    print("-" * 118)
     for row in rows:
         print(
             f"{row['full_name']:<35} "
             f"{_format_bool_status(row.get('workflow_installed')):<10} "
             f"{_format_bool_status(row.get('workflow_current')):<8} "
             f"{_format_bool_status(row.get('secret_sync_pat_present')):<7} "
+            f"{row.get('source_update_policy') or '-':<23} "
             f"{_format_last_scheduled_run(row):<10} "
+            f"{row.get('next_action') or '-'}"
+        )
+    print()
+
+
+def _print_verify_release_rows(rows):
+    """Print per-repo release-retention rows for text-mode diagnostics."""
+    if not rows:
+        return
+    print("Release retention details:")
+    print(
+        f"{'Repository':<35} {'Latest stable':<15} {'Upstream assets':<15} "
+        f"{'Fork latest':<12} {'Old assets':<10} {'Next action'}"
+    )
+    print("-" * 112)
+    for row in rows:
+        print(
+            f"{row['full_name']:<35} "
+            f"{str(row.get('latest_upstream_stable') or '-'):<15} "
+            f"{row.get('latest_upstream_asset_count', 0):<15} "
+            f"{row.get('fork_latest_stable_asset_count', 0):<12} "
+            f"{row.get('old_stable_release_asset_count', 0):<10} "
             f"{row.get('next_action') or '-'}"
         )
     print()
@@ -1064,6 +1330,11 @@ def _append_operation_report(report, fork, result, output, json_output):
         "branch": fork["branch"],
         "upstream": fork["parent"],
         "upstream_branch": fork["parent_branch"],
+        "source_update_policy": (
+            "stable_release_only"
+            if _is_stable_source_only_repo(fork["full_name"]) else
+            "upstream_default_branch"
+        ),
         "result": result,
     }
     if json_output:
@@ -1118,6 +1389,7 @@ def _run(parsed):
     force = parsed.get("force", False)
     add_mode = parsed.get("add_mode", False)
     verify_schedule = parsed.get("verify_schedule", False)
+    verify_releases = parsed.get("verify_releases", False)
     specific_repos = parsed.get("specific_repos", [])
     json_output = parsed.get("json_output", False)
 
@@ -1126,7 +1398,7 @@ def _run(parsed):
     auth_info = auth_context["auth"]
     username = auth_context["username"]
 
-    mode = _mode_name(add_mode, verify_schedule)
+    mode = _mode_name(add_mode, verify_schedule, verify_releases)
     report = _build_run_report(
         username, auth_info, mode, dry_run, force, specific_repos,
     )
@@ -1154,6 +1426,8 @@ def _run(parsed):
 
     if verify_schedule:
         return _run_verify_schedule_mode(report, forks, json_output)
+    if verify_releases:
+        return _run_verify_releases_mode(report, forks, json_output)
 
     return _run_mutating_or_dryrun_mode(
         report, forks, mode, dry_run, force, resolve_errors, json_output,

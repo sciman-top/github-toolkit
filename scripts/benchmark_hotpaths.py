@@ -306,7 +306,7 @@ def _bench_sync_specific_deduped(count, runs):
 
 def _bench_verify_schedule_readiness(count, runs):
     forks = _build_forks(count)
-    workflow_text = SYNC_FORKS.WORKFLOW_TEMPLATE.format(cron=SYNC_FORKS.SYNC_CRON)
+    workflow_text = SYNC_FORKS._render_workflow_template()
     workflow_payload = {
         "content": base64.b64encode(workflow_text.encode()).decode(),
     }
