@@ -63,6 +63,21 @@ MODE_SYNC = "sync"
 MODE_ADD_WORKFLOW = "add-workflow"
 MODE_VERIFY_SCHEDULE = "verify-schedule"
 MODE_VERIFY_RELEASES = "verify-releases"
+MODE_OPTION_FLAGS = (
+    ("add_mode", "--add-workflow"),
+    ("verify_schedule", "--verify-schedule"),
+    ("verify_releases", "--verify-releases"),
+)
+VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS = (
+    "missing_workflow",
+    "workflow_needs_update",
+    "missing_secret",
+    "scheduled_run_missing_or_unhealthy",
+)
+VERIFY_RELEASE_SAFETY_SUMMARY_KEYS = (
+    "latest_stable_missing_or_without_assets",
+    "old_stable_assets_present",
+)
 FORCE_SYNC_ACK_ENV = "SYNC_FORKS_FORCE_ACK"
 FORCE_SYNC_ACK_VALUE = "I_UNDERSTAND"
 STABLE_SOURCE_ONLY_REPOS = ("sciman-top/cockpit-tools",)
@@ -746,14 +761,11 @@ def _parse_cli_args(argv):
 
         parsed["specific_repos"].append(arg)
 
-    selected_modes = [
-        name for name in ("add_mode", "verify_schedule", "verify_releases")
-        if parsed[name]
-    ]
+    selected_modes = _selected_mode_flags(parsed)
     if len(selected_modes) > 1:
+        options = ", ".join(option for _name, option in MODE_OPTION_FLAGS)
         parsed["error"] = (
-            "Choose only one mode: --add-workflow, --verify-schedule, "
-            "or --verify-releases"
+            f"Choose only one mode: {options}"
         )
 
     return parsed
@@ -826,6 +838,24 @@ def _find_release_by_tag(releases, tag_name):
     return None
 
 
+def _release_retention_next_action(
+    latest_installable_asset_count,
+    latest_fork_release,
+    fork_latest_asset_count,
+    old_stable_asset_count,
+):
+    """Return release-retention next action from normalized counters."""
+    if latest_installable_asset_count <= 0:
+        return "none"
+    if latest_fork_release is None:
+        return "mirror_latest_stable_release"
+    if fork_latest_asset_count <= 0:
+        return "mirror_latest_stable_assets"
+    if old_stable_asset_count > 0:
+        return "prune_old_stable_release_assets"
+    return "none"
+
+
 def _latest_workflow_run(runs_payload):
     """Return normalized latest workflow run details, or None if absent/malformed."""
     if not isinstance(runs_payload, dict) or "error" in runs_payload:
@@ -852,6 +882,26 @@ def _fetch_latest_workflow_run(full_name, event):
         f"{full_name}/actions/workflows/sync-fork.yml/runs"
         f"?event={event}&per_page=1"
     )
+
+
+def _schedule_next_action(row):
+    """Return schedule-readiness next action from one normalized row."""
+    if row["result"] == RESULT_ERROR:
+        return "investigate_api_errors"
+    if not row["workflow_installed"]:
+        return "install_sync_workflow"
+    if not row["workflow_current"]:
+        return "update_sync_workflow"
+    if not row["secret_sync_pat_present"]:
+        return "set_sync_pat_secret"
+    if row["last_scheduled_run"] is None:
+        smoke_run = row["last_smoke_run"] or {}
+        if smoke_run.get("conclusion") == "success":
+            return "none"
+        return "wait_or_trigger_smoke_run"
+    if row["last_scheduled_run"].get("conclusion") != "success":
+        return "inspect_last_scheduled_failure"
+    return "none"
 
 
 def _build_verify_releases_row(fork):
@@ -906,17 +956,14 @@ def _build_verify_releases_row(fork):
         if release.get("tag_name") != latest_tag
     )
 
+    row["next_action"] = _release_retention_next_action(
+        row["latest_upstream_installable_asset_count"],
+        latest_fork,
+        row["fork_latest_stable_asset_count"],
+        row["old_stable_release_asset_count"],
+    )
     if row["latest_upstream_installable_asset_count"] <= 0:
         row["release_policy"] = "source_only_release_notes"
-        row["next_action"] = "none"
-    elif latest_fork is None:
-        row["next_action"] = "mirror_latest_stable_release"
-    elif row["fork_latest_stable_asset_count"] <= 0:
-        row["next_action"] = "mirror_latest_stable_assets"
-    elif row["old_stable_release_asset_count"] > 0:
-        row["next_action"] = "prune_old_stable_release_assets"
-    else:
-        row["next_action"] = "none"
 
     return row
 
@@ -1015,24 +1062,7 @@ def _build_verify_schedule_row(fork):
             row["result"] = RESULT_ERROR
             row["smoke_run_error"] = _short_error(smoke_runs)
 
-    if row["result"] == RESULT_ERROR:
-        row["next_action"] = "investigate_api_errors"
-    elif not row["workflow_installed"]:
-        row["next_action"] = "install_sync_workflow"
-    elif not row["workflow_current"]:
-        row["next_action"] = "update_sync_workflow"
-    elif not row["secret_sync_pat_present"]:
-        row["next_action"] = "set_sync_pat_secret"
-    elif row["last_scheduled_run"] is None:
-        smoke_run = row["last_smoke_run"] or {}
-        if smoke_run.get("conclusion") == "success":
-            row["next_action"] = "none"
-        else:
-            row["next_action"] = "wait_or_trigger_smoke_run"
-    elif row["last_scheduled_run"].get("conclusion") != "success":
-        row["next_action"] = "inspect_last_scheduled_failure"
-    else:
-        row["next_action"] = "none"
+    row["next_action"] = _schedule_next_action(row)
 
     return row
 
@@ -1088,6 +1118,14 @@ def _mode_name(add_mode, verify_schedule, verify_releases=False):
     if add_mode:
         return MODE_ADD_WORKFLOW
     return MODE_SYNC
+
+
+def _selected_mode_flags(parsed):
+    """Return selected mutually exclusive mode flag names."""
+    return [
+        name for name, _option in MODE_OPTION_FLAGS
+        if parsed.get(name)
+    ]
 
 
 def _mode_writes_remotely(mode, dry_run):
@@ -1158,6 +1196,20 @@ def _reject_unconfirmed_force_write(report, json_output):
     return EXIT_ERROR, report
 
 
+def _summary_has_any(summary, keys):
+    """Return True when any named summary counter is truthy."""
+    return any(summary.get(key) for key in keys)
+
+
+def _verification_exit_code(summary, safety_keys):
+    """Map verification summary counters to the CLI exit contract."""
+    if summary.get("errors"):
+        return EXIT_ERROR
+    if _summary_has_any(summary, safety_keys):
+        return EXIT_SAFETY
+    return EXIT_OK
+
+
 def _print_run_header(username, auth_info, text_mode, json_output):
     """Print the text-mode run header."""
     if json_output:
@@ -1219,16 +1271,13 @@ def _run_verify_schedule_mode(report, forks, json_output):
     if not json_output:
         _print_verify_schedule_rows(rows)
         print(report["message"])
-    if verify_summary["errors"]:
-        return EXIT_ERROR, report
-    if (
-        verify_summary["missing_workflow"]
-        or verify_summary["workflow_needs_update"]
-        or verify_summary["missing_secret"]
-        or verify_summary["scheduled_run_missing_or_unhealthy"]
-    ):
-        return EXIT_SAFETY, report
-    return EXIT_OK, report
+    return (
+        _verification_exit_code(
+            verify_summary,
+            VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS,
+        ),
+        report,
+    )
 
 
 def _run_verify_releases_mode(report, forks, json_output):
@@ -1243,14 +1292,13 @@ def _run_verify_releases_mode(report, forks, json_output):
     if not json_output:
         _print_verify_release_rows(rows)
         print(report["message"])
-    if release_summary["errors"]:
-        return EXIT_ERROR, report
-    if (
-        release_summary["latest_stable_missing_or_without_assets"]
-        or release_summary["old_stable_assets_present"]
-    ):
-        return EXIT_SAFETY, report
-    return EXIT_OK, report
+    return (
+        _verification_exit_code(
+            release_summary,
+            VERIFY_RELEASE_SAFETY_SUMMARY_KEYS,
+        ),
+        report,
+    )
 
 
 def _format_bool_status(value):
@@ -1354,12 +1402,17 @@ def _append_operation_report(report, fork, result, output, json_output):
         repo_report["logs"] = _split_log_lines(output)
     report["repos"].append(repo_report)
 
+    _update_operation_summary(report["summary"], result)
+
+
+def _update_operation_summary(summary, result):
+    """Update operation summary counters for one repo result."""
     if result == RESULT_OK:
-        report["summary"]["success"] += 1
+        summary["success"] += 1
     elif result == RESULT_SAFETY:
-        report["summary"]["safety_abort"] += 1
+        summary["safety_abort"] += 1
     else:
-        report["summary"]["failed"] += 1
+        summary["failed"] += 1
 
 
 def _run_mutating_or_dryrun_mode(report, forks, mode, dry_run, force,

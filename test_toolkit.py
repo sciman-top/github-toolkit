@@ -2099,6 +2099,16 @@ class TestSyncForksHelpers(unittest.TestCase):
         self.assertIn("Choose only one mode", parsed["error"])
         self.assertTrue(parsed["json_output"])
 
+    def test_selected_mode_flags_returns_selected_flags(self):
+        self.assertEqual(
+            sync_forks._selected_mode_flags({
+                "add_mode": True,
+                "verify_schedule": False,
+                "verify_releases": True,
+            }),
+            ["add_mode", "verify_releases"],
+        )
+
     def test_source_update_policy_uses_precomputed_stable_repo_set(self):
         self.assertEqual(
             sync_forks._source_update_policy("sciman-top/cockpit-tools"),
@@ -2127,6 +2137,121 @@ class TestSyncForksHelpers(unittest.TestCase):
         self.assertIsNone(sync_forks._latest_workflow_run({"workflow_runs": None}))
         self.assertIsNone(sync_forks._latest_workflow_run({"workflow_runs": [None]}))
         self.assertIsNone(sync_forks._latest_workflow_run([]))
+
+    def test_verification_exit_code_prioritizes_errors_then_safety(self):
+        self.assertEqual(
+            sync_forks._verification_exit_code(
+                {"errors": 1, "missing_workflow": 1},
+                sync_forks.VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS,
+            ),
+            sync_forks.EXIT_ERROR,
+        )
+        self.assertEqual(
+            sync_forks._verification_exit_code(
+                {"errors": 0, "missing_workflow": 1},
+                sync_forks.VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS,
+            ),
+            sync_forks.EXIT_SAFETY,
+        )
+        self.assertEqual(
+            sync_forks._verification_exit_code(
+                {"errors": 0, "missing_workflow": 0},
+                sync_forks.VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS,
+            ),
+            sync_forks.EXIT_OK,
+        )
+
+    def test_update_operation_summary_counts_results(self):
+        summary = {"success": 0, "safety_abort": 0, "failed": 0}
+
+        sync_forks._update_operation_summary(summary, sync_forks.RESULT_OK)
+        sync_forks._update_operation_summary(summary, sync_forks.RESULT_SAFETY)
+        sync_forks._update_operation_summary(summary, sync_forks.RESULT_ERROR)
+
+        self.assertEqual(summary, {
+            "success": 1,
+            "safety_abort": 1,
+            "failed": 1,
+        })
+
+    def test_release_retention_next_action_maps_policy_states(self):
+        self.assertEqual(
+            sync_forks._release_retention_next_action(0, None, 0, 0),
+            "none",
+        )
+        self.assertEqual(
+            sync_forks._release_retention_next_action(1, None, 0, 0),
+            "mirror_latest_stable_release",
+        )
+        self.assertEqual(
+            sync_forks._release_retention_next_action(1, {"tag_name": "v2"}, 0, 0),
+            "mirror_latest_stable_assets",
+        )
+        self.assertEqual(
+            sync_forks._release_retention_next_action(1, {"tag_name": "v2"}, 1, 1),
+            "prune_old_stable_release_assets",
+        )
+        self.assertEqual(
+            sync_forks._release_retention_next_action(1, {"tag_name": "v2"}, 1, 0),
+            "none",
+        )
+
+    def test_schedule_next_action_maps_readiness_states(self):
+        base_row = {
+            "result": sync_forks.RESULT_OK,
+            "workflow_installed": True,
+            "workflow_current": True,
+            "secret_sync_pat_present": True,
+            "last_scheduled_run": {
+                "conclusion": "success",
+            },
+            "last_smoke_run": None,
+        }
+
+        self.assertEqual(sync_forks._schedule_next_action(base_row), "none")
+
+        row = {**base_row, "result": sync_forks.RESULT_ERROR}
+        self.assertEqual(
+            sync_forks._schedule_next_action(row),
+            "investigate_api_errors",
+        )
+
+        row = {**base_row, "workflow_installed": False}
+        self.assertEqual(
+            sync_forks._schedule_next_action(row),
+            "install_sync_workflow",
+        )
+
+        row = {**base_row, "workflow_current": False}
+        self.assertEqual(
+            sync_forks._schedule_next_action(row),
+            "update_sync_workflow",
+        )
+
+        row = {**base_row, "secret_sync_pat_present": False}
+        self.assertEqual(
+            sync_forks._schedule_next_action(row),
+            "set_sync_pat_secret",
+        )
+
+        row = {
+            **base_row,
+            "last_scheduled_run": None,
+            "last_smoke_run": {"conclusion": "success"},
+        }
+        self.assertEqual(sync_forks._schedule_next_action(row), "none")
+
+        row = {**base_row, "last_scheduled_run": None, "last_smoke_run": None}
+        self.assertEqual(
+            sync_forks._schedule_next_action(row),
+            "wait_or_trigger_smoke_run",
+        )
+
+        row = {**base_row, "last_scheduled_run": {"conclusion": "failure"}}
+        self.assertEqual(
+            sync_forks._schedule_next_action(row),
+            "inspect_last_scheduled_failure",
+        )
 
     def test_mode_write_classification_is_explicit(self):
         self.assertTrue(
