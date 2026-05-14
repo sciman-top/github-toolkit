@@ -67,6 +67,10 @@ FORCE_SYNC_ACK_ENV = "SYNC_FORKS_FORCE_ACK"
 FORCE_SYNC_ACK_VALUE = "I_UNDERSTAND"
 STABLE_SOURCE_ONLY_REPOS = ("sciman-top/cockpit-tools",)
 STABLE_SOURCE_ONLY_REPOS_TEXT = ",".join(STABLE_SOURCE_ONLY_REPOS)
+STABLE_SOURCE_ONLY_REPO_SET = {
+    repo.lower()
+    for repo in STABLE_SOURCE_ONLY_REPOS
+}
 INSTALLABLE_RELEASE_ASSET_RE = re.compile(
     r"\.(?:exe|msi|deb|rpm|appimage|dmg|pkg|zip|tar\.gz)$",
     re.IGNORECASE,
@@ -343,8 +347,25 @@ def _short_error(payload, default="invalid response payload"):
 
 def _is_stable_source_only_repo(full_name):
     """Return True when normal default-branch sync should be skipped."""
-    stable_repos = {repo.lower() for repo in STABLE_SOURCE_ONLY_REPOS}
-    return str(full_name or "").lower() in stable_repos
+    return str(full_name or "").lower() in STABLE_SOURCE_ONLY_REPO_SET
+
+
+def _source_update_policy(full_name):
+    """Return the declared update policy for one fork full_name."""
+    if _is_stable_source_only_repo(full_name):
+        return "stable_release_only"
+    return "upstream_default_branch"
+
+
+def _base_fork_row(fork):
+    """Return common report fields for fork-level verification rows."""
+    full_name = fork["full_name"]
+    return {
+        "name": fork["name"],
+        "full_name": full_name,
+        "upstream": fork["parent"],
+        "source_update_policy": _source_update_policy(full_name),
+    }
 
 
 def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
@@ -725,6 +746,16 @@ def _parse_cli_args(argv):
 
         parsed["specific_repos"].append(arg)
 
+    selected_modes = [
+        name for name in ("add_mode", "verify_schedule", "verify_releases")
+        if parsed[name]
+    ]
+    if len(selected_modes) > 1:
+        parsed["error"] = (
+            "Choose only one mode: --add-workflow, --verify-schedule, "
+            "or --verify-releases"
+        )
+
     return parsed
 
 
@@ -795,20 +826,40 @@ def _find_release_by_tag(releases, tag_name):
     return None
 
 
+def _latest_workflow_run(runs_payload):
+    """Return normalized latest workflow run details, or None if absent/malformed."""
+    if not isinstance(runs_payload, dict) or "error" in runs_payload:
+        return None
+    runs = runs_payload.get("workflow_runs")
+    if not isinstance(runs, list) or not runs:
+        return None
+    last = runs[0]
+    if not isinstance(last, dict):
+        return None
+    return {
+        "status": last.get("status"),
+        "conclusion": last.get("conclusion"),
+        "created_at": last.get("created_at"),
+        "updated_at": last.get("updated_at"),
+        "html_url": last.get("html_url"),
+    }
+
+
+def _fetch_latest_workflow_run(full_name, event):
+    """Fetch latest sync-fork workflow run for one event type."""
+    return gh_api(
+        "repos/"
+        f"{full_name}/actions/workflows/sync-fork.yml/runs"
+        f"?event={event}&per_page=1"
+    )
+
+
 def _build_verify_releases_row(fork):
     """Collect stable-release mirror retention details for one fork."""
     full_name = fork["full_name"]
     upstream = fork["parent"]
-    source_policy = (
-        "stable_release_only"
-        if _is_stable_source_only_repo(full_name) else
-        "upstream_default_branch"
-    )
     row = {
-        "name": fork["name"],
-        "full_name": full_name,
-        "upstream": upstream,
-        "source_update_policy": source_policy,
+        **_base_fork_row(fork),
         "release_policy": "latest_stable_assets_only",
         "latest_upstream_stable": None,
         "latest_upstream_asset_count": 0,
@@ -908,16 +959,9 @@ def _build_verify_schedule_row(fork):
     encoded_branch = encode_url_component(branch)
 
     row = {
-        "name": fork["name"],
-        "full_name": full_name,
+        **_base_fork_row(fork),
         "branch": branch,
-        "upstream": fork["parent"],
         "upstream_branch": fork["parent_branch"],
-        "source_update_policy": (
-            "stable_release_only"
-            if _is_stable_source_only_repo(full_name) else
-            "upstream_default_branch"
-        ),
         "workflow_installed": False,
         "workflow_current": False,
         "workflow_update_reason": None,
@@ -950,22 +994,9 @@ def _build_verify_schedule_row(fork):
         row["result"] = RESULT_ERROR
         row["secret_error"] = _short_error(secret)
 
-    scheduled_runs = gh_api(
-        "repos/"
-        f"{full_name}/actions/workflows/sync-fork.yml/runs?event=schedule&per_page=1"
-    )
+    scheduled_runs = _fetch_latest_workflow_run(full_name, "schedule")
     if isinstance(scheduled_runs, dict) and "error" not in scheduled_runs:
-        runs = scheduled_runs.get("workflow_runs")
-        if isinstance(runs, list) and runs:
-            last = runs[0]
-            if isinstance(last, dict):
-                row["last_scheduled_run"] = {
-                    "status": last.get("status"),
-                    "conclusion": last.get("conclusion"),
-                    "created_at": last.get("created_at"),
-                    "updated_at": last.get("updated_at"),
-                    "html_url": last.get("html_url"),
-                }
+        row["last_scheduled_run"] = _latest_workflow_run(scheduled_runs)
     elif not _is_not_found_error(scheduled_runs):
         row["result"] = RESULT_ERROR
         row["scheduled_run_error"] = _short_error(scheduled_runs)
@@ -977,23 +1008,9 @@ def _build_verify_schedule_row(fork):
         and row["secret_sync_pat_present"]
         and row["last_scheduled_run"] is None
     ):
-        smoke_runs = gh_api(
-            "repos/"
-            f"{full_name}/actions/workflows/sync-fork.yml/runs"
-            "?event=workflow_dispatch&per_page=1"
-        )
+        smoke_runs = _fetch_latest_workflow_run(full_name, "workflow_dispatch")
         if isinstance(smoke_runs, dict) and "error" not in smoke_runs:
-            runs = smoke_runs.get("workflow_runs")
-            if isinstance(runs, list) and runs:
-                last = runs[0]
-                if isinstance(last, dict):
-                    row["last_smoke_run"] = {
-                        "status": last.get("status"),
-                        "conclusion": last.get("conclusion"),
-                        "created_at": last.get("created_at"),
-                        "updated_at": last.get("updated_at"),
-                        "html_url": last.get("html_url"),
-                    }
+            row["last_smoke_run"] = _latest_workflow_run(smoke_runs)
         elif not _is_not_found_error(smoke_runs):
             row["result"] = RESULT_ERROR
             row["smoke_run_error"] = _short_error(smoke_runs)
@@ -1330,11 +1347,7 @@ def _append_operation_report(report, fork, result, output, json_output):
         "branch": fork["branch"],
         "upstream": fork["parent"],
         "upstream_branch": fork["parent_branch"],
-        "source_update_policy": (
-            "stable_release_only"
-            if _is_stable_source_only_repo(fork["full_name"]) else
-            "upstream_default_branch"
-        ),
+        "source_update_policy": _source_update_policy(fork["full_name"]),
         "result": result,
     }
     if json_output:

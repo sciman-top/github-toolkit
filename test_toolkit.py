@@ -2089,6 +2089,45 @@ class TestSyncForksHelpers(unittest.TestCase):
             ["fork-a", "fork-b", "fork-c"],
         )
 
+    def test_parse_cli_rejects_multiple_modes(self):
+        parsed = sync_forks._parse_cli_args([
+            "--add-workflow",
+            "--verify-schedule",
+            "--json",
+        ])
+
+        self.assertIn("Choose only one mode", parsed["error"])
+        self.assertTrue(parsed["json_output"])
+
+    def test_source_update_policy_uses_precomputed_stable_repo_set(self):
+        self.assertEqual(
+            sync_forks._source_update_policy("sciman-top/cockpit-tools"),
+            "stable_release_only",
+        )
+        self.assertEqual(
+            sync_forks._source_update_policy("sciman-top/claude-dashboard"),
+            "upstream_default_branch",
+        )
+
+    def test_latest_workflow_run_normalizes_valid_payload(self):
+        result = sync_forks._latest_workflow_run({
+            "workflow_runs": [{
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-05-10T11:42:40Z",
+                "updated_at": "2026-05-10T11:43:00Z",
+                "html_url": "https://example.com/run/2",
+            }],
+        })
+
+        self.assertEqual(result["conclusion"], "success")
+        self.assertEqual(result["html_url"], "https://example.com/run/2")
+
+    def test_latest_workflow_run_degrades_malformed_payload(self):
+        self.assertIsNone(sync_forks._latest_workflow_run({"workflow_runs": None}))
+        self.assertIsNone(sync_forks._latest_workflow_run({"workflow_runs": [None]}))
+        self.assertIsNone(sync_forks._latest_workflow_run([]))
+
     def test_mode_write_classification_is_explicit(self):
         self.assertTrue(
             sync_forks._mode_writes_remotely(sync_forks.MODE_SYNC, dry_run=False)
