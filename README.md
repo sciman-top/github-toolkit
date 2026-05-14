@@ -112,6 +112,16 @@ python sync-forks.py --verify-releases cockpit-tools --json
 
 JSON 输出中 `next_action=prune_old_stable_release_assets` 表示旧稳定版仍带资产，需要删除旧资产但保留 release 文案；`next_action=mirror_latest_stable_release` 或 `mirror_latest_stable_assets` 表示最新稳定版还未完整保留安装/打包资产。
 
+`--verify-releases` 是只读门禁，不会自动创建、上传或删除 release 资产。只要发现需要镜像最新稳定版或清理旧稳定版资产，命令会以 safety exit code `3` 退出；这不是脚本崩溃，而是阻断信号，表示需要执行一次中风险远端 release 维护后再复测。
+
+稳定版 release 更新闭环：
+
+1. 先运行 `python sync-forks.py --verify-releases --json` 确认具体 `next_action`。
+2. 若需要镜像最新稳定版，先从 upstream 下载稳定 release 资产，再在 fork 创建同 tag release 并上传资产。
+3. 若存在 `latest.json`，必须把下载 URL 改写到 `sciman-top/...` fork release，并同步更新 `SHA256SUMS.txt` 里 `latest.json` 的 hash。
+4. 若旧稳定版仍保留安装/打包资产，只删除旧资产，保留 tag、release 标题和说明。
+5. 最后重跑 `python sync-forks.py --verify-releases --json`，确认 `ready == total` 且退出码为 `0`。
+
 ## 配置与认证
 ### 认证方式
 本项目支持两种认证方式，优先级如下：

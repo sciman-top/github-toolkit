@@ -47,9 +47,9 @@
   - `sciman-top/cockpit-tools` from `jlcodes99/cockpit-tools`
   - `sciman-top/v2ray-agent` from `mack-a/v2ray-agent`
 - Schedule readiness: `ready 2/3`.
-- `claude-dashboard`: missing sync workflow and `SYNC_FORK_PAT`; next action is `install_sync_workflow`.
-- `cockpit-tools`: workflow current, `SYNC_FORK_PAT` present, manual smoke run succeeded at `2026-05-10T11:42:40Z`; no scheduled run has occurred yet because the workflow is new.
-- `v2ray-agent`: workflow current, `SYNC_FORK_PAT` present, scheduled run succeeded at `2026-05-10T05:45:42Z`.
+- `claude-dashboard`: missing sync workflow and `SYNC_PAT`; next action is `install_sync_workflow`.
+- `cockpit-tools`: workflow current, `SYNC_PAT` present, manual smoke run succeeded at `2026-05-10T11:42:40Z`; no scheduled run has occurred yet because the workflow is new.
+- `v2ray-agent`: workflow current, `SYNC_PAT` present, scheduled run succeeded at `2026-05-10T05:45:42Z`.
 - Full dry-run sync reported success for 3/3 forks with no safety abort.
 - Backup branch verified: `backup/current-2026-05-14` -> `5d0cd7280a12c9611fc3bbf440b5e11ef0b31a45`.
 - Release mirror detection:
