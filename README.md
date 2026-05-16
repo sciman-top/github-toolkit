@@ -95,6 +95,17 @@ python sync-forks.py --json --verify-releases
 
 stable-source-only 仓库在本地 `sync-forks.py` 和生成的 `sync-fork.yml` 中都会跳过默认分支 `merge-upstream`。这不会删除已有 `backup/pre-sync` 或固定备份分支；后续稳定版更新应通过 release/tag 镜像能力落地，而不是普通默认分支合并。
 
+### 5.1 Cockpit Tools 自用分支更新
+`sciman-top/cockpit-tools` 的默认分支定时任务不会自动合并上游源码；自用源码分支需要显式本地维护，策略是“保留自用特性，把它们重放到官方最新版上”。固定入口：
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/Update-CockpitSelfUseFork.ps1 -PlanOnly
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/Update-CockpitSelfUseFork.ps1 -RunBuild
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/Update-CockpitSelfUseFork.ps1 -RunBuild -Push
+```
+
+脚本默认操作 `D:\CODE\external\cockpit-tools` 的 `codex/follow-current-local-v0.23.4` 分支，从官方 `origin/main` rebase，创建本地 `backup/selfuse-pre-rebase-<timestamp>` 备份分支。遇到冲突会停止，不会自动覆盖；冲突处理原则是保留明确的自用能力（例如 Cockpit API Service、单号池、投影链和本机快捷入口修复），同时接入官方兼容的新功能、修复和依赖更新。确认后使用 `--force-with-lease` 推送到 fork，避免无意覆盖远端新提交。
+
 ### 6. Release 保留策略
 Release 镜像遵循 `latest_stable_assets_only`：
 
