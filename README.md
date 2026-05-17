@@ -104,7 +104,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/Update-CockpitSelfUseFork.
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/Update-CockpitSelfUseFork.ps1 -RunBuild -Push
 ```
 
-脚本默认操作 `D:\CODE\external\cockpit-tools` 的 `codex/follow-current-local-v0.23.4` 分支，从官方 `origin/main` rebase，创建本地 `backup/selfuse-pre-rebase-<timestamp>` 备份分支。遇到冲突会停止，不会自动覆盖；冲突处理原则是保留明确的自用能力（例如 Cockpit API Service、单号池、投影链和本机快捷入口修复），同时接入官方兼容的新功能、修复和依赖更新。确认后使用 `--force-with-lease` 推送到 fork，避免无意覆盖远端新提交。
+脚本默认操作 `D:\CODE\external\Cockpit-Tools-Local` 的 `codex/follow-current-local-v0.23.4` 分支，从官方 `origin/main` rebase，创建本地 `backup/selfuse-pre-rebase-<timestamp>` 备份分支。遇到冲突会停止，不会自动覆盖；冲突处理原则是保留明确的自用能力（例如 Cockpit API Service、单号池、投影链和本机快捷入口修复），同时接入官方兼容的新功能、修复和依赖更新。确认后使用 `--force-with-lease` 推送到 fork，避免无意覆盖远端新提交。
 
 ### 6. Release 保留策略
 Release 镜像遵循 `latest_stable_assets_only`：

@@ -1,5 +1,5 @@
 param(
-    [string]$RepoPath = "D:\CODE\external\cockpit-tools",
+    [string]$RepoPath = "D:\CODE\external\Cockpit-Tools-Local",
     [string]$SelfUseBranch = "codex/follow-current-local-v0.23.4",
     [string]$ForkRemote = "fork",
     [string]$UpstreamRemote = "origin",
