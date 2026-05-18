@@ -1,8 +1,8 @@
 param(
     [string]$RepoPath = "D:\CODE\external\Cockpit-Tools-Local",
-    [string]$SelfUseBranch = "codex/follow-current-local-v0.23.4",
-    [string]$ForkRemote = "fork",
-    [string]$UpstreamRemote = "origin",
+    [string]$SelfUseBranch = "main",
+    [string]$ForkRemote = "origin",
+    [string]$UpstreamRemote = "upstream",
     [string]$UpstreamBranch = "main",
     [switch]$PlanOnly,
     [switch]$RunBuild,
