@@ -93,7 +93,7 @@ python sync-forks.py --json --verify-releases
 | `sciman-top/cockpit-tools-local` | `stable_release_only` | 上游稳定版 release 带 `.exe`、`.msi`、`.deb`、`.rpm`、`.AppImage`、`.dmg`、签名和校验文件；默认分支自动合并可能把本机正在使用的安装版本带到未验证状态 |
 | 其他 fork | `upstream_default_branch` | 当前 release 无安装资产，源码跟随默认分支更适合获取修复 |
 
-stable-source-only 仓库在本地 `sync-forks.py` 和生成的 `sync-fork.yml` 中都会跳过默认分支 `merge-upstream`。这不会删除已有 `backup/pre-sync` 或固定备份分支；后续稳定版更新应通过 release/tag 镜像能力落地，而不是普通默认分支合并。
+stable-source-only 仓库在本地 `sync-forks.py` 和生成的 `sync-fork.yml` 中都会跳过默认分支 `merge-upstream`。这不会删除已有 `backup/pre-sync` 或固定备份分支。`sciman-top/cockpit-tools-local` 的 release 改为自用版构建产物，不再镜像官方安装资产；其他未来需要安装包镜像的 fork 仍可使用通用 release 镜像检查。
 
 ### 5.1 Cockpit Tools 自用分支更新
 `sciman-top/cockpit-tools-local` 的默认分支 `main` 是自用源码主线；定时任务不会自动合并上游源码，策略是“保留自用特性，把它们重放到官方最新版上”。固定入口：
@@ -108,8 +108,14 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/Update-CockpitSelfUseFork.
 
 `origin/mirror/upstream-main` 是 fork 内的官方最新版源码镜像；固定快照使用 `backup/upstream-main-<timestamp>`。不要把镜像分支当作自用开发入口。
 
-### 6. Release 保留策略
-Release 镜像遵循 `latest_stable_assets_only`：
+### 6. Release 策略
+`sciman-top/cockpit-tools-local` 使用 `self_use_local_releases`：
+
+- Releases 只发布 Cockpit Tools Local 自用版构建产物。
+- 官方稳定版安装包不再镜像到 `cockpit-tools-local`。
+- 历史官方镜像 release 若仍带安装资产，`verify-releases` 会返回 `next_action=remove_upstream_mirror_release_assets`。
+
+其他需要保留上游安装包的 fork 仍可使用 `latest_stable_assets_only`：
 
 - 只把 `draft=false` 且 `prerelease=false` 视为稳定版。
 - 最新稳定版保留安装/打包资产、签名、校验文件和 `latest.json`。
@@ -125,9 +131,9 @@ python sync-forks.py --verify-releases cockpit-tools-local --json
 
 JSON 输出中 `next_action=prune_old_stable_release_assets` 表示旧稳定版仍带资产，需要删除旧资产但保留 release 文案；`next_action=mirror_latest_stable_release` 或 `mirror_latest_stable_assets` 表示最新稳定版还未完整保留安装/打包资产。
 
-`--verify-releases` 是只读门禁，不会自动创建、上传或删除 release 资产。只要发现需要镜像最新稳定版或清理旧稳定版资产，命令会以 safety exit code `3` 退出；这不是脚本崩溃，而是阻断信号，表示需要执行一次中风险远端 release 维护后再复测。
+`--verify-releases` 是只读门禁，不会自动创建、上传或删除 release 资产。只要发现需要镜像最新稳定版、清理旧稳定版资产，或清理 `cockpit-tools-local` 上的历史官方镜像资产，命令会以 safety exit code `3` 退出；这不是脚本崩溃，而是阻断信号，表示需要执行一次中风险远端 release 维护后再复测。
 
-稳定版 release 更新闭环：
+通用稳定版 release 镜像更新闭环：
 
 1. 先运行 `python sync-forks.py --verify-releases --json` 确认具体 `next_action`。
 2. 若需要镜像最新稳定版，先从 upstream 下载稳定 release 资产，再在 fork 创建同 tag release 并上传资产。

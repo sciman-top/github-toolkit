@@ -2323,7 +2323,7 @@ class TestSyncForksHelpers(unittest.TestCase):
     def test_verify_release_retention_accepts_latest_assets_only(self, mock_api):
         forks = [{
             "name": "cockpit-tools",
-            "full_name": "sciman-top/cockpit-tools-local",
+            "full_name": "sciman-top/installable-tool",
             "branch": "main",
             "parent": "jlcodes99/cockpit-tools",
             "parent_branch": "main",
@@ -2359,7 +2359,7 @@ class TestSyncForksHelpers(unittest.TestCase):
     def test_verify_release_retention_flags_old_stable_assets(self, mock_api):
         forks = [{
             "name": "cockpit-tools",
-            "full_name": "sciman-top/cockpit-tools-local",
+            "full_name": "sciman-top/installable-tool",
             "branch": "main",
             "parent": "jlcodes99/cockpit-tools",
             "parent_branch": "main",
@@ -2389,6 +2389,58 @@ class TestSyncForksHelpers(unittest.TestCase):
         self.assertEqual(rows[0]["next_action"], "prune_old_stable_release_assets")
         self.assertEqual(summary["ready"], 0)
         self.assertEqual(summary["old_stable_assets_present"], 1)
+
+    @patch.object(sync_forks, "gh_api")
+    def test_self_use_release_policy_ignores_upstream_release_mirror(self, mock_api):
+        forks = [{
+            "name": "cockpit-tools-local",
+            "full_name": "sciman-top/cockpit-tools-local",
+            "branch": "main",
+            "parent": "jlcodes99/cockpit-tools",
+            "parent_branch": "main",
+        }]
+        local_release = {
+            "tag_name": "v0.23.9-local.1",
+            "draft": False,
+            "prerelease": False,
+            "body": "Cockpit Tools Local self-use build",
+            "assets": [{"name": "Cockpit.Tools.Local_0.23.9_x64-setup.exe"}],
+        }
+        mock_api.return_value = [local_release]
+
+        rows, summary = sync_forks._verify_release_retention(forks)
+
+        self.assertEqual(rows[0]["release_policy"], "self_use_local_releases")
+        self.assertEqual(rows[0]["latest_self_use_release"], "v0.23.9-local.1")
+        self.assertEqual(rows[0]["next_action"], "none")
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["latest_stable_assets_required"], 0)
+
+    @patch.object(sync_forks, "gh_api")
+    def test_self_use_release_policy_flags_legacy_upstream_mirror_assets(self, mock_api):
+        forks = [{
+            "name": "cockpit-tools-local",
+            "full_name": "sciman-top/cockpit-tools-local",
+            "branch": "main",
+            "parent": "jlcodes99/cockpit-tools",
+            "parent_branch": "main",
+        }]
+        mirror_release = {
+            "tag_name": "v0.23.2",
+            "draft": False,
+            "prerelease": False,
+            "body": "Mirrored from https://github.com/jlcodes99/cockpit-tools/releases/tag/v0.23.2",
+            "assets": [{"name": "Cockpit.Tools_0.23.2_x64-setup.exe"}],
+        }
+        mock_api.return_value = [mirror_release]
+
+        rows, summary = sync_forks._verify_release_retention(forks)
+
+        self.assertEqual(rows[0]["release_policy"], "self_use_local_releases")
+        self.assertEqual(rows[0]["next_action"], "remove_upstream_mirror_release_assets")
+        self.assertEqual(rows[0]["upstream_mirror_release_asset_count"], 1)
+        self.assertEqual(summary["ready"], 0)
+        self.assertEqual(summary["upstream_mirror_assets_present"], 1)
 
     @patch.object(sync_forks, "gh_api")
     def test_verify_release_retention_ignores_source_only_upstream(self, mock_api):

@@ -77,6 +77,7 @@ VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS = (
 VERIFY_RELEASE_SAFETY_SUMMARY_KEYS = (
     "latest_stable_missing_or_without_assets",
     "old_stable_assets_present",
+    "upstream_mirror_assets_present",
 )
 FORCE_SYNC_ACK_ENV = "SYNC_FORKS_FORCE_ACK"
 FORCE_SYNC_ACK_VALUE = "I_UNDERSTAND"
@@ -86,6 +87,12 @@ STABLE_SOURCE_ONLY_REPO_SET = {
     repo.lower()
     for repo in STABLE_SOURCE_ONLY_REPOS
 }
+SELF_USE_RELEASE_REPOS = ("sciman-top/cockpit-tools-local",)
+SELF_USE_RELEASE_REPO_SET = {
+    repo.lower()
+    for repo in SELF_USE_RELEASE_REPOS
+}
+UPSTREAM_MIRROR_RELEASE_MARKER = "Mirrored from "
 INSTALLABLE_RELEASE_ASSET_RE = re.compile(
     r"\.(?:exe|msi|deb|rpm|appimage|dmg|pkg|zip|tar\.gz)$",
     re.IGNORECASE,
@@ -856,6 +863,68 @@ def _release_retention_next_action(
     return "none"
 
 
+def _is_upstream_mirror_release(release):
+    """Return whether a release looks like an upstream asset mirror."""
+    if not isinstance(release, dict):
+        return False
+    body = release.get("body")
+    return isinstance(body, str) and UPSTREAM_MIRROR_RELEASE_MARKER in body
+
+
+def _build_self_use_release_row(fork):
+    """Collect self-use release-policy details for one fork."""
+    full_name = fork["full_name"]
+    row = {
+        **_base_fork_row(fork),
+        "release_policy": "self_use_local_releases",
+        "latest_upstream_stable": None,
+        "latest_upstream_asset_count": 0,
+        "latest_upstream_installable_asset_count": 0,
+        "fork_release_count": 0,
+        "fork_latest_stable_asset_count": 0,
+        "old_stable_release_asset_count": 0,
+        "upstream_mirror_release_asset_count": 0,
+        "result": RESULT_OK,
+    }
+
+    fork_releases = gh_api(f"repos/{full_name}/releases?per_page=100")
+    if not isinstance(fork_releases, list):
+        row["result"] = RESULT_ERROR
+        row["release_error"] = _short_error(fork_releases)
+        row["next_action"] = "investigate_release_api_errors"
+        return row
+
+    fork_stable = _stable_releases(fork_releases)
+    local_stable = [
+        release for release in fork_stable
+        if not _is_upstream_mirror_release(release)
+    ]
+    upstream_mirrors = [
+        release for release in fork_releases
+        if _is_upstream_mirror_release(release)
+    ]
+
+    row["fork_release_count"] = len(fork_releases)
+    row["latest_self_use_release"] = (
+        local_stable[0].get("tag_name")
+        if local_stable and isinstance(local_stable[0], dict)
+        else None
+    )
+    row["fork_latest_stable_asset_count"] = (
+        _asset_count(local_stable[0]) if local_stable else 0
+    )
+    row["upstream_mirror_release_asset_count"] = sum(
+        _asset_count(release)
+        for release in upstream_mirrors
+    )
+    row["next_action"] = (
+        "remove_upstream_mirror_release_assets"
+        if row["upstream_mirror_release_asset_count"] > 0
+        else "none"
+    )
+    return row
+
+
 def _latest_workflow_run(runs_payload):
     """Return normalized latest workflow run details, or None if absent/malformed."""
     if not isinstance(runs_payload, dict) or "error" in runs_payload:
@@ -907,6 +976,8 @@ def _schedule_next_action(row):
 def _build_verify_releases_row(fork):
     """Collect stable-release mirror retention details for one fork."""
     full_name = fork["full_name"]
+    if full_name.lower() in SELF_USE_RELEASE_REPO_SET:
+        return _build_self_use_release_row(fork)
     upstream = fork["parent"]
     row = {
         **_base_fork_row(fork),
@@ -977,6 +1048,7 @@ def _verify_release_retention(forks):
         "latest_stable_assets_required": 0,
         "latest_stable_missing_or_without_assets": 0,
         "old_stable_assets_present": 0,
+        "upstream_mirror_assets_present": 0,
         "errors": 0,
     }
     for fork in forks:
@@ -994,6 +1066,8 @@ def _verify_release_retention(forks):
             summary["latest_stable_missing_or_without_assets"] += 1
         if row["old_stable_release_asset_count"] > 0:
             summary["old_stable_assets_present"] += 1
+        if row.get("upstream_mirror_release_asset_count", 0) > 0:
+            summary["upstream_mirror_assets_present"] += 1
         if row["next_action"] == "none":
             summary["ready"] += 1
     return rows, summary
