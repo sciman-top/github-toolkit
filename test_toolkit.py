@@ -961,7 +961,7 @@ class TestSyncNowResult(unittest.TestCase):
     ):
         with contextlib.redirect_stdout(io.StringIO()) as captured:
             result = sync_forks._sync_now_result(
-                "sciman-top/cockpit-tools",
+                "sciman-top/cockpit-tools-local",
                 "main",
                 "jlcodes99/cockpit-tools",
                 "main",
@@ -1309,7 +1309,7 @@ class TestWorkflowContracts(unittest.TestCase):
 
         self.assertIn("Stable source policy guard", workflow)
         self.assertIn("STABLE_SOURCE_ONLY_REPOS", workflow)
-        self.assertIn("sciman-top/cockpit-tools", workflow)
+        self.assertIn("sciman-top/cockpit-tools-local", workflow)
         self.assertIn("steps.stable_source_policy.outputs.skip != 'true'", workflow)
 
     def test_generated_workflow_url_encodes_compare_refs(self):
@@ -2111,7 +2111,7 @@ class TestSyncForksHelpers(unittest.TestCase):
 
     def test_source_update_policy_uses_precomputed_stable_repo_set(self):
         self.assertEqual(
-            sync_forks._source_update_policy("sciman-top/cockpit-tools"),
+            sync_forks._source_update_policy("sciman-top/cockpit-tools-local"),
             "stable_release_only",
         )
         self.assertEqual(
@@ -2323,7 +2323,7 @@ class TestSyncForksHelpers(unittest.TestCase):
     def test_verify_release_retention_accepts_latest_assets_only(self, mock_api):
         forks = [{
             "name": "cockpit-tools",
-            "full_name": "sciman-top/cockpit-tools",
+            "full_name": "sciman-top/cockpit-tools-local",
             "branch": "main",
             "parent": "jlcodes99/cockpit-tools",
             "parent_branch": "main",
@@ -2359,7 +2359,7 @@ class TestSyncForksHelpers(unittest.TestCase):
     def test_verify_release_retention_flags_old_stable_assets(self, mock_api):
         forks = [{
             "name": "cockpit-tools",
-            "full_name": "sciman-top/cockpit-tools",
+            "full_name": "sciman-top/cockpit-tools-local",
             "branch": "main",
             "parent": "jlcodes99/cockpit-tools",
             "parent_branch": "main",
