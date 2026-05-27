@@ -25,7 +25,7 @@ Fork 仓库自动同步管理工具集，带安全防护机制。
 - 比较上游与 fork 的文件数量
 - 检查 upstream 的删除量，拦截关键路径删除
 - 如果上游文件数低于 fork 的 50%，自动中止同步
-- 每次同步前写入 `backup/pre-sync` 恢复点（手动同步与 GitHub Actions 一致）
+- 默认分支同步仓库每次 `merge-upstream` 前写入一个移动 `backup/pre-sync` 恢复点（手动同步与 GitHub Actions 一致）
 - GitHub Actions 定时同步也会执行同样的检查
 - 对安装型工具可启用 stable-source-only 策略，阻止默认分支被每周 `merge-upstream` 自动覆盖，改为后续镜像稳定版 release/tag
 
@@ -94,6 +94,8 @@ python sync-forks.py --json --verify-releases
 | 其他 fork | `upstream_default_branch` | 当前 release 无安装资产，源码跟随默认分支更适合获取修复 |
 
 stable-source-only 仓库在本地 `sync-forks.py` 和生成的 `sync-fork.yml` 中都会跳过默认分支 `merge-upstream`，因此不会创建或刷新 `backup/pre-sync`。`sciman-top/cockpit-tools-local` 的远端分支只保留 `main` 和 `mirror/upstream-main`，不长期保留 `backup/*` 分支；release 改为自用版构建产物，不再镜像官方安装资产。其他未来需要安装包镜像的 fork 仍可使用通用 release 镜像检查。
+
+统一恢复点规则：`upstream_default_branch` 仓库保留一个移动的 `backup/pre-sync`，用于真实默认分支同步回滚；`stable_release_only`、self-use 或 mirror-only 仓库不长期保留 `backup/*`，只记录镜像分支旧 SHA、新 SHA 和回滚命令。
 
 ### 5.1 Cockpit Tools 自用分支更新
 `sciman-top/cockpit-tools-local` 的默认分支 `main` 是自用源码主线；定时任务不会自动合并上游源码，策略是“保留自用特性，把它们重放到官方最新版上”。固定入口：

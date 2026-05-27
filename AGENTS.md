@@ -16,7 +16,7 @@
 ### A.1 事实边界
 - 本仓是 Python GitHub fork/tooling 辅助仓，核心脚本为 `gh_utils.py`、`sync-forks.py`、`list-forks.py`、`test_toolkit.py`、`test_support.py`。
 - 真实同步必须保留 `--dry-run` / 显式确认边界；`--force` 需要 `SYNC_FORKS_FORCE_ACK=I_UNDERSTAND`。
-- 同步保护包括 upstream 可达性、文件数量阈值、关键路径删除保护和 `backup/pre-sync` 恢复点。
+- 同步保护包括 upstream 可达性、文件数量阈值、关键路径删除保护和条件化恢复点：`upstream_default_branch` 仓库保留一个移动 `backup/pre-sync`；`stable_release_only` / mirror-only 仓库不长期保留 `backup/*`。
 - `GH_TOKEN` / `GITHUB_TOKEN` / `gh auth login` 是认证输入；不得把真实 token 写入仓库文件、日志或证据正文。
 
 ### A.2 执行锚点
@@ -75,7 +75,7 @@
 ### C.4 证据与回滚
 - 证据目录：`docs/change-evidence/`（不存在则创建）。
 - 最低字段：规则 ID、风险等级、执行命令、关键输出、是否触发真实 GitHub 写操作、回滚动作。
-- 回滚优先使用 git 历史；真实同步变更还必须记录 `backup/pre-sync` 或等价恢复点。
+- 回滚优先使用 git 历史；真实默认分支同步变更还必须记录 `backup/pre-sync` 或等价恢复点。`stable_release_only` / mirror-only 仓库记录镜像分支旧 SHA、新 SHA 和回滚命令，不要求 `backup/pre-sync`。
 
 ### C.5 CI 与本地入口
 - 本地门禁以 C.2 命令为准。
