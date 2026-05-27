@@ -93,7 +93,7 @@ python sync-forks.py --json --verify-releases
 | `sciman-top/cockpit-tools-local` | `stable_release_only` | 上游稳定版 release 带 `.exe`、`.msi`、`.deb`、`.rpm`、`.AppImage`、`.dmg`、签名和校验文件；默认分支自动合并可能把本机正在使用的安装版本带到未验证状态 |
 | 其他 fork | `upstream_default_branch` | 当前 release 无安装资产，源码跟随默认分支更适合获取修复 |
 
-stable-source-only 仓库在本地 `sync-forks.py` 和生成的 `sync-fork.yml` 中都会跳过默认分支 `merge-upstream`。这不会删除已有 `backup/pre-sync` 或固定备份分支。`sciman-top/cockpit-tools-local` 的 release 改为自用版构建产物，不再镜像官方安装资产；其他未来需要安装包镜像的 fork 仍可使用通用 release 镜像检查。
+stable-source-only 仓库在本地 `sync-forks.py` 和生成的 `sync-fork.yml` 中都会跳过默认分支 `merge-upstream`，因此不会创建或刷新 `backup/pre-sync`。`sciman-top/cockpit-tools-local` 的远端分支只保留 `main` 和 `mirror/upstream-main`，不长期保留 `backup/*` 分支；release 改为自用版构建产物，不再镜像官方安装资产。其他未来需要安装包镜像的 fork 仍可使用通用 release 镜像检查。
 
 ### 5.1 Cockpit Tools 自用分支更新
 `sciman-top/cockpit-tools-local` 的默认分支 `main` 是自用源码主线；定时任务不会自动合并上游源码，策略是“保留自用特性，把它们重放到官方最新版上”。固定入口：
@@ -106,7 +106,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/Update-CockpitSelfUseFork.
 
 脚本默认操作 `D:\CODE\external\Cockpit-Tools-Local` 的本地 `main`，其中 `origin` 指向 `sciman-top/cockpit-tools-local`，`upstream` 指向官方 `jlcodes99/cockpit-tools`。更新时从官方 `upstream/main` rebase，创建本地 `backup/selfuse-pre-rebase-<timestamp>` 备份分支。遇到冲突会停止，不会自动覆盖；冲突处理原则是保留明确的自用能力（例如 Cockpit API Service、单号池、投影链和本机快捷入口修复），同时接入官方兼容的新功能、修复和依赖更新。确认后使用 `--force-with-lease` 推送到 `origin/main`，避免无意覆盖远端新提交。
 
-`origin/mirror/upstream-main` 是 fork 内的官方最新版源码镜像；固定快照使用 `backup/upstream-main-<timestamp>`。不要把镜像分支当作自用开发入口。
+`origin/mirror/upstream-main` 是 fork 内的官方最新版源码镜像。它是可移动镜像分支，后续不再为上游 `main` 额外保留 `backup/upstream-main-<timestamp>` 或其他 `backup/*` 固定恢复点；刷新镜像前后必须在 `docs/change-evidence/` 记录旧 SHA、新 SHA 和回滚方式。不要把镜像分支当作自用开发入口。
 
 ### 6. Release 策略
 `sciman-top/cockpit-tools-local` 使用 `self_use_local_releases`：
