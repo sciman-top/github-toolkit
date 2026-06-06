@@ -22,16 +22,20 @@ Usage:
 
 import base64
 import contextlib
+import hashlib
 import io
 import json
 import os
 import re
+import subprocess  # nosec B404
 import sys
+import tempfile
 
 from gh_utils import (
     AuthContextError,
     DELETION_THRESHOLD,
     ForkDiscoveryError,
+    GH,
     SYNC_CRON,
     build_compare_endpoint,
     build_fork_record,
@@ -63,10 +67,12 @@ MODE_SYNC = "sync"
 MODE_ADD_WORKFLOW = "add-workflow"
 MODE_VERIFY_SCHEDULE = "verify-schedule"
 MODE_VERIFY_RELEASES = "verify-releases"
+MODE_SYNC_RELEASES = "sync-releases"
 MODE_OPTION_FLAGS = (
     ("add_mode", "--add-workflow"),
     ("verify_schedule", "--verify-schedule"),
     ("verify_releases", "--verify-releases"),
+    ("sync_releases", "--sync-releases"),
 )
 VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS = (
     "missing_workflow",
@@ -81,12 +87,19 @@ VERIFY_RELEASE_SAFETY_SUMMARY_KEYS = (
 )
 FORCE_SYNC_ACK_ENV = "SYNC_FORKS_FORCE_ACK"
 FORCE_SYNC_ACK_VALUE = "I_UNDERSTAND"
-STABLE_SOURCE_ONLY_REPOS = ("sciman-top/cockpit-tools-local",)
-STABLE_SOURCE_ONLY_REPOS_TEXT = ",".join(STABLE_SOURCE_ONLY_REPOS)
-STABLE_SOURCE_ONLY_REPO_SET = {
+SELF_USE_SOURCE_REPOS = ("sciman-top/cockpit-tools-local",)
+SELF_USE_SOURCE_REPOS_TEXT = ",".join(SELF_USE_SOURCE_REPOS)
+SELF_USE_SOURCE_REPO_SET = {
     repo.lower()
-    for repo in STABLE_SOURCE_ONLY_REPOS
+    for repo in SELF_USE_SOURCE_REPOS
 }
+MIRROR_ONLY_SOURCE_REPOS = ("sciman-top/cockpit-tools-local",)
+MIRROR_ONLY_SOURCE_REPOS_TEXT = ",".join(MIRROR_ONLY_SOURCE_REPOS)
+MIRROR_ONLY_SOURCE_REPO_SET = {
+    repo.lower()
+    for repo in MIRROR_ONLY_SOURCE_REPOS
+}
+MIRROR_ONLY_SOURCE_BRANCH = "mirror/upstream-main"
 SELF_USE_RELEASE_REPOS = ("sciman-top/cockpit-tools-local",)
 SELF_USE_RELEASE_REPO_SET = {
     repo.lower()
@@ -95,6 +108,10 @@ SELF_USE_RELEASE_REPO_SET = {
 UPSTREAM_MIRROR_RELEASE_MARKER = "Mirrored from "
 INSTALLABLE_RELEASE_ASSET_RE = re.compile(
     r"\.(?:exe|msi|deb|rpm|appimage|dmg|pkg|zip|tar\.gz)$",
+    re.IGNORECASE,
+)
+SIGNED_RELEASE_ASSET_RE = re.compile(
+    r"\.(?:sig|minisig|sigstore)$",
     re.IGNORECASE,
 )
 WORKFLOW_DISPATCH_TOKEN_RE = re.compile(
@@ -112,6 +129,7 @@ Options:
   --add-workflow   Add or update sync-fork.yml instead of syncing now
   --verify-schedule Verify workflow/secret/scheduled-run readiness
   --verify-releases Verify stable release mirror retention policy
+  --sync-releases  Reconcile stable release mirror retention
   --dry-run        Preview planned changes without modifying repos
   --force          Bypass safety checks or force workflow rewrite
                    (real writes need explicit confirmation)
@@ -175,18 +193,38 @@ jobs:
           echo "branch=$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
           echo "url=$UPSTREAM_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Stable source policy guard
-        id: stable_source_policy
+      - name: Self-use source policy guard
+        id: self_use_source_policy
         if: steps.upstream.outputs.skip != 'true'
         env:
-          STABLE_SOURCE_ONLY_REPOS: "{stable_source_only_repos}"
+          SELF_USE_SOURCE_REPOS: "{self_use_source_repos}"
+          MIRROR_ONLY_SOURCE_BRANCH: "{mirror_only_source_branch}"
         run: |
           set -euo pipefail
-          IFS=',' read -ra REPOS <<< "$STABLE_SOURCE_ONLY_REPOS"
+          IFS=',' read -ra REPOS <<< "$SELF_USE_SOURCE_REPOS"
           for repo in "${{REPOS[@]}}"; do
             repo=$(echo "$repo" | xargs)
-            if [ "$repo" = "${{{{ github.repository }}}}" ]; then
-              echo "::notice::Stable-source-only policy is enabled for $repo. Default-branch merge-upstream is skipped; mirror stable releases/tags instead."
+            if [ "$repo" = "${{{{ github.repository }}}}" ] && [ "${{{{ github.event.repository.default_branch }}}}" != "$MIRROR_ONLY_SOURCE_BRANCH" ]; then
+              echo "::notice::Self-use source policy is enabled for $repo. Default-branch merge-upstream is skipped; review locally against upstream/main in an isolated worktree instead."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Restore point policy guard
+        id: restore_point_policy
+        if: steps.upstream.outputs.skip != 'true' && steps.self_use_source_policy.outputs.skip != 'true'
+        env:
+          MIRROR_ONLY_SOURCE_REPOS: "{mirror_only_source_repos}"
+          MIRROR_ONLY_SOURCE_BRANCH: "{mirror_only_source_branch}"
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra REPOS <<< "$MIRROR_ONLY_SOURCE_REPOS"
+          for repo in "${{REPOS[@]}}"; do
+            repo=$(echo "$repo" | xargs)
+            if [ "$repo" = "${{{{ github.repository }}}}" ] && [ "${{{{ github.event.repository.default_branch }}}}" = "$MIRROR_ONLY_SOURCE_BRANCH" ]; then
+              echo "::notice::Mirror-only source policy is enabled for $repo on $MIRROR_ONLY_SOURCE_BRANCH. Default-branch merge-upstream will not create backup/pre-sync."
               echo "skip=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -194,7 +232,7 @@ jobs:
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - name: Safety check - compare file counts
-        if: steps.upstream.outputs.skip != 'true' && steps.stable_source_policy.outputs.skip != 'true'
+        if: steps.upstream.outputs.skip != 'true' && steps.self_use_source_policy.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
         run: |
@@ -213,7 +251,7 @@ jobs:
           echo "Safety check passed."
 
       - name: Create restore point
-        if: steps.upstream.outputs.skip != 'true' && steps.stable_source_policy.outputs.skip != 'true'
+        if: steps.upstream.outputs.skip != 'true' && steps.self_use_source_policy.outputs.skip != 'true' && steps.restore_point_policy.outputs.skip != 'true'
         run: |
           set -euo pipefail
           BACKUP_BRANCH="backup/pre-sync"
@@ -221,7 +259,7 @@ jobs:
           git push origin "$BACKUP_BRANCH" --force
 
       - name: Diff guard - inspect deletions
-        if: steps.upstream.outputs.skip != 'true' && steps.stable_source_policy.outputs.skip != 'true'
+        if: steps.upstream.outputs.skip != 'true' && steps.self_use_source_policy.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
           BASE_REF: ${{{{ github.event.repository.default_branch }}}}
@@ -247,12 +285,203 @@ jobs:
           fi
 
       - name: Merge upstream changes
-        if: steps.upstream.outputs.skip != 'true' && steps.stable_source_policy.outputs.skip != 'true'
+        if: steps.upstream.outputs.skip != 'true' && steps.self_use_source_policy.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
         run: |
           set -euo pipefail
           gh api repos/${{{{ github.repository }}}}/merge-upstream -X POST -f branch=${{{{ github.event.repository.default_branch }}}}
+
+      - name: Release retention policy
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
+          SELF_USE_RELEASE_REPOS: "{self_use_release_repos}"
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          self_use_repos = {{
+              item.strip().lower()
+              for item in os.environ.get("SELF_USE_RELEASE_REPOS", "").split(",")
+              if item.strip()
+          }}
+          if repo.lower() in self_use_repos:
+              print("::notice::self-use local releases policy is managed manually; weekly release retention is skipped.")
+              raise SystemExit(0)
+
+          installable_re = re.compile(r"\\.(?:exe|msi|deb|rpm|appimage|dmg|pkg|zip|tar\\.gz)$", re.IGNORECASE)
+          signed_re = re.compile(r"\\.(?:sig|minisig|sigstore)$", re.IGNORECASE)
+
+          def gh_json(args):
+              cmd = ["gh", *args]
+              result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+              if result.returncode != 0:
+                  raise RuntimeError(result.stderr.strip() or "gh command failed")
+              return json.loads(result.stdout)
+
+          def gh_run(args):
+              cmd = ["gh", *args]
+              result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+              if result.returncode != 0:
+                  raise RuntimeError(result.stderr.strip() or "gh command failed")
+
+          def stable(releases):
+              return [
+                  release for release in releases
+                  if isinstance(release, dict)
+                  and not release.get("draft")
+                  and not release.get("prerelease")
+              ]
+
+          def required_asset_names(release):
+              assets = release.get("assets") or []
+              names = []
+              for asset in assets:
+                  name = asset.get("name")
+                  if not isinstance(name, str):
+                      continue
+                  lowered = name.lower()
+                  if (
+                      installable_re.search(name)
+                      or signed_re.search(name)
+                      or lowered in {{
+                          "latest.json",
+                          "sha256sums",
+                          "sha256sums.txt",
+                          "sha512sums",
+                          "sha512sums.txt",
+                      }}
+                  ):
+                      names.append(name)
+              return names
+
+          repo_meta = gh_json(["api", f"repos/{{repo}}"])
+          upstream = ((repo_meta.get("parent") or {{}}).get("full_name") or "").strip()
+          if not upstream:
+              print("::notice::Upstream repo metadata is missing; release retention skipped.")
+              raise SystemExit(0)
+
+          upstream_releases = gh_json(["api", f"repos/{{upstream}}/releases?per_page=100"])
+          fork_releases = gh_json(["api", f"repos/{{repo}}/releases?per_page=100"])
+          upstream_stable = stable(upstream_releases)
+          if not upstream_stable:
+              print("::notice::source-only release notes policy: upstream has no stable releases.")
+              raise SystemExit(0)
+
+          latest = upstream_stable[0]
+          tag = latest.get("tag_name")
+          if not tag:
+              print("::notice::Latest stable release has no tag; release retention skipped.")
+              raise SystemExit(0)
+
+          required = required_asset_names(latest)
+          if not required:
+              print("::notice::source-only release notes policy: upstream latest stable release has no mirrored assets.")
+              raise SystemExit(0)
+
+          latest_fork = None
+          for release in fork_releases:
+              if isinstance(release, dict) and release.get("tag_name") == tag:
+                  latest_fork = release
+                  break
+
+          if latest_fork is None:
+              payload_path = None
+              try:
+                  with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+                      json.dump({{
+                          "tag_name": tag,
+                          "target_commitish": os.environ["GITHUB_REF_NAME"],
+                          "name": latest.get("name") or tag,
+                          "body": latest.get("body") or "",
+                          "draft": False,
+                          "prerelease": False,
+                      }}, handle, ensure_ascii=False)
+                      payload_path = handle.name
+                  gh_run(["api", f"repos/{{repo}}/releases", "-X", "POST", "--input", payload_path])
+                  latest_fork = {{"tag_name": tag, "assets": []}}
+              finally:
+                  if payload_path and os.path.exists(payload_path):
+                      os.unlink(payload_path)
+
+          fork_asset_names = {{
+              asset.get("name")
+              for asset in (latest_fork.get("assets") or [])
+              if isinstance(asset, dict) and isinstance(asset.get("name"), str)
+          }}
+          missing = [name for name in required if name not in fork_asset_names]
+
+          if missing:
+              with tempfile.TemporaryDirectory() as tmpdir:
+                  for asset_name in missing:
+                      gh_run([
+                          "release", "download", tag,
+                          "-R", upstream,
+                          "-D", tmpdir,
+                          "-p", asset_name,
+                          "--clobber",
+                      ])
+
+                  latest_json = pathlib.Path(tmpdir) / "latest.json"
+                  if latest_json.exists():
+                      upstream_prefix = f"https://github.com/{{upstream}}/releases/download/{{tag}}/"
+                      fork_prefix = f"https://github.com/{{repo}}/releases/download/{{tag}}/"
+                      text = latest_json.read_text(encoding="utf-8")
+                      latest_json.write_text(text.replace(upstream_prefix, fork_prefix), encoding="utf-8")
+
+                  sha_sums = pathlib.Path(tmpdir) / "SHA256SUMS.txt"
+                  if sha_sums.exists() and latest_json.exists():
+                      latest_hash = hashlib.sha256(latest_json.read_bytes()).hexdigest()
+                      updated = []
+                      for line in sha_sums.read_text(encoding="utf-8").splitlines():
+                          stripped = line.rstrip("\n")
+                          if stripped.strip().endswith("latest.json"):
+                              filename = stripped.split()[-1]
+                              updated.append(f"{{latest_hash}}  {{filename}}")
+                          else:
+                              updated.append(stripped)
+                      sha_sums.write_text("\\n".join(updated) + "\\n", encoding="utf-8")
+
+                  upload_files = [str(pathlib.Path(tmpdir) / asset_name) for asset_name in missing]
+                  gh_run(["release", "upload", tag, *upload_files, "-R", repo])
+
+          old_stable = [
+              release for release in stable(fork_releases)
+              if release.get("tag_name") != tag
+          ]
+          for release in old_stable:
+              old_tag = release.get("tag_name")
+              if not old_tag:
+                  continue
+              for asset in release.get("assets") or []:
+                  name = asset.get("name")
+                  if not isinstance(name, str):
+                      continue
+                  lowered = name.lower()
+                  if (
+                      installable_re.search(name)
+                      or signed_re.search(name)
+                      or lowered in {{
+                          "latest.json",
+                          "sha256sums",
+                          "sha256sums.txt",
+                          "sha512sums",
+                          "sha512sums.txt",
+                      }}
+                  ):
+                      gh_run(["release", "delete-asset", old_tag, name, "-R", repo, "--yes"])
+          PY
 '''
 
 
@@ -276,7 +505,10 @@ def _render_workflow_template(cron=SYNC_CRON):
     """Render the managed fork-sync workflow template."""
     return WORKFLOW_TEMPLATE.format(
         cron=cron,
-        stable_source_only_repos=STABLE_SOURCE_ONLY_REPOS_TEXT,
+        self_use_source_repos=SELF_USE_SOURCE_REPOS_TEXT,
+        mirror_only_source_repos=MIRROR_ONLY_SOURCE_REPOS_TEXT,
+        mirror_only_source_branch=MIRROR_ONLY_SOURCE_BRANCH,
+        self_use_release_repos=",".join(SELF_USE_RELEASE_REPOS),
     )
 
 
@@ -317,8 +549,11 @@ def _missing_workflow_template_markers(workflow_text):
         f'cron: "{SYNC_CRON}"',
         "actions/checkout@v6",
         "Resolve upstream",
-        "Stable source policy guard",
-        "Stable-source-only policy is enabled",
+        "Self-use source policy guard",
+        "Self-use source policy is enabled",
+        "Restore point policy guard",
+        "Mirror-only source policy is enabled",
+        "MIRROR_ONLY_SOURCE_BRANCH",
         "Create restore point",
         "Diff guard - inspect deletions",
         "backup/pre-sync",
@@ -367,26 +602,50 @@ def _short_error(payload, default="invalid response payload"):
     return default
 
 
-def _is_stable_source_only_repo(full_name):
+def _is_self_use_source_repo(full_name):
     """Return True when normal default-branch sync should be skipped."""
-    return str(full_name or "").lower() in STABLE_SOURCE_ONLY_REPO_SET
+    return str(full_name or "").lower() in SELF_USE_SOURCE_REPO_SET
 
 
-def _source_update_policy(full_name):
+def _is_mirror_only_source_repo(full_name):
+    """Return True when the repo should sync from upstream into a mirror branch."""
+    return str(full_name or "").lower() in MIRROR_ONLY_SOURCE_REPO_SET
+
+
+def _is_stable_source_only_repo(full_name):
+    """Backward-compatible alias for repos excluded from merge-upstream."""
+    return _is_self_use_source_repo(full_name)
+
+
+def _source_update_policy(full_name, branch=None):
     """Return the declared update policy for one fork full_name."""
-    if _is_stable_source_only_repo(full_name):
-        return "stable_release_only"
+    if (
+        _is_mirror_only_source_repo(full_name)
+        and branch == MIRROR_ONLY_SOURCE_BRANCH
+    ):
+        return "mirror_upstream_main"
+    if _is_self_use_source_repo(full_name):
+        return "self_use_main_manual_merge"
     return "upstream_default_branch"
+
+
+def _should_create_restore_point(full_name, branch):
+    """Return whether sync should maintain backup/pre-sync for this branch."""
+    return not (
+        _is_mirror_only_source_repo(full_name)
+        and branch == MIRROR_ONLY_SOURCE_BRANCH
+    )
 
 
 def _base_fork_row(fork):
     """Return common report fields for fork-level verification rows."""
     full_name = fork["full_name"]
+    branch = fork.get("branch")
     return {
         "name": fork["name"],
         "full_name": full_name,
         "upstream": fork["parent"],
-        "source_update_policy": _source_update_policy(full_name),
+        "source_update_policy": _source_update_policy(full_name, branch),
     }
 
 
@@ -618,19 +877,29 @@ def _create_restore_point(fork_name, fork_branch):
 def _sync_now_result(fork_name, fork_branch, upstream_name, upstream_branch,
                      dry_run=False, force=False):
     """Perform a one-time sync with safety check. Return operation result."""
-    if _is_stable_source_only_repo(fork_name) and not force:
+    if (
+        _source_update_policy(fork_name, fork_branch)
+        == "self_use_main_manual_merge"
+        and not force
+    ):
         print(
-            "  SKIP: stable-source-only policy is enabled. "
-            "Default-branch merge-upstream is skipped; mirror stable "
-            "releases/tags instead."
+            "  SKIP: self-use source policy is enabled. "
+            "Default-branch merge-upstream is skipped; review locally "
+            "against upstream/main in an isolated worktree instead."
         )
         return RESULT_OK
 
     if dry_run:
-        print(
-            f"  [DRY-RUN] Would create/refresh backup/pre-sync and "
-            f"sync {upstream_name} -> {fork_name}"
-        )
+        if _should_create_restore_point(fork_name, fork_branch):
+            print(
+                f"  [DRY-RUN] Would create/refresh backup/pre-sync and "
+                f"sync {upstream_name} -> {fork_name}"
+            )
+        else:
+            print(
+                f"  [DRY-RUN] Would sync {upstream_name} -> {fork_name} "
+                f"without backup/pre-sync (mirror-only source policy)"
+            )
         return RESULT_OK
 
     safety_result = safety_check(
@@ -641,8 +910,14 @@ def _sync_now_result(fork_name, fork_branch, upstream_name, upstream_branch,
     if safety_result is ABORT:
         return RESULT_SAFETY
 
-    if not _create_restore_point(fork_name, fork_branch):
-        return RESULT_SAFETY
+    if _should_create_restore_point(fork_name, fork_branch):
+        if not _create_restore_point(fork_name, fork_branch):
+            return RESULT_SAFETY
+    else:
+        print(
+            "  Restore point skipped: mirror-only source policy keeps "
+            "remote branches minimal."
+        )
 
     result = gh_api(
         f"repos/{fork_name}/merge-upstream",
@@ -732,6 +1007,7 @@ def _parse_cli_args(argv):
         "add_mode": False,
         "verify_schedule": False,
         "verify_releases": False,
+        "sync_releases": False,
         "json_output": "--json" in argv,
         "specific_repos": [],
         "show_help": False,
@@ -758,6 +1034,9 @@ def _parse_cli_args(argv):
                 continue
             if arg == "--verify-releases":
                 parsed["verify_releases"] = True
+                continue
+            if arg == "--sync-releases":
+                parsed["sync_releases"] = True
                 continue
             if arg == "--json":
                 parsed["json_output"] = True
@@ -835,6 +1114,33 @@ def _installable_asset_count(release):
         1 for name in _asset_names(release)
         if INSTALLABLE_RELEASE_ASSET_RE.search(name)
     )
+
+
+def _required_release_asset_names(release):
+    """Return release asset names that must be mirrored to the fork."""
+    required = []
+    for name in _asset_names(release):
+        lowered = name.lower()
+        if (
+            INSTALLABLE_RELEASE_ASSET_RE.search(name)
+            or SIGNED_RELEASE_ASSET_RE.search(name)
+            or lowered in {
+                "latest.json",
+                "sha256sums",
+                "sha256sums.txt",
+                "sha512sums",
+                "sha512sums.txt",
+            }
+        ):
+            required.append(name)
+    return required
+
+
+def _missing_release_asset_names(upstream_release, fork_release):
+    """Return required upstream asset names missing from the fork release."""
+    upstream_required = _required_release_asset_names(upstream_release)
+    fork_names = set(_asset_names(fork_release))
+    return [name for name in upstream_required if name not in fork_names]
 
 
 def _find_release_by_tag(releases, tag_name):
@@ -988,6 +1294,7 @@ def _build_verify_releases_row(fork):
         "fork_release_count": 0,
         "fork_latest_stable_asset_count": 0,
         "old_stable_release_asset_count": 0,
+        "missing_latest_release_assets": [],
         "result": RESULT_OK,
     }
 
@@ -1021,6 +1328,10 @@ def _build_verify_releases_row(fork):
 
     latest_fork = _find_release_by_tag(fork_releases, latest_tag)
     row["fork_latest_stable_asset_count"] = _asset_count(latest_fork)
+    row["missing_latest_release_assets"] = _missing_release_asset_names(
+        latest_upstream,
+        latest_fork,
+    )
     row["old_stable_release_asset_count"] = sum(
         _asset_count(release)
         for release in fork_stable
@@ -1030,7 +1341,8 @@ def _build_verify_releases_row(fork):
     row["next_action"] = _release_retention_next_action(
         row["latest_upstream_installable_asset_count"],
         latest_fork,
-        row["fork_latest_stable_asset_count"],
+        row["fork_latest_stable_asset_count"]
+        if not row["missing_latest_release_assets"] else 0,
         row["old_stable_release_asset_count"],
     )
     if row["latest_upstream_installable_asset_count"] <= 0:
@@ -1071,6 +1383,216 @@ def _verify_release_retention(forks):
         if row["next_action"] == "none":
             summary["ready"] += 1
     return rows, summary
+
+
+def _run_gh_command(args):
+    """Run gh CLI with argv list and return CompletedProcess."""
+    return subprocess.run(
+        [GH, *args],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        shell=False,
+    )  # nosec B603
+
+
+def _sync_latest_release_assets(fork, row):
+    """Create/update the latest stable release and upload missing assets."""
+    upstream = fork["parent"]
+    full_name = fork["full_name"]
+    tag = row.get("latest_upstream_stable")
+    if not tag:
+        print("  FAIL: Latest upstream stable tag is missing.")
+        return False
+
+    upstream_releases = gh_api(f"repos/{upstream}/releases?per_page=100")
+    fork_releases = gh_api(f"repos/{full_name}/releases?per_page=100")
+    if not isinstance(upstream_releases, list) or not isinstance(fork_releases, list):
+        print("  FAIL: Cannot refresh release metadata for sync.")
+        return False
+
+    latest_upstream = _find_release_by_tag(upstream_releases, tag)
+    latest_fork = _find_release_by_tag(fork_releases, tag)
+    if latest_upstream is None:
+        print("  FAIL: Latest upstream stable release is missing.")
+        return False
+
+    if latest_fork is None:
+        payload_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                delete=False,
+            ) as handle:
+                json.dump({
+                    "tag_name": tag,
+                    "target_commitish": fork["branch"],
+                    "name": latest_upstream.get("name") or tag,
+                    "body": latest_upstream.get("body") or "",
+                    "draft": False,
+                    "prerelease": False,
+                }, handle, ensure_ascii=False)
+                payload_path = handle.name
+            result = _run_gh_command([
+                "api",
+                f"repos/{full_name}/releases",
+                "-X",
+                "POST",
+                "--input",
+                payload_path,
+            ])
+            if result.returncode != 0:
+                print(f"  FAIL: {result.stderr.strip()[:200] or 'cannot create release'}")
+                return False
+        finally:
+            if payload_path and os.path.exists(payload_path):
+                os.unlink(payload_path)
+        latest_fork = {"tag_name": tag, "assets": []}
+
+    missing_assets = _missing_release_asset_names(latest_upstream, latest_fork)
+    if not missing_assets:
+        print(f"  Latest stable release already has required assets: {tag}")
+        return True
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for asset_name in missing_assets:
+            result = _run_gh_command([
+                "release",
+                "download",
+                tag,
+                "-R",
+                upstream,
+                "-D",
+                temp_dir,
+                "-p",
+                asset_name,
+                "--clobber",
+            ])
+            if result.returncode != 0:
+                print(f"  FAIL: {result.stderr.strip()[:200] or 'cannot download release asset'}")
+                return False
+
+        latest_json_path = os.path.join(temp_dir, "latest.json")
+        if os.path.isfile(latest_json_path):
+            with open(latest_json_path, "r", encoding="utf-8") as handle:
+                latest_json_text = handle.read()
+            upstream_prefix = f"https://github.com/{upstream}/releases/download/{tag}/"
+            fork_prefix = f"https://github.com/{full_name}/releases/download/{tag}/"
+            with open(latest_json_path, "w", encoding="utf-8") as handle:
+                handle.write(latest_json_text.replace(upstream_prefix, fork_prefix))
+
+        sha_sums_path = os.path.join(temp_dir, "SHA256SUMS.txt")
+        if os.path.isfile(sha_sums_path) and os.path.isfile(latest_json_path):
+            with open(latest_json_path, "rb") as handle:
+                latest_hash = hashlib.sha256(handle.read()).hexdigest()
+            updated_lines = []
+            with open(sha_sums_path, "r", encoding="utf-8") as handle:
+                for line in handle.read().splitlines():
+                    if line.strip().endswith("latest.json"):
+                        filename = line.split()[-1]
+                        updated_lines.append(f"{latest_hash}  {filename}")
+                    else:
+                        updated_lines.append(line)
+            with open(sha_sums_path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(updated_lines) + "\n")
+
+        upload_paths = [os.path.join(temp_dir, asset_name) for asset_name in missing_assets]
+        result = _run_gh_command([
+            "release",
+            "upload",
+            tag,
+            *upload_paths,
+            "-R",
+            full_name,
+        ])
+        if result.returncode != 0:
+            print(f"  FAIL: {result.stderr.strip()[:200] or 'cannot upload release assets'}")
+            return False
+
+    print(f"  Synced latest stable release assets: {tag}")
+    return True
+
+
+def _prune_old_stable_release_assets(fork, row):
+    """Delete installable/support assets from old stable releases."""
+    if row.get("old_stable_release_asset_count", 0) <= 0:
+        return True
+
+    full_name = fork["full_name"]
+    latest_tag = row.get("latest_upstream_stable")
+    fork_releases = gh_api(f"repos/{full_name}/releases?per_page=100")
+    if not isinstance(fork_releases, list):
+        print("  FAIL: Cannot refresh fork releases for pruning.")
+        return False
+
+    for release in _stable_releases(fork_releases):
+        old_tag = release.get("tag_name")
+        if old_tag == latest_tag or not old_tag:
+            continue
+        for asset_name in _required_release_asset_names(release):
+            result = _run_gh_command([
+                "release",
+                "delete-asset",
+                old_tag,
+                asset_name,
+                "-R",
+                full_name,
+                "--yes",
+            ])
+            if result.returncode != 0:
+                print(f"  FAIL: {result.stderr.strip()[:200] or 'cannot delete old release asset'}")
+                return False
+
+    print("  Pruned old stable release assets.")
+    return True
+
+
+def _sync_releases_result(fork, dry_run=False):
+    """Reconcile stable release retention for one fork repository."""
+    row = _build_verify_releases_row(fork)
+    if row["result"] == RESULT_ERROR:
+        print(f"  FAIL: {row.get('release_error') or 'release verification failed'}")
+        return RESULT_ERROR
+
+    if row["release_policy"] == "self_use_local_releases":
+        print("  SKIP: self-use local releases policy is managed manually.")
+        return RESULT_OK
+    if row["release_policy"] == "source_only_release_notes":
+        print("  SKIP: source-only release notes policy requires no mirrored assets.")
+        return RESULT_OK
+
+    next_action = row.get("next_action")
+    if next_action == "none":
+        print("  Stable release retention already converged.")
+        return RESULT_OK
+
+    if dry_run:
+        print(
+            "  [DRY-RUN] Would reconcile release retention "
+            f"for {fork['full_name']} ({next_action})"
+        )
+        return RESULT_OK
+
+    if next_action in {"mirror_latest_stable_release", "mirror_latest_stable_assets"}:
+        if not _sync_latest_release_assets(fork, row):
+            return RESULT_ERROR
+    if row.get("old_stable_release_asset_count", 0) > 0:
+        if not _prune_old_stable_release_assets(fork, row):
+            return RESULT_ERROR
+
+    final_row = _build_verify_releases_row(fork)
+    if final_row["result"] == RESULT_ERROR:
+        print(f"  FAIL: {final_row.get('release_error') or 'post-sync verification failed'}")
+        return RESULT_ERROR
+    if final_row.get("next_action") != "none":
+        print(
+            "  SAFETY: release retention did not converge after sync. "
+            f"Next action: {final_row.get('next_action')}"
+        )
+        return RESULT_SAFETY
+    print("  Release retention converged.")
+    return RESULT_OK
 
 
 def _build_verify_schedule_row(fork):
@@ -1151,7 +1673,8 @@ def _verify_schedule_readiness(forks):
         "workflow_needs_update": 0,
         "missing_secret": 0,
         "scheduled_run_missing_or_unhealthy": 0,
-        "stable_source_only": 0,
+        "mirror_only_source": 0,
+        "self_use_source": 0,
         "errors": 0,
     }
 
@@ -1162,8 +1685,10 @@ def _verify_schedule_readiness(forks):
         if row["result"] == RESULT_ERROR:
             summary["errors"] += 1
             continue
-        if row["source_update_policy"] == "stable_release_only":
-            summary["stable_source_only"] += 1
+        if row["source_update_policy"] == "mirror_upstream_main":
+            summary["mirror_only_source"] += 1
+        if row["source_update_policy"] == "self_use_main_manual_merge":
+            summary["self_use_source"] += 1
         if not row["workflow_installed"]:
             summary["missing_workflow"] += 1
         elif not row["workflow_current"]:
@@ -1194,6 +1719,19 @@ def _mode_name(add_mode, verify_schedule, verify_releases=False):
     return MODE_SYNC
 
 
+def _mode_name(add_mode, verify_schedule, verify_releases=False, sync_releases=False):
+    """Return the machine-readable execution mode name."""
+    if verify_schedule:
+        return MODE_VERIFY_SCHEDULE
+    if verify_releases:
+        return MODE_VERIFY_RELEASES
+    if sync_releases:
+        return MODE_SYNC_RELEASES
+    if add_mode:
+        return MODE_ADD_WORKFLOW
+    return MODE_SYNC
+
+
 def _selected_mode_flags(parsed):
     """Return selected mutually exclusive mode flag names."""
     return [
@@ -1206,7 +1744,7 @@ def _mode_writes_remotely(mode, dry_run):
     """Return True when the selected mode can perform remote writes."""
     if dry_run:
         return False
-    if mode in {MODE_SYNC, MODE_ADD_WORKFLOW}:
+    if mode in {MODE_SYNC, MODE_ADD_WORKFLOW, MODE_SYNC_RELEASES}:
         return True
     if mode in {MODE_VERIFY_SCHEDULE, MODE_VERIFY_RELEASES}:
         return False
@@ -1375,6 +1913,37 @@ def _run_verify_releases_mode(report, forks, json_output):
     )
 
 
+def _run_sync_releases_mode(report, forks, dry_run, resolve_errors, json_output):
+    """Execute sync-releases mode and return its exit result."""
+    _print_fork_overview(forks, json_output)
+
+    for fork in forks:
+        if not json_output:
+            print(f"[{fork['name']}]")
+        result, output = _run_with_captured_stdout(
+            _sync_releases_result,
+            fork,
+            dry_run,
+        )
+        if not json_output and output:
+            print(output, end="")
+        _append_operation_report(report, fork, result, output, json_output)
+        if not json_output:
+            print()
+
+    report["message"] = (
+        f"Done: {report['summary']['success']}/{len(forks)} repos release-synced."
+    )
+    if not json_output:
+        print(report["message"])
+
+    if report["summary"]["failed"] or resolve_errors:
+        return EXIT_ERROR, report
+    if report["summary"]["safety_abort"]:
+        return EXIT_SAFETY, report
+    return EXIT_OK, report
+
+
 def _format_bool_status(value):
     """Return a compact status label for text tables."""
     return "yes" if value else "no"
@@ -1469,7 +2038,10 @@ def _append_operation_report(report, fork, result, output, json_output):
         "branch": fork["branch"],
         "upstream": fork["parent"],
         "upstream_branch": fork["parent_branch"],
-        "source_update_policy": _source_update_policy(fork["full_name"]),
+        "source_update_policy": _source_update_policy(
+            fork["full_name"],
+            fork["branch"],
+        ),
         "result": result,
     }
     if json_output:
@@ -1530,6 +2102,7 @@ def _run(parsed):
     add_mode = parsed.get("add_mode", False)
     verify_schedule = parsed.get("verify_schedule", False)
     verify_releases = parsed.get("verify_releases", False)
+    sync_releases = parsed.get("sync_releases", False)
     specific_repos = parsed.get("specific_repos", [])
     json_output = parsed.get("json_output", False)
 
@@ -1538,7 +2111,7 @@ def _run(parsed):
     auth_info = auth_context["auth"]
     username = auth_context["username"]
 
-    mode = _mode_name(add_mode, verify_schedule, verify_releases)
+    mode = _mode_name(add_mode, verify_schedule, verify_releases, sync_releases)
     report = _build_run_report(
         username, auth_info, mode, dry_run, force, specific_repos,
     )
@@ -1568,6 +2141,10 @@ def _run(parsed):
         return _run_verify_schedule_mode(report, forks, json_output)
     if verify_releases:
         return _run_verify_releases_mode(report, forks, json_output)
+    if sync_releases:
+        return _run_sync_releases_mode(
+            report, forks, dry_run, resolve_errors, json_output,
+        )
 
     return _run_mutating_or_dryrun_mode(
         report, forks, mode, dry_run, force, resolve_errors, json_output,

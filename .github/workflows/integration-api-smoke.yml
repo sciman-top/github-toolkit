@@ -64,6 +64,8 @@ jobs:
           set -euo pipefail
           python list-forks.py --json > integration-list-forks.json
           python sync-forks.py --json --dry-run > integration-sync-all-dry-run.json
+          python sync-forks.py --json --verify-releases > integration-verify-releases.json
+          python sync-forks.py --json --sync-releases --dry-run > integration-sync-releases-dry-run.json
 
       - name: Integration specific-repo dry checks
         if: steps.integration_credentials.outputs.ready == 'true'
@@ -80,6 +82,8 @@ jobs:
           echo "Target repo: ${TARGET}"
           python sync-forks.py --json --dry-run "${TARGET}" > integration-sync-target-dry-run.json
           python sync-forks.py --json --add-workflow --dry-run "${TARGET}" > integration-add-workflow-target-dry-run.json
+          python sync-forks.py --json --verify-releases "${TARGET}" > integration-verify-releases-target.json
+          python sync-forks.py --json --sync-releases --dry-run "${TARGET}" > integration-sync-releases-target-dry-run.json
 
       - name: Validate integration JSON outputs
         if: steps.integration_credentials.outputs.ready == 'true'

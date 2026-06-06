@@ -956,7 +956,7 @@ class TestSyncNowResult(unittest.TestCase):
 
     @patch.object(sync_forks, "gh_api")
     @patch.object(sync_forks, "safety_check")
-    def test_stable_source_only_repo_skips_default_branch_sync(
+    def test_self_use_policy_repo_skips_default_branch_sync(
         self, mock_safety, mock_api
     ):
         with contextlib.redirect_stdout(io.StringIO()) as captured:
@@ -968,9 +968,35 @@ class TestSyncNowResult(unittest.TestCase):
             )
 
         self.assertEqual(result, sync_forks.RESULT_OK)
-        self.assertIn("stable-source-only policy", captured.getvalue())
+        self.assertIn("self-use source policy", captured.getvalue())
         mock_safety.assert_not_called()
         mock_api.assert_not_called()
+
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "safety_check")
+    def test_mirror_policy_repo_skips_restore_point_but_merges(
+        self, mock_safety, mock_api
+    ):
+        mock_safety.return_value = sync_forks.SAFE
+        mock_api.side_effect = [
+            {"message": "merged"},
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._sync_now_result(
+                "sciman-top/cockpit-tools-local",
+                "mirror/upstream-main",
+                "jlcodes99/cockpit-tools",
+                "main",
+            )
+
+        self.assertEqual(result, sync_forks.RESULT_OK)
+        self.assertIn("Restore point skipped", captured.getvalue())
+        self.assertEqual(len(mock_api.call_args_list), 1)
+        self.assertEqual(
+            mock_api.call_args_list[0].args[0],
+            "repos/sciman-top/cockpit-tools-local/merge-upstream",
+        )
 
     @patch.object(sync_forks, "gh_api")
     @patch.object(sync_forks, "safety_check")
@@ -1009,6 +1035,143 @@ class TestSyncNowResult(unittest.TestCase):
             call.args[0] != "repos/me/fork/merge-upstream"
             for call in mock_api.call_args_list
         ))
+
+
+class TestSyncReleasesResult(unittest.TestCase):
+    @patch.object(sync_forks, "_build_verify_releases_row")
+    def test_self_use_release_policy_is_skipped(self, mock_row):
+        mock_row.return_value = {
+            "release_policy": "self_use_local_releases",
+            "next_action": "none",
+            "result": sync_forks.RESULT_OK,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._sync_releases_result({
+                "name": "cockpit-tools-local",
+                "full_name": "sciman-top/cockpit-tools-local",
+                "branch": "mirror/upstream-main",
+                "parent": "jlcodes99/cockpit-tools",
+                "parent_branch": "main",
+            })
+
+        self.assertEqual(result, sync_forks.RESULT_OK)
+        self.assertIn("self-use local releases policy", captured.getvalue())
+
+    @patch.object(sync_forks, "_build_verify_releases_row")
+    def test_source_only_release_notes_policy_is_skipped(self, mock_row):
+        mock_row.return_value = {
+            "release_policy": "source_only_release_notes",
+            "next_action": "none",
+            "result": sync_forks.RESULT_OK,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._sync_releases_result({
+                "name": "claude-dashboard",
+                "full_name": "sciman-top/claude-dashboard",
+                "branch": "main",
+                "parent": "uppinote20/claude-dashboard",
+                "parent_branch": "main",
+            })
+
+        self.assertEqual(result, sync_forks.RESULT_OK)
+        self.assertIn("source-only release notes policy", captured.getvalue())
+
+    @patch.object(sync_forks, "_build_verify_releases_row")
+    def test_dry_run_reports_release_action(self, mock_row):
+        mock_row.return_value = {
+            "release_policy": "latest_stable_assets_only",
+            "next_action": "mirror_latest_stable_release",
+            "latest_upstream_stable": "v2",
+            "missing_latest_release_assets": ["tool.exe"],
+            "result": sync_forks.RESULT_OK,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._sync_releases_result({
+                "name": "installable-tool",
+                "full_name": "sciman-top/installable-tool",
+                "branch": "main",
+                "parent": "upstream-owner/installable-tool",
+                "parent_branch": "main",
+            }, dry_run=True)
+
+        self.assertEqual(result, sync_forks.RESULT_OK)
+        self.assertIn("Would reconcile release retention", captured.getvalue())
+
+    @patch.object(sync_forks, "_build_verify_releases_row")
+    @patch.object(sync_forks, "_prune_old_stable_release_assets")
+    @patch.object(sync_forks, "_sync_latest_release_assets")
+    def test_sync_releases_executes_and_reverifies(
+        self, mock_sync_latest, mock_prune_old, mock_row
+    ):
+        fork = {
+            "name": "installable-tool",
+            "full_name": "sciman-top/installable-tool",
+            "branch": "main",
+            "parent": "upstream-owner/installable-tool",
+            "parent_branch": "main",
+        }
+        mock_row.side_effect = [
+            {
+                "release_policy": "latest_stable_assets_only",
+                "next_action": "mirror_latest_stable_release",
+                "latest_upstream_stable": "v2",
+                "missing_latest_release_assets": ["tool.exe"],
+                "result": sync_forks.RESULT_OK,
+            },
+            {
+                "release_policy": "latest_stable_assets_only",
+                "next_action": "none",
+                "latest_upstream_stable": "v2",
+                "missing_latest_release_assets": [],
+                "result": sync_forks.RESULT_OK,
+            },
+        ]
+        mock_sync_latest.return_value = True
+        mock_prune_old.return_value = True
+
+        result = sync_forks._sync_releases_result(fork)
+
+        self.assertEqual(result, sync_forks.RESULT_OK)
+        mock_sync_latest.assert_called_once()
+
+    @patch.object(sync_forks, "_build_verify_releases_row")
+    @patch.object(sync_forks, "_prune_old_stable_release_assets")
+    @patch.object(sync_forks, "_sync_latest_release_assets")
+    def test_sync_releases_returns_safety_when_not_converged(
+        self, mock_sync_latest, mock_prune_old, mock_row
+    ):
+        fork = {
+            "name": "installable-tool",
+            "full_name": "sciman-top/installable-tool",
+            "branch": "main",
+            "parent": "upstream-owner/installable-tool",
+            "parent_branch": "main",
+        }
+        mock_row.side_effect = [
+            {
+                "release_policy": "latest_stable_assets_only",
+                "next_action": "mirror_latest_stable_assets",
+                "latest_upstream_stable": "v2",
+                "missing_latest_release_assets": ["tool.exe"],
+                "result": sync_forks.RESULT_OK,
+            },
+            {
+                "release_policy": "latest_stable_assets_only",
+                "next_action": "mirror_latest_stable_assets",
+                "latest_upstream_stable": "v2",
+                "missing_latest_release_assets": ["tool.exe"],
+                "result": sync_forks.RESULT_OK,
+            },
+        ]
+        mock_sync_latest.return_value = True
+        mock_prune_old.return_value = True
+
+        result = sync_forks._sync_releases_result(fork)
+
+        self.assertEqual(result, sync_forks.RESULT_SAFETY)
 
 
 # ── paginate ──────────────────────────────────────────────────
@@ -1304,13 +1467,27 @@ class TestWorkflowContracts(unittest.TestCase):
         self.assertIn("github.event.repository.default_branch", merge_lines[0])
         self.assertNotIn("steps.upstream.outputs.branch", merge_lines[0])
 
-    def test_generated_workflow_has_stable_source_guard(self):
+    def test_generated_workflow_has_self_use_source_guard(self):
         workflow = sync_forks._render_workflow_template()
 
-        self.assertIn("Stable source policy guard", workflow)
-        self.assertIn("STABLE_SOURCE_ONLY_REPOS", workflow)
-        self.assertIn("sciman-top/cockpit-tools-local", workflow)
-        self.assertIn("steps.stable_source_policy.outputs.skip != 'true'", workflow)
+        self.assertIn("Self-use source policy guard", workflow)
+        self.assertIn("SELF_USE_SOURCE_REPOS", workflow)
+        self.assertIn("steps.self_use_source_policy.outputs.skip != 'true'", workflow)
+        self.assertIn("MIRROR_ONLY_SOURCE_REPOS", workflow)
+        self.assertIn("MIRROR_ONLY_SOURCE_BRANCH", workflow)
+        self.assertIn("github.event.repository.default_branch", workflow)
+        self.assertIn("Restore point policy guard", workflow)
+        self.assertIn("Mirror-only source policy is enabled", workflow)
+
+    def test_generated_workflow_has_release_retention_step(self):
+        workflow = sync_forks._render_workflow_template()
+
+        self.assertIn("Release retention policy", workflow)
+        self.assertIn("SELF_USE_RELEASE_REPOS", workflow)
+        self.assertIn("source-only release notes policy", workflow)
+        self.assertIn('"release", "download"', workflow)
+        self.assertIn('"release", "upload"', workflow)
+        self.assertIn('"release", "delete-asset"', workflow)
 
     def test_generated_workflow_url_encodes_compare_refs(self):
         workflow = sync_forks._render_workflow_template()
@@ -2105,18 +2282,50 @@ class TestSyncForksHelpers(unittest.TestCase):
                 "add_mode": True,
                 "verify_schedule": False,
                 "verify_releases": True,
+                "sync_releases": False,
             }),
             ["add_mode", "verify_releases"],
         )
 
-    def test_source_update_policy_uses_precomputed_stable_repo_set(self):
+    def test_selected_mode_flags_includes_sync_releases(self):
         self.assertEqual(
-            sync_forks._source_update_policy("sciman-top/cockpit-tools-local"),
-            "stable_release_only",
+            sync_forks._selected_mode_flags({
+                "add_mode": False,
+                "verify_schedule": False,
+                "verify_releases": False,
+                "sync_releases": True,
+            }),
+            ["sync_releases"],
+        )
+
+    def test_source_update_policy_uses_branch_specific_repo_policy(self):
+        self.assertEqual(
+            sync_forks._source_update_policy(
+                "sciman-top/cockpit-tools-local",
+                "main",
+            ),
+            "self_use_main_manual_merge",
         )
         self.assertEqual(
-            sync_forks._source_update_policy("sciman-top/claude-dashboard"),
+            sync_forks._source_update_policy(
+                "sciman-top/cockpit-tools-local",
+                "mirror/upstream-main",
+            ),
+            "mirror_upstream_main",
+        )
+        self.assertEqual(
+            sync_forks._source_update_policy(
+                "sciman-top/claude-dashboard",
+                "main",
+            ),
             "upstream_default_branch",
+        )
+        self.assertEqual(
+            sync_forks._source_update_policy(
+                "sciman-top/cockpit-tools-local",
+                None,
+            ),
+            "self_use_main_manual_merge",
         )
 
     def test_latest_workflow_run_normalizes_valid_payload(self):
@@ -2194,6 +2403,25 @@ class TestSyncForksHelpers(unittest.TestCase):
         self.assertEqual(
             sync_forks._release_retention_next_action(1, {"tag_name": "v2"}, 1, 0),
             "none",
+        )
+
+    def test_missing_release_asset_names_detects_partial_latest_mirror(self):
+        upstream = {
+            "assets": [
+                {"name": "tool.exe"},
+                {"name": "SHA256SUMS.txt"},
+                {"name": "latest.json"},
+            ],
+        }
+        fork = {
+            "assets": [
+                {"name": "tool.exe"},
+            ],
+        }
+
+        self.assertEqual(
+            sync_forks._missing_release_asset_names(upstream, fork),
+            ["SHA256SUMS.txt", "latest.json"],
         )
 
     def test_schedule_next_action_maps_readiness_states(self):
@@ -2275,6 +2503,12 @@ class TestSyncForksHelpers(unittest.TestCase):
                 dry_run=False,
             )
         )
+        self.assertTrue(
+            sync_forks._mode_writes_remotely(
+                sync_forks.MODE_SYNC_RELEASES,
+                dry_run=False,
+            )
+        )
         self.assertFalse(
             sync_forks._mode_writes_remotely(sync_forks.MODE_SYNC, dry_run=True)
         )
@@ -2308,6 +2542,13 @@ class TestSyncForksHelpers(unittest.TestCase):
                 sync_forks._force_confirmation_missing(
                     True,
                     sync_forks.MODE_VERIFY_RELEASES,
+                    dry_run=False,
+                )
+            )
+            self.assertTrue(
+                sync_forks._force_confirmation_missing(
+                    True,
+                    sync_forks.MODE_SYNC_RELEASES,
                     dry_run=False,
                 )
             )
@@ -2389,6 +2630,45 @@ class TestSyncForksHelpers(unittest.TestCase):
         self.assertEqual(rows[0]["next_action"], "prune_old_stable_release_assets")
         self.assertEqual(summary["ready"], 0)
         self.assertEqual(summary["old_stable_assets_present"], 1)
+
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_release_retention_flags_missing_latest_support_assets(self, mock_api):
+        forks = [{
+            "name": "installable-tool",
+            "full_name": "sciman-top/installable-tool",
+            "branch": "main",
+            "parent": "upstream-owner/installable-tool",
+            "parent_branch": "main",
+        }]
+        upstream_latest = {
+            "tag_name": "v2",
+            "draft": False,
+            "prerelease": False,
+            "assets": [
+                {"name": "tool.exe"},
+                {"name": "SHA256SUMS.txt"},
+                {"name": "latest.json"},
+            ],
+        }
+        fork_latest = {
+            "tag_name": "v2",
+            "draft": False,
+            "prerelease": False,
+            "assets": [
+                {"name": "tool.exe"},
+            ],
+        }
+        mock_api.side_effect = [[upstream_latest], [fork_latest]]
+
+        rows, summary = sync_forks._verify_release_retention(forks)
+
+        self.assertEqual(rows[0]["next_action"], "mirror_latest_stable_assets")
+        self.assertEqual(
+            rows[0]["missing_latest_release_assets"],
+            ["SHA256SUMS.txt", "latest.json"],
+        )
+        self.assertEqual(summary["ready"], 0)
+        self.assertEqual(summary["latest_stable_missing_or_without_assets"], 1)
 
     @patch.object(sync_forks, "gh_api")
     def test_self_use_release_policy_ignores_upstream_release_mirror(self, mock_api):
@@ -2866,6 +3146,80 @@ class TestSyncForksVerifyScheduleMode(unittest.TestCase):
         self.assertIn("Schedule readiness details:", output)
         self.assertIn("me/forked-repo", output)
         self.assertIn("update_sync_workflow", output)
+
+
+class TestSyncForksSyncReleasesMode(unittest.TestCase):
+    @patch.object(sync_forks, "_sync_releases_result")
+    @patch.object(sync_forks, "_resolve_specific_forks")
+    @patch.object(sync_forks, "get_auth_context")
+    @patch.object(sync_forks, "check_gh_cli")
+    def test_sync_releases_json_returns_summary_payload(
+        self, _mock_check, mock_auth_context, mock_resolve, mock_sync_releases
+    ):
+        mock_auth_context.return_value = {
+            "username": "me",
+            "auth": {
+                "configured": True,
+                "mode": "env_token",
+                "source": "GH_TOKEN",
+            },
+        }
+        mock_resolve.return_value = ([{
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "main",
+            "parent": "upstream-owner/forked-repo",
+            "parent_branch": "main",
+            "parent_owner": "upstream-owner",
+        }], False)
+        mock_sync_releases.return_value = sync_forks.RESULT_OK
+
+        with patch.dict(
+            "os.environ",
+            {sync_forks.FORCE_SYNC_ACK_ENV: sync_forks.FORCE_SYNC_ACK_VALUE},
+            clear=False,
+        ):
+            with patch.object(
+                sync_forks.sys,
+                "argv",
+                ["sync-forks.py", "--json", "--sync-releases", "forked-repo"],
+            ):
+                with contextlib.redirect_stdout(io.StringIO()) as captured:
+                    exit_code = sync_forks.main()
+
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(exit_code, sync_forks.EXIT_OK)
+        self.assertEqual(payload["mode"], "sync-releases")
+        self.assertEqual(payload["summary"]["success"], 1)
+        mock_sync_releases.assert_called_once()
+
+    @patch.object(sync_forks, "get_auth_context")
+    @patch.object(sync_forks, "check_gh_cli")
+    def test_force_sync_releases_requires_explicit_confirmation(
+        self, _mock_check, mock_auth_context
+    ):
+        mock_auth_context.return_value = {
+            "username": "me",
+            "auth": {
+                "configured": True,
+                "mode": "env_token",
+                "source": "GH_TOKEN",
+            },
+        }
+
+        with patch.dict("os.environ", {sync_forks.FORCE_SYNC_ACK_ENV: ""}, clear=False):
+            with patch.object(
+                sync_forks.sys,
+                "argv",
+                ["sync-forks.py", "--json", "--sync-releases", "--force", "forked-repo"],
+            ):
+                with contextlib.redirect_stdout(io.StringIO()) as captured:
+                    exit_code = sync_forks.main()
+
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
+        self.assertEqual(payload["error"], "force_confirmation_required")
+        self.assertEqual(payload["error_code"], "E_FORCE_CONFIRMATION_REQUIRED")
 
 
 if __name__ == "__main__":
