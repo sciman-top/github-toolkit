@@ -1,22 +1,49 @@
 # GitHub Toolkit
 
-Fork 仓库自动同步管理工具集，带安全防护机制。
+Fork 仓库自动同步与 release retention 管理工具集，带安全防护机制。
 
 ## 这个工具做什么
 - 为 fork 仓库添加自动同步 workflow
 - 立即同步单个或全部 fork
 - 列出 fork 仓库及其同步状态
+- 只读核验 schedule / release readiness，并输出稳定的 `next_action`
+- 按策略收敛 fork release 资产保留状态
 - 在同步前做安全检查，避免上游仓库异常时把 fork 一起带崩
+
+## 当前状态快照（2026-06-13 实测）
+以下快照来自：
+
+- `python list-forks.py --json`
+- `python sync-forks.py --json --verify-schedule`
+- `python sync-forks.py --json --verify-releases`
+
+当前 live 状态：
+
+- 认证方式：`gh auth login`
+- 已认证账号：`sciman-top`
+- 仓库发现：`repo_count=9`，其中 fork `3`
+- schedule readiness：`ready 3/3`
+- release retention readiness：`ready 3/3`
+
+| fork | 默认同步分支 | source 策略 | release 策略 | 当前状态 |
+|------|--------------|-------------|--------------|----------|
+| `sciman-top/claude-dashboard` | `main` | `upstream_default_branch` | `source_only_release_notes` | schedule / release 均 `next_action=none` |
+| `sciman-top/cockpit-tools-local` | `mirror/upstream-main` | `mirror_upstream_main` | `self_use_local_releases` | schedule / release 均 `next_action=none` |
+| `sciman-top/v2ray-agent` | `master` | `upstream_default_branch` | `source_only_release_notes` | schedule / release 均 `next_action=none` |
+
+这个快照会随远端 GitHub 状态变化漂移；需要最新结果时，直接重跑上面的三条命令。
 
 ## 脚本说明
 
 | 脚本 | 用途 |
 |------|------|
 | `setup.bat` | 检测/安装 `gh` CLI，完成登录和权限准备 |
-| `sync-forks.py` | 添加同步 workflow、检查定时同步 readiness，或执行同步，支持 `--json` |
+| `sync-forks.py` | 添加/更新同步 workflow、只读核验 schedule/release readiness、执行源码同步或 release 收敛，支持 `--json` |
 | `list-forks.py` | 查看所有 fork 和同步状态，支持 `--json` |
 | `gh_utils.py` | 公共 GitHub 辅助逻辑 |
 | `scripts/Verify-WindowsProcessEnvironment.ps1` | 诊断 Codex/PowerShell 进程环境与 `gh` 可用性 |
+| `scripts/Update-CockpitSelfUseFork.ps1` | 为 `cockpit-tools-local` 的本地自用主线创建隔离 review worktree，并吸收 `upstream/main` |
+| `scripts/benchmark_hotpaths.py` | 运行无网络热路径基准与阈值检查 |
 
 ## 安全机制
 同步前会自动做一组保护检查：
@@ -84,6 +111,7 @@ python sync-forks.py --json --sync-releases --dry-run
 
 非 JSON 模式会输出每个 fork 的 readiness 明细表，便于直接查看 `next_action`。
 fork 范围不是静态名单，而是每次根据已认证账号的 GitHub `user/repos` 实时发现；新增或删除 fork 后，下次执行会自动收敛。
+`--verify-schedule` 和 `--verify-releases` 都是只读门禁：当发现 workflow 漂移、secret 缺失、schedule 不健康或 release 需要收敛时，会按 safety exit code `3` 退出，并通过 `next_action` 指出下一步；这不是脚本崩溃。
 
 ### 5. Cockpit Tools Local 远端 mirror 策略
 默认源码同步仍跟随上游默认分支；只有 fork 需要把远端默认分支收敛成上游镜像，同时把本机自用主线保留在本地时，才进入 mirror-only source。
@@ -224,18 +252,40 @@ Python 入口也会在导入 `gh_utils.py` 时自动补齐同一组 Windows 基�
 ### 依赖
 - Python 3.8+
 - GitHub CLI (`gh`)
-- Windows 10/11
+- 本地维护入口默认面向 Windows 10/11（`setup.bat` 与环境诊断脚本是 Windows-first）
+- GitHub Actions 集成 smoke 使用 `ubuntu-latest` + Python 3.11 执行只读/干跑验证
 
 ## 文件结构
 ```text
 github-toolkit/
+├── .github/workflows/  CI 与集成 smoke workflow
+├── docs/change-evidence/  变更证据、回滚入口与 live 结果
 ├── setup.bat          环境配置入口
 ├── sync-forks.py      同步与 workflow 管理核心
 ├── list-forks.py      状态查看
 ├── gh_utils.py        GitHub API / CLI 辅助函数
+├── test_toolkit.py    单元与回归测试
+├── test_support.py    受限环境 fallback / test helper
 ├── scripts/           诊断、基准与辅助脚本
 └── README.md          本文件
 ```
+
+## 本地门禁（固定顺序）
+交付前按项目硬门禁顺序执行：
+
+1. `python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py .claude/hooks/governed-pre-tool-use.py`
+2. `python -m unittest test_toolkit.py`
+3. `python -m unittest test_toolkit.py`
+4. 若触及性能路径，再运行 `python scripts/benchmark_hotpaths.py --sizes 10,100,500 --runs 5 --check`
+
+第 2 步是 test，第 3 步是 contract/invariant；两者当前都由 `test_toolkit.py` 承担。
+
+## 相关文档
+- `docs/change-evidence/`：按日期记录每次变更的依据、命令、证据与回滚入口
+- `docs/change-evidence/2026-06-06-release-sync.md`：`--sync-releases` 和 weekly release retention 收敛的首次落地证据
+- `docs/change-evidence/2026-06-06-delete-codex-fork.md`：删除 `sciman-top/codex` 后 fork 集合收敛证据
+- `docs/superpowers/specs/2026-06-06-release-sync-design.md`：release sync 设计约束
+- `docs/superpowers/plans/2026-06-06-release-sync-implementation.md`：对应实现计划
 
 ## 常用命令速查
 ```powershell
@@ -283,9 +333,14 @@ python list-forks.py --json           # 输出 JSON 状态
 - 或按周定时自动触发（UTC 每周一 03:30）
 
 该 workflow 默认执行：
+- `python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py`
 - `list-forks.py --json`
 - `sync-forks.py --json --dry-run`
-- （可选）指定仓库的 `--dry-run` 与 `--add-workflow --dry-run`
+- `sync-forks.py --json --verify-releases`
+- `sync-forks.py --json --sync-releases --dry-run`
+- （可选）指定仓库的 `--dry-run`、`--add-workflow --dry-run`、`--verify-releases` 与 `--sync-releases --dry-run`
+- 校验 `integration-*.json` 没有 `error`
+- 上传 `integration-*.json` 作为 workflow artifact
 
 如果未配置 `INTEGRATION_GH_TOKEN` 或 `INTEGRATION_EXPECTED_LOGIN`，workflow 会成功退出并记录 skip 原因，不会把缺少集成测试密钥误报为代码失败。
 
