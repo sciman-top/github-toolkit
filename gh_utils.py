@@ -530,6 +530,27 @@ def _classify_gh_error(stderr):
     )
 
 
+def _run_gh_subprocess(cmd, timeout=None, payload=None):
+    """Run one gh subprocess with shared encoding/timeout/error policy."""
+    try:
+        return subprocess.run(
+            cmd,
+            input=json.dumps(payload) if payload is not None else None,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+            timeout=timeout,
+        )  # nosec B603
+    except subprocess.TimeoutExpired:
+        raise
+    except OSError as exc:
+        return _build_error_result(
+            f"Cannot execute gh CLI: {exc}",
+            error_type="environment",
+        )
+
+
 def gh_api(endpoint, method="GET", payload=None, timeout=API_TIMEOUT):
     """Call GitHub API via gh CLI.
 
@@ -545,15 +566,7 @@ def gh_api(endpoint, method="GET", payload=None, timeout=API_TIMEOUT):
 
     for attempt in range(MAX_RETRIES + 1):
         try:
-            result = subprocess.run(
-                cmd,
-                input=json.dumps(payload) if payload is not None else None,
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                shell=False,
-                timeout=timeout,
-            )  # nosec B603
+            result = _run_gh_subprocess(cmd, timeout=timeout, payload=payload)
         except subprocess.TimeoutExpired:
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BASE_DELAY * (attempt + 1))
@@ -563,11 +576,9 @@ def gh_api(endpoint, method="GET", payload=None, timeout=API_TIMEOUT):
                 error_type="timeout",
                 retryable=True,
             )
-        except OSError as exc:
-            return _build_error_result(
-                f"Cannot execute gh CLI: {exc}",
-                error_type="environment",
-            )
+
+        if isinstance(result, dict):
+            return result
 
         if result.returncode != 0:
             error_result = _classify_gh_error(result.stderr)
@@ -599,11 +610,28 @@ def paginate(endpoint, per_page=100, include_error=False):
     Returns a flat list of items by default.
     If include_error=True, returns (items, error_payload_or_none).
     """
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        page_error = _build_error_result(
+            "Invalid paginated endpoint",
+            error_type="invalid_response",
+            detail=repr(endpoint)[:200],
+        )
+        return ([], page_error) if include_error else []
+
+    normalized_per_page = parse_nonnegative_int(per_page)
+    if normalized_per_page is None or normalized_per_page <= 0:
+        page_error = _build_error_result(
+            "Invalid pagination size",
+            error_type="invalid_response",
+            detail=repr(per_page)[:200],
+        )
+        return ([], page_error) if include_error else []
+
     sep = "&" if "?" in endpoint else "?"
     results = []
     page_error = None
     for page in range(1, MAX_PAGES + 1):
-        data = gh_api(f"{endpoint}{sep}per_page={per_page}&page={page}")
+        data = gh_api(f"{endpoint}{sep}per_page={normalized_per_page}&page={page}")
         if isinstance(data, dict):
             if "error" in data:
                 page_error = data
@@ -624,13 +652,13 @@ def paginate(endpoint, per_page=100, include_error=False):
             )
             break
         results.extend(data)
-        if len(data) < per_page:
+        if len(data) < normalized_per_page:
             break
         if page == MAX_PAGES:
             page_error = _build_error_result(
                 f"Pagination limit exceeded for endpoint: {endpoint}",
                 error_type="invalid_response",
-                detail=f"max_pages={MAX_PAGES}, per_page={per_page}",
+                detail=f"max_pages={MAX_PAGES}, per_page={normalized_per_page}",
             )
             break
     if include_error:

@@ -61,18 +61,25 @@ def _collect_fork_statuses(forks):
     """Collect fork status rows for text and JSON renderers."""
     rows = []
     for fork in forks:
-        encoded_branch = encode_url_component(fork["branch"])
-        wf = gh_api(
-            f"repos/{fork['full_name']}/contents/.github/workflows/sync-fork.yml"
-            f"?ref={encoded_branch}"
-        )
-        has_workflow = isinstance(wf, dict) and "error" not in wf
+        branch = fork.get("branch")
+        parent = fork.get("parent")
+        parent_branch = fork.get("parent_branch")
+        full_name = fork.get("full_name")
+
+        has_workflow = False
+        encoded_branch = encode_url_component(branch)
+        if full_name and encoded_branch:
+            wf = gh_api(
+                f"repos/{full_name}/contents/.github/workflows/sync-fork.yml"
+                f"?ref={encoded_branch}"
+            )
+            has_workflow = isinstance(wf, dict) and "error" not in wf
 
         behind_by = None
-        compare_head = get_compare_head(fork["parent"], fork["parent_branch"])
+        compare_head = get_compare_head(parent, parent_branch)
         compare_endpoint = build_compare_endpoint(
-            fork["full_name"],
-            fork["branch"],
+            full_name,
+            branch,
             compare_head,
         )
         if compare_endpoint:
