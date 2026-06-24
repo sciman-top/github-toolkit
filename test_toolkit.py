@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for GitHub Toolkit core logic."""
 
+import ast
 import base64
 import contextlib
 import importlib.util
@@ -490,6 +491,24 @@ class TestGhApiErrors(unittest.TestCase):
         self.assertEqual(result["error_code"], "E_GH_ENVIRONMENT")
         self.assertFalse(result["retryable"])
         self.assertIn("Cannot execute gh CLI", result["error"])
+
+    @patch("gh_utils.gh_api")
+    def test_paginate_invalid_endpoint_returns_structured_error(self, mock_api):
+        items, error = paginate(None, include_error=True)
+
+        self.assertEqual(items, [])
+        self.assertEqual(error["error_type"], "invalid_response")
+        self.assertIn("Invalid paginated endpoint", error["error"])
+        mock_api.assert_not_called()
+
+    @patch("gh_utils.gh_api")
+    def test_paginate_invalid_per_page_returns_structured_error(self, mock_api):
+        items, error = paginate("users/u/repos", per_page=0, include_error=True)
+
+        self.assertEqual(items, [])
+        self.assertEqual(error["error_type"], "invalid_response")
+        self.assertIn("Invalid pagination size", error["error"])
+        mock_api.assert_not_called()
 
 
 class TestAuthDetection(unittest.TestCase):
@@ -1729,6 +1748,47 @@ class TestListForks(unittest.TestCase):
         rows = list_forks._collect_fork_statuses([fork])
         self.assertIsNone(rows[0]["behind_by"])
 
+    @patch.object(list_forks, "gh_api")
+    def test_collect_fork_statuses_skips_api_calls_when_branch_metadata_is_missing(
+        self, mock_api
+    ):
+        fork = {
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": None,
+            "parent": "upstream-owner/forked-repo",
+            "parent_branch": "main",
+            "parent_owner": "upstream-owner",
+        }
+
+        rows = list_forks._collect_fork_statuses([fork])
+
+        self.assertEqual(rows[0]["workflow_status"], "Missing")
+        self.assertIsNone(rows[0]["behind_by"])
+        mock_api.assert_not_called()
+
+    @patch.object(list_forks, "gh_api")
+    def test_collect_fork_statuses_degrades_compare_errors_to_unknown_behind(
+        self, mock_api
+    ):
+        fork = {
+            "name": "forked-repo",
+            "full_name": "me/forked-repo",
+            "branch": "main",
+            "parent": "upstream-owner/forked-repo",
+            "parent_branch": "main",
+            "parent_owner": "upstream-owner",
+        }
+        mock_api.side_effect = [
+            {"content": "workflow"},
+            {"error": "gh: Bad Gateway (HTTP 502)", "error_type": "server"},
+        ]
+
+        rows = list_forks._collect_fork_statuses([fork])
+
+        self.assertEqual(rows[0]["workflow_status"], "Installed")
+        self.assertIsNone(rows[0]["behind_by"])
+
     @patch.object(list_forks, "get_auth_context")
     @patch.object(list_forks, "check_gh_cli")
     def test_json_output_treats_non_dict_workflow_response_as_missing(
@@ -2257,6 +2317,38 @@ class TestConstants(unittest.TestCase):
         self.assertEqual(sync_forks.EXIT_SAFETY, 3)
 
 
+class TestAstGuards(unittest.TestCase):
+    def test_no_duplicate_top_level_definitions(self):
+        target_paths = (
+            "gh_utils.py",
+            "sync-forks.py",
+            "list-forks.py",
+        )
+
+        for relative_path in target_paths:
+            with self.subTest(path=relative_path):
+                full_path = os.path.join(_here, relative_path)
+                with open(full_path, encoding="utf-8") as handle:
+                    tree = ast.parse(handle.read(), filename=relative_path)
+
+                first_seen = {}
+                duplicates = []
+                for node in tree.body:
+                    if not isinstance(
+                        node,
+                        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                    ):
+                        continue
+                    if node.name in first_seen:
+                        duplicates.append(
+                            (node.name, first_seen[node.name], node.lineno)
+                        )
+                    else:
+                        first_seen[node.name] = node.lineno
+
+                self.assertEqual(duplicates, [])
+
+
 class TestSyncForksHelpers(unittest.TestCase):
     def test_dedupe_preserve_order(self):
         self.assertEqual(
@@ -2296,6 +2388,28 @@ class TestSyncForksHelpers(unittest.TestCase):
                 "sync_releases": True,
             }),
             ["sync_releases"],
+        )
+
+    def test_mode_name_maps_all_supported_modes(self):
+        self.assertEqual(
+            sync_forks._mode_name(False, False, False, False),
+            sync_forks.MODE_SYNC,
+        )
+        self.assertEqual(
+            sync_forks._mode_name(True, False, False, False),
+            sync_forks.MODE_ADD_WORKFLOW,
+        )
+        self.assertEqual(
+            sync_forks._mode_name(False, True, False, False),
+            sync_forks.MODE_VERIFY_SCHEDULE,
+        )
+        self.assertEqual(
+            sync_forks._mode_name(False, False, True, False),
+            sync_forks.MODE_VERIFY_RELEASES,
+        )
+        self.assertEqual(
+            sync_forks._mode_name(False, False, False, True),
+            sync_forks.MODE_SYNC_RELEASES,
         )
 
     def test_source_update_policy_uses_branch_specific_repo_policy(self):
@@ -2671,6 +2785,41 @@ class TestSyncForksHelpers(unittest.TestCase):
         self.assertEqual(summary["latest_stable_missing_or_without_assets"], 1)
 
     @patch.object(sync_forks, "gh_api")
+    def test_verify_release_retention_ignores_non_required_old_assets(self, mock_api):
+        forks = [{
+            "name": "installable-tool",
+            "full_name": "sciman-top/installable-tool",
+            "branch": "main",
+            "parent": "upstream-owner/installable-tool",
+            "parent_branch": "main",
+        }]
+        upstream_latest = {
+            "tag_name": "v2",
+            "draft": False,
+            "prerelease": False,
+            "assets": [{"name": "tool.exe"}],
+        }
+        fork_latest = {
+            "tag_name": "v2",
+            "draft": False,
+            "prerelease": False,
+            "assets": [{"name": "tool.exe"}],
+        }
+        fork_old = {
+            "tag_name": "v1",
+            "draft": False,
+            "prerelease": False,
+            "assets": [{"name": "notes.md"}],
+        }
+        mock_api.side_effect = [[upstream_latest], [fork_latest, fork_old]]
+
+        rows, summary = sync_forks._verify_release_retention(forks)
+
+        self.assertEqual(rows[0]["next_action"], "none")
+        self.assertEqual(rows[0]["old_stable_release_asset_count"], 0)
+        self.assertEqual(summary["old_stable_assets_present"], 0)
+
+    @patch.object(sync_forks, "gh_api")
     def test_self_use_release_policy_ignores_upstream_release_mirror(self, mock_api):
         forks = [{
             "name": "cockpit-tools-local",
@@ -2721,6 +2870,153 @@ class TestSyncForksHelpers(unittest.TestCase):
         self.assertEqual(rows[0]["upstream_mirror_release_asset_count"], 1)
         self.assertEqual(summary["ready"], 0)
         self.assertEqual(summary["upstream_mirror_assets_present"], 1)
+
+    @patch.object(sync_forks, "_run_gh_command")
+    @patch.object(sync_forks, "gh_api")
+    def test_sync_latest_release_assets_reuploads_checksum_when_latest_json_changes(
+        self, mock_api, mock_run
+    ):
+        fork = {
+            "name": "installable-tool",
+            "full_name": "sciman-top/installable-tool",
+            "branch": "main",
+            "parent": "upstream-owner/installable-tool",
+            "parent_branch": "main",
+        }
+        row = {"latest_upstream_stable": "v2"}
+        upstream_latest = {
+            "tag_name": "v2",
+            "name": "Version 2",
+            "body": "release notes",
+            "assets": [
+                {"name": "tool.exe"},
+                {"name": "latest.json"},
+                {"name": "SHA256SUMS.txt"},
+            ],
+        }
+        fork_latest = {
+            "tag_name": "v2",
+            "assets": [
+                {"name": "tool.exe"},
+                {"name": "SHA256SUMS.txt"},
+            ],
+        }
+        mock_api.side_effect = [[upstream_latest], [fork_latest]]
+
+        def _fake_run(args):
+            if args[:2] == ["release", "download"]:
+                target_dir = args[args.index("-D") + 1]
+                asset_name = args[args.index("-p") + 1]
+                asset_path = os.path.join(target_dir, asset_name)
+                if asset_name == "latest.json":
+                    with open(asset_path, "w", encoding="utf-8") as handle:
+                        handle.write(
+                            '{"url":"https://github.com/upstream-owner/installable-tool/'
+                            'releases/download/v2/tool.exe"}'
+                        )
+                elif asset_name == "SHA256SUMS.txt":
+                    with open(asset_path, "w", encoding="utf-8") as handle:
+                        handle.write(
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            "  latest.json\n"
+                        )
+                else:
+                    with open(asset_path, "w", encoding="utf-8") as handle:
+                        handle.write("binary")
+            return Mock(returncode=0, stderr="", stdout="")
+
+        mock_run.side_effect = _fake_run
+
+        result = sync_forks._sync_latest_release_assets(fork, row)
+
+        self.assertTrue(result)
+        upload_call = mock_run.call_args_list[-1].args[0]
+        self.assertEqual(upload_call[:2], ["release", "upload"])
+        uploaded_names = {os.path.basename(path) for path in upload_call[3:-2]}
+        self.assertEqual(uploaded_names, {"latest.json", "SHA256SUMS.txt"})
+
+    @patch.object(sync_forks, "_run_gh_command")
+    @patch.object(sync_forks, "gh_api")
+    def test_sync_latest_release_assets_fails_when_checksum_entry_missing(
+        self, mock_api, mock_run
+    ):
+        fork = {
+            "name": "installable-tool",
+            "full_name": "sciman-top/installable-tool",
+            "branch": "main",
+            "parent": "upstream-owner/installable-tool",
+            "parent_branch": "main",
+        }
+        row = {"latest_upstream_stable": "v2"}
+        upstream_latest = {
+            "tag_name": "v2",
+            "name": "Version 2",
+            "body": "release notes",
+            "assets": [
+                {"name": "latest.json"},
+                {"name": "SHA256SUMS.txt"},
+            ],
+        }
+        fork_latest = {"tag_name": "v2", "assets": []}
+        mock_api.side_effect = [[upstream_latest], [fork_latest]]
+
+        def _fake_run(args):
+            if args[:2] == ["release", "download"]:
+                target_dir = args[args.index("-D") + 1]
+                asset_name = args[args.index("-p") + 1]
+                asset_path = os.path.join(target_dir, asset_name)
+                if asset_name == "latest.json":
+                    with open(asset_path, "w", encoding="utf-8") as handle:
+                        handle.write(
+                            '{"url":"https://github.com/upstream-owner/installable-tool/'
+                            'releases/download/v2/tool.exe"}'
+                        )
+                elif asset_name == "SHA256SUMS.txt":
+                    with open(asset_path, "w", encoding="utf-8") as handle:
+                        handle.write(
+                            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            "  tool.exe\n"
+                        )
+            return Mock(returncode=0, stderr="", stdout="")
+
+        mock_run.side_effect = _fake_run
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._sync_latest_release_assets(fork, row)
+
+        self.assertFalse(result)
+        self.assertIn(
+            "checksum manifest does not contain latest.json",
+            captured.getvalue(),
+        )
+
+    @patch.object(sync_forks, "_run_gh_command")
+    @patch.object(sync_forks, "gh_api")
+    def test_sync_latest_release_assets_fails_when_downloaded_asset_missing(
+        self, mock_api, mock_run
+    ):
+        fork = {
+            "name": "installable-tool",
+            "full_name": "sciman-top/installable-tool",
+            "branch": "main",
+            "parent": "upstream-owner/installable-tool",
+            "parent_branch": "main",
+        }
+        row = {"latest_upstream_stable": "v2"}
+        upstream_latest = {
+            "tag_name": "v2",
+            "name": "Version 2",
+            "body": "release notes",
+            "assets": [{"name": "tool.exe"}],
+        }
+        mock_api.side_effect = [[upstream_latest], []]
+        mock_run.return_value = Mock(returncode=0, stderr="", stdout="")
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            result = sync_forks._sync_latest_release_assets(fork, row)
+
+        self.assertFalse(result)
+        self.assertIn("Downloaded release asset is missing", captured.getvalue())
 
     @patch.object(sync_forks, "gh_api")
     def test_verify_release_retention_ignores_source_only_upstream(self, mock_api):

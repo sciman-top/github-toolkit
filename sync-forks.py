@@ -649,6 +649,126 @@ def _base_fork_row(fork):
     }
 
 
+def _print_safety_abort(message_lines):
+    """Print a standardized safety abort banner plus detail lines."""
+    print("  *** SAFETY ABORT ***")
+    for line in message_lines:
+        print(f"  {line}")
+
+
+def _safe_compare_payload(compare):
+    """Normalize compare response payload or return an abort reason."""
+    if not isinstance(compare, dict) or "error" in compare:
+        return None, "Cannot inspect upstream diff safely."
+
+    total_deletions = parse_nonnegative_int(compare.get("total_deletions", 0) or 0)
+    if total_deletions is None:
+        return None, "Compare response deletion count is malformed."
+
+    files = compare.get("files", [])
+    if not isinstance(files, list):
+        return None, "Compare response files payload is malformed."
+
+    deleted_files = []
+    for item in files:
+        if not isinstance(item, dict):
+            return None, "Compare response file entry is malformed."
+        if item.get("status") != "removed":
+            continue
+        filename = item.get("filename")
+        if not isinstance(filename, str) or not filename.strip():
+            return None, "Compare response removed filename is malformed."
+        deleted_files.append(filename)
+
+    return {
+        "total_deletions": total_deletions,
+        "deleted_files": deleted_files,
+    }, None
+
+
+def _old_stable_required_asset_count(releases, latest_tag):
+    """Return retained old-stable assets that policy requires pruning."""
+    return sum(
+        len(_required_release_asset_names(release))
+        for release in _stable_releases(releases)
+        if release.get("tag_name") != latest_tag
+    )
+
+
+def _write_release_file(path, content):
+    """Write one release helper file using UTF-8."""
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+
+
+def _rewrite_latest_json(latest_json_path, upstream, full_name, tag):
+    """Rewrite latest.json URLs from upstream to fork download URLs."""
+    if not os.path.isfile(latest_json_path):
+        return False
+    with open(latest_json_path, "r", encoding="utf-8") as handle:
+        latest_json_text = handle.read()
+    upstream_prefix = f"https://github.com/{upstream}/releases/download/{tag}/"
+    fork_prefix = f"https://github.com/{full_name}/releases/download/{tag}/"
+    _write_release_file(
+        latest_json_path,
+        latest_json_text.replace(upstream_prefix, fork_prefix),
+    )
+    return True
+
+
+def _refresh_sha256_sums_for_latest_json(sha_sums_path, latest_json_path):
+    """Refresh latest.json hash in SHA256SUMS.txt, fail closed if entry is missing."""
+    if not os.path.isfile(sha_sums_path) or not os.path.isfile(latest_json_path):
+        return True, None
+
+    with open(latest_json_path, "rb") as handle:
+        latest_hash = hashlib.sha256(handle.read()).hexdigest()
+
+    updated_lines = []
+    matched_latest_json = False
+    with open(sha_sums_path, "r", encoding="utf-8") as handle:
+        for line in handle.read().splitlines():
+            if line.strip().endswith("latest.json"):
+                filename = line.split()[-1]
+                updated_lines.append(f"{latest_hash}  {filename}")
+                matched_latest_json = True
+            else:
+                updated_lines.append(line)
+
+    if not matched_latest_json:
+        return False, "checksum manifest does not contain latest.json"
+
+    _write_release_file(sha_sums_path, "\n".join(updated_lines) + "\n")
+    return True, None
+
+
+def _download_missing_release_assets(upstream, tag, missing_assets, temp_dir):
+    """Download all missing assets and verify every expected file exists."""
+    downloaded_paths = []
+    for asset_name in missing_assets:
+        result = _run_gh_command([
+            "release",
+            "download",
+            tag,
+            "-R",
+            upstream,
+            "-D",
+            temp_dir,
+            "-p",
+            asset_name,
+            "--clobber",
+        ])
+        if result.returncode != 0:
+            return None, result.stderr.strip()[:200] or "cannot download release asset"
+
+        asset_path = os.path.join(temp_dir, asset_name)
+        if not os.path.isfile(asset_path):
+            return None, f"Downloaded release asset is missing: {asset_name}"
+        downloaded_paths.append(asset_path)
+
+    return downloaded_paths, None
+
+
 def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
                  force=False):
     """Compare file counts and deletions. Return SAFE/ABORT/SKIP."""
@@ -660,10 +780,11 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
     upstream_count = get_file_count(upstream_name, upstream_branch)
 
     if fork_count is None:
-        print("  *** SAFETY ABORT ***")
-        print("  Cannot get fork file count, safety baseline is unavailable.")
-        print("  Sync skipped to preserve fork.")
-        print("  Use --force to override (NOT recommended).")
+        _print_safety_abort((
+            "Cannot get fork file count, safety baseline is unavailable.",
+            "Sync skipped to preserve fork.",
+            "Use --force to override (NOT recommended).",
+        ))
         return ABORT
     if upstream_count is None:
         print("  WARN: Upstream unavailable or deleted. Skipping sync to preserve fork.")
@@ -672,10 +793,11 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
     print(f"  Files: fork={fork_count}, upstream={upstream_count}")
 
     if upstream_count < fork_count * DELETION_THRESHOLD:
-        print("  *** SAFETY ABORT ***")
-        print(f"  Upstream has {upstream_count} files, fork has {fork_count}.")
-        print("  Upstream may have been wiped. Sync skipped for safety.")
-        print("  Use --force to override (NOT recommended).")
+        _print_safety_abort((
+            f"Upstream has {upstream_count} files, fork has {fork_count}.",
+            "Upstream may have been wiped. Sync skipped for safety.",
+            "Use --force to override (NOT recommended).",
+        ))
         return ABORT
 
     compare_head = get_compare_head(upstream_name, upstream_branch)
@@ -683,38 +805,18 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
     if not compare_endpoint:
         print("  ABORT: Upstream metadata is incomplete, cannot inspect diff safely.")
         return ABORT
-    compare = gh_api(compare_endpoint)
-    if not isinstance(compare, dict) or "error" in compare:
-        print("  ABORT: Cannot inspect upstream diff safely.")
+    compare_summary, compare_error = _safe_compare_payload(gh_api(compare_endpoint))
+    if compare_error:
+        print(f"  ABORT: {compare_error}")
         return ABORT
 
-    total_deletions = parse_nonnegative_int(compare.get("total_deletions", 0) or 0)
-    if total_deletions is None:
-        print("  ABORT: Compare response deletion count is malformed.")
-        return ABORT
-
-    files = compare.get("files", [])
-    if not isinstance(files, list):
-        print("  ABORT: Compare response files payload is malformed.")
-        return ABORT
-
-    deleted_files = []
-    for item in files:
-        if not isinstance(item, dict):
-            print("  ABORT: Compare response file entry is malformed.")
-            return ABORT
-        if item.get("status") == "removed":
-            filename = item.get("filename")
-            if not isinstance(filename, str) or not filename.strip():
-                print("  ABORT: Compare response removed filename is malformed.")
-                return ABORT
-            deleted_files.append(filename)
+    total_deletions = compare_summary["total_deletions"]
+    deleted_files = compare_summary["deleted_files"]
     deletion_limit = 5 + (fork_count // 10)
 
     print(f"  Deletions: {total_deletions} (limit: {deletion_limit})")
     if total_deletions > deletion_limit:
-        print("  *** SAFETY ABORT ***")
-        print("  Deletion volume is too large for a safe sync.")
+        _print_safety_abort(("Deletion volume is too large for a safe sync.",))
         return ABORT
 
     critical_deleted = [
@@ -724,8 +826,7 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
         }
     ]
     if critical_deleted:
-        print("  *** SAFETY ABORT ***")
-        print("  Critical path deletions detected:")
+        _print_safety_abort(("Critical path deletions detected:",))
         for path in critical_deleted:
             print(f"    - {path}")
         return ABORT
@@ -1332,10 +1433,9 @@ def _build_verify_releases_row(fork):
         latest_upstream,
         latest_fork,
     )
-    row["old_stable_release_asset_count"] = sum(
-        _asset_count(release)
-        for release in fork_stable
-        if release.get("tag_name") != latest_tag
+    row["old_stable_release_asset_count"] = _old_stable_required_asset_count(
+        fork_releases,
+        latest_tag,
     )
 
     row["next_action"] = _release_retention_next_action(
@@ -1455,49 +1555,37 @@ def _sync_latest_release_assets(fork, row):
         print(f"  Latest stable release already has required assets: {tag}")
         return True
 
+    if "latest.json" in missing_assets:
+        for asset_name in _required_release_asset_names(latest_upstream):
+            lowered = asset_name.lower()
+            if lowered in {"sha256sums", "sha256sums.txt"} and asset_name not in missing_assets:
+                missing_assets.append(asset_name)
+
     with tempfile.TemporaryDirectory() as temp_dir:
-        for asset_name in missing_assets:
-            result = _run_gh_command([
-                "release",
-                "download",
-                tag,
-                "-R",
-                upstream,
-                "-D",
-                temp_dir,
-                "-p",
-                asset_name,
-                "--clobber",
-            ])
-            if result.returncode != 0:
-                print(f"  FAIL: {result.stderr.strip()[:200] or 'cannot download release asset'}")
-                return False
+        download_paths, download_error = _download_missing_release_assets(
+            upstream, tag, missing_assets, temp_dir,
+        )
+        if download_error:
+            print(f"  FAIL: {download_error}")
+            return False
 
         latest_json_path = os.path.join(temp_dir, "latest.json")
-        if os.path.isfile(latest_json_path):
-            with open(latest_json_path, "r", encoding="utf-8") as handle:
-                latest_json_text = handle.read()
-            upstream_prefix = f"https://github.com/{upstream}/releases/download/{tag}/"
-            fork_prefix = f"https://github.com/{full_name}/releases/download/{tag}/"
-            with open(latest_json_path, "w", encoding="utf-8") as handle:
-                handle.write(latest_json_text.replace(upstream_prefix, fork_prefix))
+        if _rewrite_latest_json(latest_json_path, upstream, full_name, tag):
+            if latest_json_path not in download_paths:
+                download_paths.append(latest_json_path)
 
         sha_sums_path = os.path.join(temp_dir, "SHA256SUMS.txt")
-        if os.path.isfile(sha_sums_path) and os.path.isfile(latest_json_path):
-            with open(latest_json_path, "rb") as handle:
-                latest_hash = hashlib.sha256(handle.read()).hexdigest()
-            updated_lines = []
-            with open(sha_sums_path, "r", encoding="utf-8") as handle:
-                for line in handle.read().splitlines():
-                    if line.strip().endswith("latest.json"):
-                        filename = line.split()[-1]
-                        updated_lines.append(f"{latest_hash}  {filename}")
-                    else:
-                        updated_lines.append(line)
-            with open(sha_sums_path, "w", encoding="utf-8") as handle:
-                handle.write("\n".join(updated_lines) + "\n")
+        refreshed, refresh_error = _refresh_sha256_sums_for_latest_json(
+            sha_sums_path,
+            latest_json_path,
+        )
+        if not refreshed:
+            print(f"  FAIL: {refresh_error}")
+            return False
+        if os.path.isfile(sha_sums_path) and sha_sums_path not in download_paths:
+            download_paths.append(sha_sums_path)
 
-        upload_paths = [os.path.join(temp_dir, asset_name) for asset_name in missing_assets]
+        upload_paths = download_paths
         result = _run_gh_command([
             "release",
             "upload",
@@ -1706,18 +1794,6 @@ def _verify_schedule_readiness(forks):
             summary["ready"] += 1
 
     return rows, summary
-
-
-def _mode_name(add_mode, verify_schedule, verify_releases=False):
-    """Return the machine-readable execution mode name."""
-    if verify_schedule:
-        return MODE_VERIFY_SCHEDULE
-    if verify_releases:
-        return MODE_VERIFY_RELEASES
-    if add_mode:
-        return MODE_ADD_WORKFLOW
-    return MODE_SYNC
-
 
 def _mode_name(add_mode, verify_schedule, verify_releases=False, sync_releases=False):
     """Return the machine-readable execution mode name."""
