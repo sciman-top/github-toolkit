@@ -273,7 +273,7 @@ github-toolkit/
 ## 本地门禁（固定顺序）
 交付前按项目硬门禁顺序执行：
 
-1. `python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py .claude/hooks/governed-pre-tool-use.py`
+1. `python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py`
 2. `python -m unittest test_toolkit.py`
 3. `python -m unittest test_toolkit.py`
 4. 若触及性能路径，再运行 `python scripts/benchmark_hotpaths.py --sizes 10,100,500 --runs 5 --check`

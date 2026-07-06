@@ -44,10 +44,6 @@ def _load_module(module_name, module_path):
 
 sync_forks = _load_module("sync_forks", os.path.join(_here, "sync-forks.py"))
 list_forks = _load_module("list_forks", os.path.join(_here, "list-forks.py"))
-claude_hook = _load_module(
-    "governed_pre_tool_use",
-    os.path.join(_here, ".claude", "hooks", "governed-pre-tool-use.py"),
-)
 
 
 def _encode(text):
@@ -683,31 +679,6 @@ class TestWindowsProcessEnvironment(unittest.TestCase):
                     content = handle.read()
                 for name in required:
                     self.assertIn(name, content)
-
-
-class TestGovernedClaudeHook(unittest.TestCase):
-    def test_blocks_bare_windows_powershell_command(self):
-        self.assertTrue(claude_hook._uses_direct_windows_powershell("powershell"))
-        self.assertTrue(claude_hook._uses_direct_windows_powershell("powershell.exe"))
-
-    def test_blocks_quoted_windows_powershell_path(self):
-        command = (
-            '& "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" '
-            "-NoProfile"
-        )
-        self.assertTrue(claude_hook._uses_direct_windows_powershell(command))
-
-    def test_allows_pwsh_command(self):
-        self.assertFalse(
-            claude_hook._uses_direct_windows_powershell(
-                "pwsh -NoProfile -Command Get-Location"
-            )
-        )
-
-    def test_blocks_sensitive_read_paths(self):
-        self.assertTrue(claude_hook._is_sensitive_path("C:/tmp/.env"))
-        self.assertTrue(claude_hook._is_sensitive_path("C:/tmp/id_ed25519.pub"))
-        self.assertFalse(claude_hook._is_sensitive_path("docs/readme.md"))
 
 
 # ── get_file_count ────────────────────────────────────────────

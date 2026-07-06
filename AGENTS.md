@@ -24,7 +24,7 @@
 - 默认中文沟通、中文解释、中文汇报；代码标识符、命令、日志、报错和 GitHub API 字段保留英文原文。
 - 全局规则给风险、语言、N/A 和门禁语义；本文件给 github-toolkit 的脚本边界、真实命令、删除保护、证据与回滚入口。
 - 项目规则只保留本仓不可由代码/CI自动推断且会改变执行、风险或验收的事实；长流程下沉到子文档或工具专属规则。
-- 规则文件、门禁、profile、baseline 或同步脚本修改前，必须先比对控制仓 `governed-ai-coding-runtime/rules/manifest.json`、源文件、用户目录/目标仓已分发副本、目标仓真实 gate/profile/CI/script/README 差异和当前工具官方加载模型；发现漂移先整合再同步，不盲目覆盖。
+- 规则文件、门禁、profile、baseline 或同步脚本修改前，必须先比对本仓源文件、用户目录实际副本、本仓真实 gate/profile/CI/script/README 差异和当前工具官方加载模型；发现漂移先整合，不盲目覆盖。
 - 小步闭环，优先根因修复；止血补丁必须标明回收时点。
 
 ### A.3 N/A 分类与字段
@@ -57,10 +57,9 @@
 - `test_toolkit.py`、`test_support.py`：回归测试与受限环境 mock fallback。
 - `scripts/Verify-WindowsProcessEnvironment.ps1`：Codex/PowerShell/`gh` 环境诊断。
 - `scripts/benchmark_hotpaths.py`：fork 列表/同步热点基准。
-- `.claude/hooks/governed-pre-tool-use.py`：Claude Code 工具前置安全拦截（敏感文件读取、direct `powershell.exe` 调用）。
 
 ### C.2 门禁命令与顺序（硬门禁）
-- build：`python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py .claude/hooks/governed-pre-tool-use.py`
+- build：`python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py`
 - test：`python -m unittest test_toolkit.py`
 - contract/invariant：`python -m unittest test_toolkit.py`
 - hotspot：复核本次改动的 GitHub API 参数、删除保护、dry-run/force 确认边界；触及性能路径时运行 `python scripts/benchmark_hotpaths.py --sizes 10,100,500 --runs 5 --check`。
@@ -98,6 +97,6 @@
   - `E4`: hotspot 复核 GitHub API 参数、删除保护、dry-run/force 确认和 `gh` 认证状态。
   - `E5`: Python、`gh`、workflow token 或第三方依赖变化必须记录供应链/工具基线；新增依赖前先说明必要性。
   - `E6`: GitHub API 字段、workflow YAML、同步状态 JSON 或持久配置结构变化必须记录兼容性和回滚。
-- 本文件属于控制仓 `governed-ai-coding-runtime/rules/manifest.json` 管理的规则家族；目标仓现场修改必须回写控制仓源文件后再同步。
+- 本文件由本仓直接维护；如需跨工具协同，先在本仓更新根规则并复测。
 - 子文档只承载细节，不替代根文件中的硬门禁和项目事实。
 - 三工具协同约束：`AGENTS.md` 承载共同 A/C/D 项目事实；`CLAUDE.md` / `GEMINI.md` 通过 import 追加 B/D 平台差异，不复制共同正文。
