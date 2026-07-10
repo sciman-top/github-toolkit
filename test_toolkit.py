@@ -947,7 +947,7 @@ class TestSyncNowResult(unittest.TestCase):
     @patch.object(
         sync_forks,
         "SELF_USE_SOURCE_REPO_SET",
-        {"sciman-top/cockpit-tools-local"},
+        {"example/self-use-fork"},
     )
     @patch.object(sync_forks, "gh_api")
     @patch.object(sync_forks, "safety_check")
@@ -956,9 +956,9 @@ class TestSyncNowResult(unittest.TestCase):
     ):
         with contextlib.redirect_stdout(io.StringIO()) as captured:
             result = sync_forks._sync_now_result(
-                "sciman-top/cockpit-tools-local",
+                "example/self-use-fork",
                 "main",
-                "jlcodes99/cockpit-tools",
+                "upstream/example",
                 "main",
             )
 
@@ -970,7 +970,7 @@ class TestSyncNowResult(unittest.TestCase):
     @patch.object(
         sync_forks,
         "MIRROR_ONLY_SOURCE_REPO_SET",
-        {"sciman-top/cockpit-tools-local"},
+        {"example/mirror-fork"},
     )
     @patch.object(sync_forks, "gh_api")
     @patch.object(sync_forks, "safety_check")
@@ -984,9 +984,9 @@ class TestSyncNowResult(unittest.TestCase):
 
         with contextlib.redirect_stdout(io.StringIO()) as captured:
             result = sync_forks._sync_now_result(
-                "sciman-top/cockpit-tools-local",
+                "example/mirror-fork",
                 "mirror/upstream-main",
-                "jlcodes99/cockpit-tools",
+                "upstream/example",
                 "main",
             )
 
@@ -995,7 +995,7 @@ class TestSyncNowResult(unittest.TestCase):
         self.assertEqual(len(mock_api.call_args_list), 1)
         self.assertEqual(
             mock_api.call_args_list[0].args[0],
-            "repos/sciman-top/cockpit-tools-local/merge-upstream",
+            "repos/example/mirror-fork/merge-upstream",
         )
 
     @patch.object(sync_forks, "gh_api")
@@ -1048,8 +1048,8 @@ class TestSyncReleasesResult(unittest.TestCase):
 
         with contextlib.redirect_stdout(io.StringIO()) as captured:
             result = sync_forks._sync_releases_result({
-                "name": "cockpit-tools-local",
-                "full_name": "sciman-top/cockpit-tools-local",
+                "name": "self-use-fork",
+                "full_name": "example/self-use-fork",
                 "branch": "mirror/upstream-main",
                 "parent": "jlcodes99/cockpit-tools",
                 "parent_branch": "main",
@@ -2402,14 +2402,14 @@ class TestSyncForksHelpers(unittest.TestCase):
     def test_cockpit_source_update_policy_follows_upstream_default_branch(self):
         self.assertEqual(
             sync_forks._source_update_policy(
-                "sciman-top/cockpit-tools-local",
+                "sciman-top/cockpit-tools",
                 "main",
             ),
             "upstream_default_branch",
         )
         self.assertEqual(
             sync_forks._source_update_policy(
-                "sciman-top/cockpit-tools-local",
+                "sciman-top/cockpit-tools",
                 "mirror/upstream-main",
             ),
             "upstream_default_branch",
@@ -2423,7 +2423,7 @@ class TestSyncForksHelpers(unittest.TestCase):
         )
         self.assertEqual(
             sync_forks._source_update_policy(
-                "sciman-top/cockpit-tools-local",
+                "sciman-top/cockpit-tools",
                 None,
             ),
             "upstream_default_branch",
@@ -2809,13 +2809,13 @@ class TestSyncForksHelpers(unittest.TestCase):
     @patch.object(
         sync_forks,
         "SELF_USE_RELEASE_REPO_SET",
-        {"sciman-top/cockpit-tools-local"},
+        {"example/self-use-fork"},
     )
     @patch.object(sync_forks, "gh_api")
     def test_self_use_release_policy_ignores_upstream_release_mirror(self, mock_api):
         forks = [{
-            "name": "cockpit-tools-local",
-            "full_name": "sciman-top/cockpit-tools-local",
+            "name": "self-use-fork",
+            "full_name": "example/self-use-fork",
             "branch": "main",
             "parent": "jlcodes99/cockpit-tools",
             "parent_branch": "main",
@@ -2824,7 +2824,7 @@ class TestSyncForksHelpers(unittest.TestCase):
             "tag_name": "v0.23.9-local.1",
             "draft": False,
             "prerelease": False,
-            "body": "Cockpit Tools Local self-use build",
+            "body": "Example self-use build",
             "assets": [{"name": "Cockpit.Tools.Local_0.23.9_x64-setup.exe"}],
         }
         mock_api.return_value = [local_release]
@@ -2840,13 +2840,13 @@ class TestSyncForksHelpers(unittest.TestCase):
     @patch.object(
         sync_forks,
         "SELF_USE_RELEASE_REPO_SET",
-        {"sciman-top/cockpit-tools-local"},
+        {"example/self-use-fork"},
     )
     @patch.object(sync_forks, "gh_api")
     def test_self_use_release_policy_flags_legacy_upstream_mirror_assets(self, mock_api):
         forks = [{
-            "name": "cockpit-tools-local",
-            "full_name": "sciman-top/cockpit-tools-local",
+            "name": "self-use-fork",
+            "full_name": "example/self-use-fork",
             "branch": "main",
             "parent": "jlcodes99/cockpit-tools",
             "parent_branch": "main",

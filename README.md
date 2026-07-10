@@ -28,7 +28,7 @@ Fork 仓库自动同步与 release retention 管理工具集，带安全防护�
 | fork | 默认同步分支 | source 策略 | release 策略 | 当前状态 |
 |------|--------------|-------------|--------------|----------|
 | `sciman-top/claude-dashboard` | `main` | `upstream_default_branch` | `source_only_release_notes` | schedule / release 均 `next_action=none` |
-| `sciman-top/cockpit-tools-local` | `main` | `upstream_default_branch` | `latest_stable_assets_only` | 仅保留上游源码，schedule / release 均 `next_action=none` |
+| `sciman-top/cockpit-tools` | `main` | `upstream_default_branch` | `latest_stable_assets_only` | 仅保留上游源码，schedule / release 均 `next_action=none` |
 | `sciman-top/v2ray-agent` | `master` | `upstream_default_branch` | `source_only_release_notes` | schedule / release 均 `next_action=none` |
 
 这个快照会随远端 GitHub 状态变化漂移；需要最新结果时，直接重跑上面的三条命令。
@@ -113,13 +113,13 @@ fork 范围不是静态名单，而是每次根据已认证账号的 GitHub `use
 `--verify-schedule` 和 `--verify-releases` 都是只读门禁：当发现 workflow 漂移、secret 缺失、schedule 不健康或 release 需要收敛时，会按 safety exit code `3` 退出，并通过 `next_action` 指出下一步；这不是脚本崩溃。
 
 ### 5. Cockpit Tools 上游直同步策略
-`sciman-top/cockpit-tools-local` 不再保留自用版代码或 mirror-only 分支，远端默认分支统一为 `main`，内容跟随 `jlcodes99/cockpit-tools:main`。
+`sciman-top/cockpit-tools` 不保留自用版代码或 mirror-only 分支，远端默认分支为 `main`，内容跟随 `jlcodes99/cockpit-tools:main`。
 
 当前策略：
 
 | fork | 源码同步策略 | 原因 |
 |------|--------------|------|
-| `sciman-top/cockpit-tools-local` | `upstream_default_branch` | `main` 直接跟随上游默认分支，不保留自用版代码 |
+| `sciman-top/cockpit-tools` | `upstream_default_branch` | `main` 直接跟随上游默认分支，不保留自用版代码 |
 | 其他 fork | `upstream_default_branch` | 源码跟随上游默认分支获取修复 |
 
 `sync-forks.py` 和生成的 `sync-fork.yml` 每周对 `main` 执行安全检查与 `merge-upstream`，真实同步前维护移动恢复点 `backup/pre-sync`。仓库不再使用 `mirror/upstream-main`，也不再依赖本地自用分支维护脚本。
@@ -127,7 +127,7 @@ fork 范围不是静态名单，而是每次根据已认证账号的 GitHub `use
 统一恢复点规则：`upstream_default_branch` 仓库保留一个移动的 `backup/pre-sync`，用于真实默认分支同步回滚；未来若重新启用 mirror-only 策略，则按镜像分支旧 SHA、新 SHA 和回滚命令留痕。
 
 ### 6. Release 策略
-`sciman-top/cockpit-tools-local` 当前使用 `latest_stable_assets_only`：不再创建自用版 release；每周 release retention 跟随上游最新稳定版，保留其安装、签名和校验资产。
+`sciman-top/cockpit-tools` 当前使用 `latest_stable_assets_only`：不创建自用版 release；每周 release retention 跟随上游最新稳定版，保留其安装、签名和校验资产。
 
 其他需要保留上游安装包的 fork 仍可使用 `latest_stable_assets_only`：
 
@@ -140,7 +140,7 @@ fork 范围不是静态名单，而是每次根据已认证账号的 GitHub `use
 
 ```powershell
 python sync-forks.py --verify-releases --json
-python sync-forks.py --verify-releases cockpit-tools-local --json
+python sync-forks.py --verify-releases cockpit-tools --json
 ```
 
 手动收敛命令：
@@ -158,7 +158,7 @@ JSON 输出中 `next_action=prune_old_stable_release_assets` 表示旧稳定版�
 `--sync-releases` 是执行器，只会自动处理 `latest_stable_assets_only`：
 
 - `source_only_release_notes`：跳过，不写远端
-- `self_use_local_releases`：跳过，不自动更新 `cockpit-tools-local` 自用版 weekly release
+- `self_use_local_releases`：预留策略，跳过自动 release 更新
 - `latest_stable_assets_only`：按需创建最新稳定版 release、补齐缺失安装/签名/校验资产、清理旧稳定版安装资产
 
 生成到 fork 的 weekly `sync-fork.yml` 现在也会在源码同步后执行同一套 release retention 收敛逻辑，因此通用稳定版镜像不再只依赖人工补跑。
