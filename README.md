@@ -10,7 +10,7 @@ Fork 仓库自动同步与 release retention 管理工具集，带安全防护�
 - 按策略收敛 fork release 资产保留状态
 - 在同步前做安全检查，避免上游仓库异常时把 fork 一起带崩
 
-## 当前状态快照（2026-06-13 实测）
+## 当前状态快照（2026-07-10 实测）
 以下快照来自：
 
 - `python list-forks.py --json`
@@ -21,14 +21,14 @@ Fork 仓库自动同步与 release retention 管理工具集，带安全防护�
 
 - 认证方式：`gh auth login`
 - 已认证账号：`sciman-top`
-- 仓库发现：`repo_count=9`，其中 fork `3`
+- 仓库发现：`repo_count=14`，其中 fork `3`
 - schedule readiness：`ready 3/3`
 - release retention readiness：`ready 3/3`
 
 | fork | 默认同步分支 | source 策略 | release 策略 | 当前状态 |
 |------|--------------|-------------|--------------|----------|
 | `sciman-top/claude-dashboard` | `main` | `upstream_default_branch` | `source_only_release_notes` | schedule / release 均 `next_action=none` |
-| `sciman-top/cockpit-tools-local` | `mirror/upstream-main` | `mirror_upstream_main` | `self_use_local_releases` | schedule / release 均 `next_action=none` |
+| `sciman-top/cockpit-tools-local` | `main` | `upstream_default_branch` | `latest_stable_assets_only` | 仅保留上游源码，schedule / release 均 `next_action=none` |
 | `sciman-top/v2ray-agent` | `master` | `upstream_default_branch` | `source_only_release_notes` | schedule / release 均 `next_action=none` |
 
 这个快照会随远端 GitHub 状态变化漂移；需要最新结果时，直接重跑上面的三条命令。
@@ -42,7 +42,6 @@ Fork 仓库自动同步与 release retention 管理工具集，带安全防护�
 | `list-forks.py` | 查看所有 fork 和同步状态，支持 `--json` |
 | `gh_utils.py` | 公共 GitHub 辅助逻辑 |
 | `scripts/Verify-WindowsProcessEnvironment.ps1` | 诊断 Codex/PowerShell 进程环境与 `gh` 可用性 |
-| `scripts/Update-CockpitSelfUseFork.ps1` | 为 `cockpit-tools-local` 的本地自用主线创建隔离 review worktree，并吸收 `upstream/main` |
 | `scripts/benchmark_hotpaths.py` | 运行无网络热路径基准与阈值检查 |
 
 ## 安全机制
@@ -113,39 +112,22 @@ python sync-forks.py --json --sync-releases --dry-run
 fork 范围不是静态名单，而是每次根据已认证账号的 GitHub `user/repos` 实时发现；新增或删除 fork 后，下次执行会自动收敛。
 `--verify-schedule` 和 `--verify-releases` 都是只读门禁：当发现 workflow 漂移、secret 缺失、schedule 不健康或 release 需要收敛时，会按 safety exit code `3` 退出，并通过 `next_action` 指出下一步；这不是脚本崩溃。
 
-### 5. Cockpit Tools Local 远端 mirror 策略
-默认源码同步仍跟随上游默认分支；只有 fork 需要把远端默认分支收敛成上游镜像，同时把本机自用主线保留在本地时，才进入 mirror-only source。
+### 5. Cockpit Tools 上游直同步策略
+`sciman-top/cockpit-tools-local` 不再保留自用版代码或 mirror-only 分支，远端默认分支统一为 `main`，内容跟随 `jlcodes99/cockpit-tools:main`。
 
 当前策略：
 
 | fork | 源码同步策略 | 原因 |
 |------|--------------|------|
-| `sciman-top/cockpit-tools-local` | `mirror_upstream_main` | 远端只保留 `mirror/upstream-main` 作为每周自动同步入口；本机自用 `main` 留在本地 worktree 中手动吸收上游 |
-| 其他 fork | `upstream_default_branch` | 当前 release 无安装资产，源码跟随默认分支更适合获取修复 |
+| `sciman-top/cockpit-tools-local` | `upstream_default_branch` | `main` 直接跟随上游默认分支，不保留自用版代码 |
+| 其他 fork | `upstream_default_branch` | 源码跟随上游默认分支获取修复 |
 
-mirror-only source 仓库在本地 `sync-forks.py` 和生成的 `sync-fork.yml` 中会继续执行每周 `merge-upstream`，但不会创建或刷新 `backup/pre-sync`。`sciman-top/cockpit-tools-local` 的远端长期源码入口只保留 `mirror/upstream-main`；本机自用主线通过本地 checkout 的 `main` + `upstream/main` 维护，不再依赖远端 `main`。release 改为自用版构建产物，不再镜像官方安装资产。其他未来需要安装包镜像的 fork 仍可使用通用 release 镜像检查。
+`sync-forks.py` 和生成的 `sync-fork.yml` 每周对 `main` 执行安全检查与 `merge-upstream`，真实同步前维护移动恢复点 `backup/pre-sync`。仓库不再使用 `mirror/upstream-main`，也不再依赖本地自用分支维护脚本。
 
-统一恢复点规则：`upstream_default_branch` 仓库保留一个移动的 `backup/pre-sync`，用于真实默认分支同步回滚；`mirror_upstream_main` 仓库不长期保留 `backup/*`，只记录镜像分支旧 SHA、新 SHA 和回滚命令；本地自用吸收上游时另建 `backup/selfuse-pre-upstream-sync-<timestamp>` 作为本地恢复点。
-
-### 5.1 Cockpit Tools 自用分支更新
-`sciman-top/cockpit-tools-local` 的本地 `main` 是自用源码主线；远端默认分支改为 `mirror/upstream-main` 仅承载每周自动镜像。定时任务不会自动改写本地自用主线，策略是“保留自用特性，在本地隔离 worktree 中吸收官方最新版”。固定入口：
-
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/Update-CockpitSelfUseFork.ps1 -PlanOnly
-pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/Update-CockpitSelfUseFork.ps1
-pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/Update-CockpitSelfUseFork.ps1 -InstallDeps -RunBuild -Push
-```
-
-脚本默认操作 `D:\CODE\external\Cockpit-Tools-Local`，其中 `origin` 指向 `sciman-top/cockpit-tools-local`，`upstream` 指向官方 `jlcodes99/cockpit-tools`。更新时刷新官方 `upstream/main`，从本地 `main` 创建 `codex/upstream-sync-v<upstream>-<timestamp>` review 分支和 sibling worktree，再执行 `git merge --no-ff upstream/main`。遇到冲突会停止在 review worktree，不会自动覆盖自用 `main`；冲突处理原则是保留明确的自用能力（例如 Cockpit API Service、单号池、投影链和本机快捷入口修复），同时接入官方兼容的新功能、修复和依赖更新。`-Push` 只推送 review 分支，供远端 checks/备份使用；不依赖远端 `main` 作为长期分支。
-
-Cockpit 自用版的版本号按“官方基线 + 本地后缀”记录，例如官方基线 `v0.24.9` 吸收完成后发布 `0.24.9-local.1`。仅本地修复递增后缀；下一次吸收官方新基线后重置为 `<upstream>-local.1`。
+统一恢复点规则：`upstream_default_branch` 仓库保留一个移动的 `backup/pre-sync`，用于真实默认分支同步回滚；未来若重新启用 mirror-only 策略，则按镜像分支旧 SHA、新 SHA 和回滚命令留痕。
 
 ### 6. Release 策略
-`sciman-top/cockpit-tools-local` 使用 `self_use_local_releases`：
-
-- Releases 只发布 Cockpit Tools Local 自用版构建产物。
-- 官方稳定版安装包不再镜像到 `cockpit-tools-local`。
-- 历史官方镜像 release 若仍带安装资产，`verify-releases` 会返回 `next_action=remove_upstream_mirror_release_assets`。
+`sciman-top/cockpit-tools-local` 当前使用 `latest_stable_assets_only`：不再创建自用版 release；每周 release retention 跟随上游最新稳定版，保留其安装、签名和校验资产。
 
 其他需要保留上游安装包的 fork 仍可使用 `latest_stable_assets_only`：
 
@@ -171,7 +153,7 @@ python sync-forks.py --sync-releases repo-name
 
 JSON 输出中 `next_action=prune_old_stable_release_assets` 表示旧稳定版仍带资产，需要删除旧资产但保留 release 文案；`next_action=mirror_latest_stable_release` 或 `mirror_latest_stable_assets` 表示最新稳定版还未完整保留安装/打包资产。`mirror_latest_stable_assets` 不只表示“完全没资产”，也包括 `latest.json`、`SHA256SUMS.txt`、签名/校验文件等支持资产缺失。
 
-`--verify-releases` 是只读门禁，不会自动创建、上传或删除 release 资产。只要发现需要镜像最新稳定版、清理旧稳定版资产，或清理 `cockpit-tools-local` 上的历史官方镜像资产，命令会以 safety exit code `3` 退出；这不是脚本崩溃，而是阻断信号，表示需要执行一次中风险远端 release 维护后再复测。
+`--verify-releases` 是只读门禁，不会自动创建、上传或删除 release 资产。只要发现需要镜像最新稳定版或清理旧稳定版资产，命令会以 safety exit code `3` 退出；这不是脚本崩溃，而是阻断信号，表示需要执行一次中风险远端 release 维护后再复测。
 
 `--sync-releases` 是执行器，只会自动处理 `latest_stable_assets_only`：
 

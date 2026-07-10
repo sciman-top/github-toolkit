@@ -944,6 +944,11 @@ class TestSyncNowResult(unittest.TestCase):
         self.assertEqual(mock_api.call_args_list[1].args[0], "repos/me/fork/git/refs/heads/backup/pre-sync")
         self.assertEqual(mock_api.call_args_list[2].args[0], "repos/me/fork/merge-upstream")
 
+    @patch.object(
+        sync_forks,
+        "SELF_USE_SOURCE_REPO_SET",
+        {"sciman-top/cockpit-tools-local"},
+    )
     @patch.object(sync_forks, "gh_api")
     @patch.object(sync_forks, "safety_check")
     def test_self_use_policy_repo_skips_default_branch_sync(
@@ -962,6 +967,11 @@ class TestSyncNowResult(unittest.TestCase):
         mock_safety.assert_not_called()
         mock_api.assert_not_called()
 
+    @patch.object(
+        sync_forks,
+        "MIRROR_ONLY_SOURCE_REPO_SET",
+        {"sciman-top/cockpit-tools-local"},
+    )
     @patch.object(sync_forks, "gh_api")
     @patch.object(sync_forks, "safety_check")
     def test_mirror_policy_repo_skips_restore_point_but_merges(
@@ -2389,20 +2399,20 @@ class TestSyncForksHelpers(unittest.TestCase):
             sync_forks.MODE_SYNC_RELEASES,
         )
 
-    def test_source_update_policy_uses_branch_specific_repo_policy(self):
+    def test_cockpit_source_update_policy_follows_upstream_default_branch(self):
         self.assertEqual(
             sync_forks._source_update_policy(
                 "sciman-top/cockpit-tools-local",
                 "main",
             ),
-            "self_use_main_manual_merge",
+            "upstream_default_branch",
         )
         self.assertEqual(
             sync_forks._source_update_policy(
                 "sciman-top/cockpit-tools-local",
                 "mirror/upstream-main",
             ),
-            "mirror_upstream_main",
+            "upstream_default_branch",
         )
         self.assertEqual(
             sync_forks._source_update_policy(
@@ -2416,7 +2426,7 @@ class TestSyncForksHelpers(unittest.TestCase):
                 "sciman-top/cockpit-tools-local",
                 None,
             ),
-            "self_use_main_manual_merge",
+            "upstream_default_branch",
         )
 
     def test_latest_workflow_run_normalizes_valid_payload(self):
@@ -2796,6 +2806,11 @@ class TestSyncForksHelpers(unittest.TestCase):
         self.assertEqual(rows[0]["old_stable_release_asset_count"], 0)
         self.assertEqual(summary["old_stable_assets_present"], 0)
 
+    @patch.object(
+        sync_forks,
+        "SELF_USE_RELEASE_REPO_SET",
+        {"sciman-top/cockpit-tools-local"},
+    )
     @patch.object(sync_forks, "gh_api")
     def test_self_use_release_policy_ignores_upstream_release_mirror(self, mock_api):
         forks = [{
@@ -2822,6 +2837,11 @@ class TestSyncForksHelpers(unittest.TestCase):
         self.assertEqual(summary["ready"], 1)
         self.assertEqual(summary["latest_stable_assets_required"], 0)
 
+    @patch.object(
+        sync_forks,
+        "SELF_USE_RELEASE_REPO_SET",
+        {"sciman-top/cockpit-tools-local"},
+    )
     @patch.object(sync_forks, "gh_api")
     def test_self_use_release_policy_flags_legacy_upstream_mirror_assets(self, mock_api):
         forks = [{

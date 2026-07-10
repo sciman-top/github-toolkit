@@ -30,6 +30,7 @@ import re
 import subprocess  # nosec B404
 import sys
 import tempfile
+from typing import Tuple
 
 from gh_utils import (
     AuthContextError,
@@ -87,20 +88,20 @@ VERIFY_RELEASE_SAFETY_SUMMARY_KEYS = (
 )
 FORCE_SYNC_ACK_ENV = "SYNC_FORKS_FORCE_ACK"
 FORCE_SYNC_ACK_VALUE = "I_UNDERSTAND"
-SELF_USE_SOURCE_REPOS = ("sciman-top/cockpit-tools-local",)
+SELF_USE_SOURCE_REPOS: Tuple[str, ...] = ()
 SELF_USE_SOURCE_REPOS_TEXT = ",".join(SELF_USE_SOURCE_REPOS)
 SELF_USE_SOURCE_REPO_SET = {
     repo.lower()
     for repo in SELF_USE_SOURCE_REPOS
 }
-MIRROR_ONLY_SOURCE_REPOS = ("sciman-top/cockpit-tools-local",)
+MIRROR_ONLY_SOURCE_REPOS: Tuple[str, ...] = ()
 MIRROR_ONLY_SOURCE_REPOS_TEXT = ",".join(MIRROR_ONLY_SOURCE_REPOS)
 MIRROR_ONLY_SOURCE_REPO_SET = {
     repo.lower()
     for repo in MIRROR_ONLY_SOURCE_REPOS
 }
 MIRROR_ONLY_SOURCE_BRANCH = "mirror/upstream-main"
-SELF_USE_RELEASE_REPOS = ("sciman-top/cockpit-tools-local",)
+SELF_USE_RELEASE_REPOS: Tuple[str, ...] = ()
 SELF_USE_RELEASE_REPO_SET = {
     repo.lower()
     for repo in SELF_USE_RELEASE_REPOS
