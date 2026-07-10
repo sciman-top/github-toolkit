@@ -22,6 +22,7 @@
 - release readiness：`ready=1/1`，`next_action=none`
 - 最新稳定版：`v1.1.4`，27 个资产完整保留
 - 源码状态：`behind_by=0`
+- rename 后 smoke：<https://github.com/sciman-top/cockpit-tools/actions/runs/29086354037>，success
 
 ## 回滚
 
