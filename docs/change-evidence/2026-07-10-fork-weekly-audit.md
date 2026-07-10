@@ -15,6 +15,7 @@
 2. 先记录旧 SHA `99f252280a8df5b086f0f64d12f222effe172609`，再将镜像分支对齐到上游 SHA `93d939b77055365933ec995ad5042c4e67601169`。
 3. 重新安装 workflow 后发现模板把嵌入 Python 的 `line.rstrip("\\n")` 渲染为跨行字符串，GitHub 将 YAML 判为无效并拒绝 `workflow_dispatch`。
 4. 修复 `sync-forks.py` 的转义并增加回归测试，随后按显式 force 确认重写 3 个 fork 的受管 `.github/workflows/sync-fork.yml`。
+5. 首次推送后的 CI 暴露既有 gate 漂移：已删除的 `.claude/hooks/governed-pre-tool-use.py` 仍在 compile 清单中；将 CI 对齐到项目现行 build 命令。
 
 ## 验证证据
 
