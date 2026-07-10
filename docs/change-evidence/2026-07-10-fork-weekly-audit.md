@@ -16,6 +16,7 @@
 3. 重新安装 workflow 后发现模板把嵌入 Python 的 `line.rstrip("\\n")` 渲染为跨行字符串，GitHub 将 YAML 判为无效并拒绝 `workflow_dispatch`。
 4. 修复 `sync-forks.py` 的转义并增加回归测试，随后按显式 force 确认重写 3 个 fork 的受管 `.github/workflows/sync-fork.yml`。
 5. 首次推送后的 CI 暴露既有 gate 漂移：已删除的 `.claude/hooks/governed-pre-tool-use.py` 仍在 compile 清单中；将 CI 对齐到项目现行 build 命令。
+6. 第二次 CI 暴露既有 Ruff `F841`：删除未使用且不参与行为的 `fork_stable` 局部变量。
 
 ## 验证证据
 

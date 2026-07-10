@@ -1413,7 +1413,6 @@ def _build_verify_releases_row(fork):
         return row
 
     upstream_stable = _stable_releases(upstream_releases)
-    fork_stable = _stable_releases(fork_releases)
     row["fork_release_count"] = len(fork_releases)
     if not upstream_stable:
         row["next_action"] = "none"
