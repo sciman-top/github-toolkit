@@ -1479,6 +1479,12 @@ class TestWorkflowContracts(unittest.TestCase):
         self.assertIn('"release", "upload"', workflow)
         self.assertIn('"release", "delete-asset"', workflow)
 
+    def test_generated_workflow_preserves_embedded_python_newline_escape(self):
+        workflow = sync_forks._render_workflow_template()
+
+        self.assertIn('stripped = line.rstrip("\\n")', workflow)
+        self.assertNotIn('stripped = line.rstrip("\n")', workflow)
+
     def test_generated_workflow_url_encodes_compare_refs(self):
         workflow = sync_forks._render_workflow_template()
 

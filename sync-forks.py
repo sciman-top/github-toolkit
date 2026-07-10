@@ -445,7 +445,7 @@ jobs:
                       latest_hash = hashlib.sha256(latest_json.read_bytes()).hexdigest()
                       updated = []
                       for line in sha_sums.read_text(encoding="utf-8").splitlines():
-                          stripped = line.rstrip("\n")
+                          stripped = line.rstrip("\\n")
                           if stripped.strip().endswith("latest.json"):
                               filename = stripped.split()[-1]
                               updated.append(f"{{latest_hash}}  {{filename}}")
