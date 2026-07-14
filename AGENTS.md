@@ -1,7 +1,7 @@
 # AGENTS.md - github-toolkit
 **项目契约**: 2.0
-**全局规则复核**: 9.55
-**最后更新**: 2026-07-10
+**全局规则复核**: 9.56
+**最后更新**: 2026-07-14
 
 ## 1. 当前落点与目标归宿
 - 当前落点：本仓是 Python GitHub fork/同步辅助工具，核心能力集中在 `gh_utils.py`、`sync-forks.py` 与 `list-forks.py`。
@@ -26,7 +26,7 @@
 - agent-rule contract CI：`.github/workflows/agent-rule-contract.yml` 只验证规则契约，不替代本仓产品门禁。
 - build：`python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py`
 - test：`python -m unittest test_toolkit.py`
-- contract/invariant：当前没有独立命令；`gate_na` 记录 `reason=现有合同与 test 共用同一 suite`、`alternative_verification=python -m unittest test_toolkit.py`、`evidence_link=README.md#本地门禁固定顺序`、`expires_at=next_executable_change`，不得把重复运行表述为独立证据。
+- contract/invariant：当前没有独立命令；`gate_na` 记录 `reason=现有合同与 test 共用同一 suite`、`alternative_verification=python -m unittest test_toolkit.py`、`evidence_link=README.md#本地门禁固定顺序`、`expires_at=next_executable_change`、`recovery_condition=建立独立合同命令并纳入门禁`，不得把重复运行表述为独立证据。
 - hotspot：触及性能路径运行 `python scripts/benchmark_hotpaths.py --sizes 10,100,500 --runs 5 --check`；其他切片复核 API 参数、删除保护与 dry-run/force 边界。
 - full static parity 追加 `python -m ruff check .` 与 `python -m mypy gh_utils.py list-forks.py sync-forks.py scripts/benchmark_hotpaths.py`。
 - 语法、测试、类型、删除保护或恢复点未收敛时阻断真实同步/发布。
