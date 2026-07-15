@@ -1,7 +1,7 @@
 # AGENTS.md - github-toolkit
 **项目契约**: 2.0
-**全局规则复核**: 9.56
-**最后更新**: 2026-07-14
+**全局规则复核**: 9.57
+**最后更新**: 2026-07-15
 
 ## 1. 当前落点与目标归宿
 - 当前落点：本仓是 Python GitHub fork/同步辅助工具，核心能力集中在 `gh_utils.py`、`sync-forks.py` 与 `list-forks.py`。
