@@ -1,41 +1,102 @@
-# AGENTS.md - github-toolkit
-**项目契约**: 2.0
-**全局规则复核**: 9.56
-**最后更新**: 2026-07-14
+# AGENTS.md — github-toolkit（共同项目规则 / Codex 直接读取）
+**项目**: github-toolkit
+**承接来源**: `GlobalUser/AGENTS.md v9.53`
+**适用范围**: 项目级（仓库根）
+**最后更新**: 2026-05-23
 
-## 1. 当前落点与目标归宿
-- 当前落点：本仓是 Python GitHub fork/同步辅助工具，核心能力集中在 `gh_utils.py`、`sync-forks.py` 与 `list-forks.py`。
-- 目标归宿：在明确 dry-run、删除保护、恢复点和认证边界下安全维护 fork/workflow，同步行为保持可审计、可回退。
-- 下一最小里程碑：完成当前脚本 slice，并以静态检查、回归、合同缺口说明与 hotspot 证据收口。
+## 1. 阅读指引
+- 本文件只写本仓事实、门禁命令、证据位置和回滚入口，不重写全局 `R/E` 语义。
+- 本文件是三工具共同项目规则主体；Codex 直接读取，Claude/Gemini 通过各自 wrapper 的 `AGENTS.md` import 承接并只追加平台差异。
+- 固定结构：本文件保持 `1 / A / B / C / D`；Claude/Gemini wrapper 保持 `1 / B / D`，并通过 import 承接本文件 `A/C/D`。
+- 裁决链：`运行事实/代码 > 项目级文件 > 全局文件 > 临时上下文`。
+- 自包含约束：执行规则以本文件正文为准，不依赖外部子文档或治理脚本作为前置条件。
+- 渐进披露边界：根文件保留本仓边界、门禁、阻断、证据和回滚；长 GitHub API 排障、批量同步样例和历史证据放入 `docs/`。
 
-## A. 仓库事实与模块边界
-- `gh_utils.py`：GitHub CLI/API、认证与同步保护；`sync-forks.py`：workflow/同步/dry-run/force；`list-forks.py`：状态输出。
-- `test_toolkit.py` 与 `test_support.py` 承载回归及受限环境 fallback；`scripts/benchmark_hotpaths.py` 承载合成热点基准。
-- 真实同步必须先 dry-run；`--force` 需要 `SYNC_FORKS_FORCE_ACK=I_UNDERSTAND`。
-- `upstream_default_branch` 仓保留移动恢复点 `backup/pre-sync`；stable-release/mirror-only 仓记录旧/新 SHA 与回滚命令，不长期创建 `backup/*`。
-- `GH_TOKEN`、`GITHUB_TOKEN` 与本机 `gh auth` 是认证输入，不得进入仓库、日志或证据正文。
+## A. 项目基线
+### A.1 事实边界
+- 本仓是 Python GitHub fork/tooling 辅助仓，核心脚本为 `gh_utils.py`、`sync-forks.py`、`list-forks.py`、`test_toolkit.py`、`test_support.py`。
+- 真实同步必须保留 `--dry-run` / 显式确认边界；`--force` 需要 `SYNC_FORKS_FORCE_ACK=I_UNDERSTAND`。
+- 同步保护包括 upstream 可达性、文件数量阈值、关键路径删除保护和条件化恢复点：`upstream_default_branch` 仓库保留一个移动 `backup/pre-sync`；`stable_release_only` / mirror-only 仓库不长期保留 `backup/*`。
+- `GH_TOKEN` / `GITHUB_TOKEN` / `gh auth login` 是认证输入；不得把真实 token 写入仓库文件、日志或证据正文。
 
-## B. 执行与风险边界
-- setup/auth 入口不计门禁；认证缺失时优先完成无写入静态/测试证据，不得为通过门禁伪造线上状态。
-- 任何真实默认分支、workflow 或 release 写操作属于中风险；执行前确认 dry-run、删除阈值、关键路径保护与恢复点。
-- 新增依赖、API 字段或同步模式前说明必要性、向后兼容与 rollback；无证据不扩成通用平台。
-- Windows 进程环境异常先运行 `scripts/Verify-WindowsProcessEnvironment.ps1`，不要直接归因于仓库逻辑。
+### A.2 执行锚点
+- 每次改动先声明：当前落点 -> 目标归宿 -> 验证方式。
+- 默认中文沟通、中文解释、中文汇报；代码标识符、命令、日志、报错和 GitHub API 字段保留英文原文。
+- 全局规则给风险、语言、N/A 和门禁语义；本文件给 github-toolkit 的脚本边界、真实命令、删除保护、证据与回滚入口。
+- 项目规则只保留本仓不可由代码/CI自动推断且会改变执行、风险或验收的事实；长流程下沉到子文档或工具专属规则。
+- 规则文件、门禁、profile、baseline 或同步脚本修改前，必须先比对本仓源文件、用户目录实际副本、本仓真实 gate/profile/CI/script/README 差异和当前工具官方加载模型；发现漂移先整合，不盲目覆盖。
+- 小步闭环，优先根因修复；止血补丁必须标明回收时点。
 
-## C. 门禁、证据与回滚
-- fixed order：`build -> test -> contract/invariant -> hotspot`。
-- agent-rule contract CI：`.github/workflows/agent-rule-contract.yml` 只验证规则契约，不替代本仓产品门禁。
+### A.3 N/A 分类与字段
+- `platform_na`：平台能力缺失、命令不存在、非交互限制或认证上下文不可用。
+- `gate_na`：门禁步骤客观不可执行（含脚本缺失、GitHub 认证不可用、纯文档/注释/排版改动）。
+- 两类 N/A 均必须记录：`reason`、`alternative_verification`、`evidence_link`、`expires_at`。
+- N/A 不得改变门禁顺序：`build -> test -> contract/invariant -> hotspot`。
+
+### A.4 触发式澄清协议
+- 默认执行：`direct_fix`（先修复、后验证）。
+- 触发条件：同一 `issue_id` 连续失败达到阈值（默认 `2`），或同步风险/用户期望持续冲突。
+- 一次最多 3 个澄清问题；确认后恢复 `direct_fix` 并清零失败计数。
+- 留痕字段：`issue_id`、`attempt_count`、`clarification_mode`、`clarification_questions`、`clarification_answers`。
+
+## B. Codex 平台差异
+- 用户目录：`~/.codex`（可由 `CODEX_HOME` 覆盖）。
+- 项目链从 Git root 到当前目录逐层加载；同层优先级：`AGENTS.override.md > AGENTS.md > configured fallback`。
+- `AGENTS.override.md` 仅用于短期排障，结论后必须清理并复测。
+- 诊断优先执行 `codex --version`、`codex --help`；`codex status` 非交互失败时按 `platform_na` 记录。
+- `AGENTS.md` 是上下文规则；确定性验证、权限或安全拦截应落到本仓门禁、hooks、CI 或管理脚本。
+- 未经用户在当前任务中明确确认，不得重启、停止、杀掉或自动拉起 `Codex App`、`codex`、`Claude Code`、`Claude Desktop`、`claude`；provider/auth/API 修复先做文件级状态、dry-run、连通性探针和证据记录，确需重启时先说明影响、会话历史可见性风险和回滚入口。
+- 命令审批、沙箱外执行和 allowlist 应优先写入 `.codex/rules/*.rules`、本仓脚本门禁或 CI；`prefix_rule()` 必须保持精确前缀并配 `match/not_match` 样例。
+- 替代命令仅用于补证据，不得改变本仓门禁顺序与阻断语义。
+
+## C. 项目差异（领域与技术）
+### C.1 模块职责
+- `gh_utils.py`：GitHub CLI/API、认证、同步保护与 Windows 环境补齐。
+- `sync-forks.py`：workflow 安装、手动同步、dry-run、force 确认与 JSON 输出。
+- `list-forks.py`：fork 枚举与同步状态输出。
+- `test_toolkit.py`、`test_support.py`：回归测试与受限环境 mock fallback。
+- `scripts/Verify-WindowsProcessEnvironment.ps1`：Codex/PowerShell/`gh` 环境诊断。
+- `scripts/benchmark_hotpaths.py`：fork 列表/同步热点基准。
+
+### C.2 门禁命令与顺序（硬门禁）
 - build：`python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py`
 - test：`python -m unittest test_toolkit.py`
-- contract/invariant：当前没有独立命令；`gate_na` 记录 `reason=现有合同与 test 共用同一 suite`、`alternative_verification=python -m unittest test_toolkit.py`、`evidence_link=README.md#本地门禁固定顺序`、`expires_at=next_executable_change`、`recovery_condition=建立独立合同命令并纳入门禁`，不得把重复运行表述为独立证据。
-- hotspot：触及性能路径运行 `python scripts/benchmark_hotpaths.py --sizes 10,100,500 --runs 5 --check`；其他切片复核 API 参数、删除保护与 dry-run/force 边界。
-- full static parity 追加 `python -m ruff check .` 与 `python -m mypy gh_utils.py list-forks.py sync-forks.py scripts/benchmark_hotpaths.py`。
-- 语法、测试、类型、删除保护或恢复点未收敛时阻断真实同步/发布。
-- 证据放入 `docs/change-evidence/`；记录风险、命令、exit code、是否有真实 GitHub 写入、旧/新 SHA 与回滚。
-- 回滚优先撤销本任务代码/规则；真实同步按仓型使用 `backup/pre-sync` 或记录的 SHA 恢复，不得影响无关 fork。
+- contract/invariant：`python -m unittest test_toolkit.py`
+- hotspot：复核本次改动的 GitHub API 参数、删除保护、dry-run/force 确认边界；触及性能路径时运行 `python scripts/benchmark_hotpaths.py --sizes 10,100,500 --runs 5 --check`。
+- fixed order：`build -> test -> contract/invariant -> hotspot`
 
-## D. Global Rule -> Repo Action
-- `R1-R5`：先定脚本/仓型/写入面与验证；先 dry-run 和小步测试，不做无证据平台化。
-- `R6`：C 章按序执行，并诚实记录独立 contract 缺口。
-- `R7`：保持 API、workflow、状态 JSON、删除保护与仓型恢复语义兼容。
-- `R8`：证据记录命令、写入状态、恢复点与回滚。
-- `E4`：测试/基准/认证状态承接健康；`E5`：Python、gh、action/token 变化记录供应链；`E6`：API/workflow/状态结构变化记录迁移、兼容和回滚。
+### C.3 失败分流与阻断
+- build 失败：阻断，先修语法、导入和脚本路径。
+- test 失败：阻断，先修回归失败再继续。
+- contract/invariant 失败：高风险阻断，禁止真实同步或发布。
+- hotspot 未收敛：阻断；涉及真实 GitHub 写操作时必须先 dry-run 并记录恢复入口。
+
+### C.4 证据与回滚
+- 证据目录：`docs/change-evidence/`（不存在则创建）。
+- 最低字段：规则 ID、风险等级、执行命令、关键输出、是否触发真实 GitHub 写操作、回滚动作。
+- 回滚优先使用 git 历史；真实默认分支同步变更还必须记录 `backup/pre-sync` 或等价恢复点。`stable_release_only` / mirror-only 仓库记录镜像分支旧 SHA、新 SHA 和回滚命令，不要求 `backup/pre-sync`。
+
+### C.5 CI 与本地入口
+- 本地门禁以 C.2 命令为准。
+- `setup.bat` 只负责本机 `gh` / 登录准备，不替代门禁。
+- Codex/PowerShell 环境异常先运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Verify-WindowsProcessEnvironment.ps1`。
+
+### C.6 Git 提交与推送边界
+- `整理提交全部` 的“全部”仅指：`本次任务相关 + 应被版本管理 + 通过 .gitignore 的文件`。
+- 默认不纳入：真实 token、临时日志、缓存、运行态探针、本机 `gh` 配置和敏感输出。
+- `push` 仅推送既有 commit 历史；文件筛选必须在 `git add/commit` 前完成。
+
+## D. 维护校验清单
+- 仅落地本仓事实，不复述全局规则正文。
+- 与全局职责互补，不重叠、不缺失。
+- 协同链完整：`规则 -> 落点 -> 命令 -> 证据 -> 回滚`。
+- 协同有效性抽查：仅凭全局 + 项目规则，必须能推出本仓当前落点、目标归宿、硬门禁、证据路径和回滚入口。
+- `Global Rule -> Repo Action`：
+  - `R6`: 本仓门禁命令是硬门禁；quick/fast 只能作为已声明的日常反馈切片，交付前仍按 full gate 或固定顺序收口。
+  - `R8`: 证据与回滚字段是最小留痕；缺字段必须按 N/A 口径说明。
+  - `E4`: hotspot 复核 GitHub API 参数、删除保护、dry-run/force 确认和 `gh` 认证状态。
+  - `E5`: Python、`gh`、workflow token 或第三方依赖变化必须记录供应链/工具基线；新增依赖前先说明必要性。
+  - `E6`: GitHub API 字段、workflow YAML、同步状态 JSON 或持久配置结构变化必须记录兼容性和回滚。
+- 本文件由本仓直接维护；如需跨工具协同，先在本仓更新根规则并复测。
+- 子文档只承载细节，不替代根文件中的硬门禁和项目事实。
+- 三工具协同约束：`AGENTS.md` 承载共同 A/C/D 项目事实；`CLAUDE.md` / `GEMINI.md` 通过 import 追加 B/D 平台差异，不复制共同正文。
