@@ -40,6 +40,4 @@ This change is documentation/policy only. Roll back by reverting the README / AG
 - `python -m unittest test_toolkit.py`: passed, 170 tests OK.
 - `python -m unittest test_toolkit.py` as contract/invariant gate: passed, 170 tests OK.
 - `python sync-forks.py --verify-schedule --json`: `ready 4/4`, `stable_source_only=1`.
-- `pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/sync-agent-rules.ps1 -Scope All -FailOnChange` in `D:\CODE\governed-ai-coding-runtime`: passed, `changed_count=0`.
 - `git diff --check` in `D:\CODE\github-toolkit`: passed; only LF/CRLF warnings for edited Markdown files.
-- `git diff --check` in `D:\CODE\governed-ai-coding-runtime`: passed; only LF/CRLF warning for the edited managed source rule file.
