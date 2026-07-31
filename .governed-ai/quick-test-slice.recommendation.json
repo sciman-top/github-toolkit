@@ -1,5 +1,0 @@
-{
-  "schema_version": "1.0",
-  "status": "skip",
-  "quick_test_reason": "Full test command is already a single deterministic unittest file; no materially faster representative slice was found."
-}
