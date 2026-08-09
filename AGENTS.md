@@ -1,6 +1,6 @@
 # AGENTS.md - github-toolkit
 **项目契约**: 2.0
-**全局规则复核**: 9.73
+**全局规则复核**: 9.75
 **最后更新**: 2026-08-08
 
 ## 1. 当前落点与目标归宿
@@ -40,7 +40,7 @@
 - 回滚只撤销本任务；真实同步按仓型用 `backup/pre-sync` 或记录的 SHA 恢复。
 
 ## D. Global Rule -> Repo Action
-- Git profile: baseline=`main`; upstream=`origin/main`; closeout=`push_after_full_gate`。
+- Git profile: baseline=`main`; upstream=`origin/main`; closeout=`proportional_focused_or_full_static`。
 - `R1`：先定脚本、目标仓型、GitHub 写入面与验证命令。
 - `R2`：先 dry-run 与受影响 unittest，再扩到完整 suite。
 - `R3`：临时 API/workflow 兼容写明回收时点和恢复点。
