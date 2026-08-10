@@ -10,7 +10,7 @@ Fork 仓库自动同步与 release retention 管理工具集，带安全防护�
 - 按策略收敛 fork release 资产保留状态
 - 在同步前做安全检查，避免上游仓库异常时把 fork 一起带崩
 
-## 当前状态快照（2026-07-10 实测）
+## 当前状态快照（2026-08-10 实测）
 以下快照来自：
 
 - `python list-forks.py --json`
@@ -21,14 +21,15 @@ Fork 仓库自动同步与 release retention 管理工具集，带安全防护�
 
 - 认证方式：`gh auth login`
 - 已认证账号：`sciman-top`
-- 仓库发现：`repo_count=14`，其中 fork `3`
-- schedule readiness：`ready 3/3`
-- release retention readiness：`ready 3/3`
+- 仓库发现：`repo_count=14`，其中 fork `4`
+- schedule readiness：`ready 4/4`
+- release retention readiness：`ready 4/4`
 
 | fork | 默认同步分支 | source 策略 | release 策略 | 当前状态 |
 |------|--------------|-------------|--------------|----------|
 | `sciman-top/claude-dashboard` | `main` | `upstream_default_branch` | `source_only_release_notes` | schedule / release 均 `next_action=none` |
 | `sciman-top/cockpit-tools` | `main` | `upstream_default_branch` | `latest_stable_assets_only` | 仅保留上游源码，schedule / release 均 `next_action=none` |
+| `sciman-top/gpt56_api_detector` | `main` | `upstream_default_branch` | `latest_stable_assets_only` | schedule / release 均 `next_action=none` |
 | `sciman-top/v2ray-agent` | `master` | `upstream_default_branch` | `source_only_release_notes` | schedule / release 均 `next_action=none` |
 
 这个快照会随远端 GitHub 状态变化漂移；需要最新结果时，直接重跑上面的三条命令。
@@ -79,7 +80,7 @@ python sync-forks.py --add-workflow repo-name
 python sync-forks.py --add-workflow --dry-run
 ```
 
-添加后，GitHub Actions 会在每周日 UTC 02:17，也就是北京时间 10:17 自动同步。
+添加后，GitHub Actions 会在每周五 UTC 13:00，也就是北京时间 21:00 自动同步。
 该时间刻意避开 GitHub Actions 整点高峰，降低 scheduled workflow 延迟或被丢弃的概率。
 
 ### 3. 手动同步

@@ -31,7 +31,7 @@ from urllib.parse import quote
 
 # ── Config ────────────────────────────────────────────────────
 DELETION_THRESHOLD = 0.5   # Abort sync if upstream < fork * this
-SYNC_CRON = "17 2 * * 0"  # Every Sunday 02:17 UTC
+SYNC_CRON = "0 13 * * 5"  # Every Friday 13:00 UTC / 21:00 China Standard Time
 FORK_DISCOVERY_ENDPOINT = "user/repos?affiliation=owner&visibility=all"
 API_TIMEOUT = 30           # Seconds per API call
 MAX_RETRIES = 2            # Retries on transient failures
