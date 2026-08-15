@@ -30,7 +30,6 @@ import re
 import subprocess  # nosec B404
 import sys
 import tempfile
-from typing import Tuple
 
 from gh_utils import (
     AuthContextError,
@@ -66,47 +65,19 @@ RESULT_SAFETY = "safety"
 RESULT_ERROR = "error"
 MODE_SYNC = "sync"
 MODE_ADD_WORKFLOW = "add-workflow"
-MODE_VERIFY_SCHEDULE = "verify-schedule"
 MODE_VERIFY_RELEASES = "verify-releases"
 MODE_SYNC_RELEASES = "sync-releases"
 MODE_OPTION_FLAGS = (
     ("add_mode", "--add-workflow"),
-    ("verify_schedule", "--verify-schedule"),
     ("verify_releases", "--verify-releases"),
     ("sync_releases", "--sync-releases"),
-)
-VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS = (
-    "missing_workflow",
-    "workflow_needs_update",
-    "missing_secret",
-    "scheduled_run_missing_or_unhealthy",
 )
 VERIFY_RELEASE_SAFETY_SUMMARY_KEYS = (
     "latest_stable_missing_or_without_assets",
     "old_stable_assets_present",
-    "upstream_mirror_assets_present",
 )
 FORCE_SYNC_ACK_ENV = "SYNC_FORKS_FORCE_ACK"
 FORCE_SYNC_ACK_VALUE = "I_UNDERSTAND"
-SELF_USE_SOURCE_REPOS: Tuple[str, ...] = ()
-SELF_USE_SOURCE_REPOS_TEXT = ",".join(SELF_USE_SOURCE_REPOS)
-SELF_USE_SOURCE_REPO_SET = {
-    repo.lower()
-    for repo in SELF_USE_SOURCE_REPOS
-}
-MIRROR_ONLY_SOURCE_REPOS: Tuple[str, ...] = ()
-MIRROR_ONLY_SOURCE_REPOS_TEXT = ",".join(MIRROR_ONLY_SOURCE_REPOS)
-MIRROR_ONLY_SOURCE_REPO_SET = {
-    repo.lower()
-    for repo in MIRROR_ONLY_SOURCE_REPOS
-}
-MIRROR_ONLY_SOURCE_BRANCH = "mirror/upstream-main"
-SELF_USE_RELEASE_REPOS: Tuple[str, ...] = ()
-SELF_USE_RELEASE_REPO_SET = {
-    repo.lower()
-    for repo in SELF_USE_RELEASE_REPOS
-}
-UPSTREAM_MIRROR_RELEASE_MARKER = "Mirrored from "
 INSTALLABLE_RELEASE_ASSET_RE = re.compile(
     r"\.(?:exe|msi|deb|rpm|appimage|dmg|pkg|zip|tar\.gz)$",
     re.IGNORECASE,
@@ -128,7 +99,6 @@ Usage:
 
 Options:
   --add-workflow   Add or update sync-fork.yml instead of syncing now
-  --verify-schedule Verify workflow/secret/scheduled-run readiness
   --verify-releases Verify stable release mirror retention policy
   --sync-releases  Reconcile stable release mirror retention
   --dry-run        Preview planned changes without modifying repos
@@ -194,46 +164,8 @@ jobs:
           echo "branch=$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
           echo "url=$UPSTREAM_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Self-use source policy guard
-        id: self_use_source_policy
-        if: steps.upstream.outputs.skip != 'true'
-        env:
-          SELF_USE_SOURCE_REPOS: "{self_use_source_repos}"
-          MIRROR_ONLY_SOURCE_BRANCH: "{mirror_only_source_branch}"
-        run: |
-          set -euo pipefail
-          IFS=',' read -ra REPOS <<< "$SELF_USE_SOURCE_REPOS"
-          for repo in "${{REPOS[@]}}"; do
-            repo=$(echo "$repo" | xargs)
-            if [ "$repo" = "${{{{ github.repository }}}}" ] && [ "${{{{ github.event.repository.default_branch }}}}" != "$MIRROR_ONLY_SOURCE_BRANCH" ]; then
-              echo "::notice::Self-use source policy is enabled for $repo. Default-branch merge-upstream is skipped; review locally against upstream/main in an isolated worktree instead."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-
-      - name: Restore point policy guard
-        id: restore_point_policy
-        if: steps.upstream.outputs.skip != 'true' && steps.self_use_source_policy.outputs.skip != 'true'
-        env:
-          MIRROR_ONLY_SOURCE_REPOS: "{mirror_only_source_repos}"
-          MIRROR_ONLY_SOURCE_BRANCH: "{mirror_only_source_branch}"
-        run: |
-          set -euo pipefail
-          IFS=',' read -ra REPOS <<< "$MIRROR_ONLY_SOURCE_REPOS"
-          for repo in "${{REPOS[@]}}"; do
-            repo=$(echo "$repo" | xargs)
-            if [ "$repo" = "${{{{ github.repository }}}}" ] && [ "${{{{ github.event.repository.default_branch }}}}" = "$MIRROR_ONLY_SOURCE_BRANCH" ]; then
-              echo "::notice::Mirror-only source policy is enabled for $repo on $MIRROR_ONLY_SOURCE_BRANCH. Default-branch merge-upstream will not create backup/pre-sync."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-
       - name: Safety check - compare file counts
-        if: steps.upstream.outputs.skip != 'true' && steps.self_use_source_policy.outputs.skip != 'true'
+        if: steps.upstream.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
         run: |
@@ -252,7 +184,7 @@ jobs:
           echo "Safety check passed."
 
       - name: Create restore point
-        if: steps.upstream.outputs.skip != 'true' && steps.self_use_source_policy.outputs.skip != 'true' && steps.restore_point_policy.outputs.skip != 'true'
+        if: steps.upstream.outputs.skip != 'true'
         run: |
           set -euo pipefail
           BACKUP_BRANCH="backup/pre-sync"
@@ -260,7 +192,7 @@ jobs:
           git push origin "$BACKUP_BRANCH" --force
 
       - name: Diff guard - inspect deletions
-        if: steps.upstream.outputs.skip != 'true' && steps.self_use_source_policy.outputs.skip != 'true'
+        if: steps.upstream.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
           BASE_REF: ${{{{ github.event.repository.default_branch }}}}
@@ -286,7 +218,7 @@ jobs:
           fi
 
       - name: Merge upstream changes
-        if: steps.upstream.outputs.skip != 'true' && steps.self_use_source_policy.outputs.skip != 'true'
+        if: steps.upstream.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
         run: |
@@ -297,7 +229,6 @@ jobs:
         if: steps.upstream.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
-          SELF_USE_RELEASE_REPOS: "{self_use_release_repos}"
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -312,15 +243,6 @@ jobs:
           import tempfile
 
           repo = os.environ["GITHUB_REPOSITORY"]
-          self_use_repos = {{
-              item.strip().lower()
-              for item in os.environ.get("SELF_USE_RELEASE_REPOS", "").split(",")
-              if item.strip()
-          }}
-          if repo.lower() in self_use_repos:
-              print("::notice::self-use local releases policy is managed manually; weekly release retention is skipped.")
-              raise SystemExit(0)
-
           installable_re = re.compile(r"\\.(?:exe|msi|deb|rpm|appimage|dmg|pkg|zip|tar\\.gz)$", re.IGNORECASE)
           signed_re = re.compile(r"\\.(?:sig|minisig|sigstore)$", re.IGNORECASE)
 
@@ -504,13 +426,7 @@ def _decode_workflow_content(existing_file):
 
 def _render_workflow_template(cron=SYNC_CRON):
     """Render the managed fork-sync workflow template."""
-    return WORKFLOW_TEMPLATE.format(
-        cron=cron,
-        self_use_source_repos=SELF_USE_SOURCE_REPOS_TEXT,
-        mirror_only_source_repos=MIRROR_ONLY_SOURCE_REPOS_TEXT,
-        mirror_only_source_branch=MIRROR_ONLY_SOURCE_BRANCH,
-        self_use_release_repos=",".join(SELF_USE_RELEASE_REPOS),
-    )
+    return WORKFLOW_TEMPLATE.format(cron=cron)
 
 
 def _has_workflow_dispatch(workflow_text):
@@ -550,11 +466,6 @@ def _missing_workflow_template_markers(workflow_text):
         f'cron: "{SYNC_CRON}"',
         "actions/checkout@v6",
         "Resolve upstream",
-        "Self-use source policy guard",
-        "Self-use source policy is enabled",
-        "Restore point policy guard",
-        "Mirror-only source policy is enabled",
-        "MIRROR_ONLY_SOURCE_BRANCH",
         "Create restore point",
         "Diff guard - inspect deletions",
         "backup/pre-sync",
@@ -603,50 +514,12 @@ def _short_error(payload, default="invalid response payload"):
     return default
 
 
-def _is_self_use_source_repo(full_name):
-    """Return True when normal default-branch sync should be skipped."""
-    return str(full_name or "").lower() in SELF_USE_SOURCE_REPO_SET
-
-
-def _is_mirror_only_source_repo(full_name):
-    """Return True when the repo should sync from upstream into a mirror branch."""
-    return str(full_name or "").lower() in MIRROR_ONLY_SOURCE_REPO_SET
-
-
-def _is_stable_source_only_repo(full_name):
-    """Backward-compatible alias for repos excluded from merge-upstream."""
-    return _is_self_use_source_repo(full_name)
-
-
-def _source_update_policy(full_name, branch=None):
-    """Return the declared update policy for one fork full_name."""
-    if (
-        _is_mirror_only_source_repo(full_name)
-        and branch == MIRROR_ONLY_SOURCE_BRANCH
-    ):
-        return "mirror_upstream_main"
-    if _is_self_use_source_repo(full_name):
-        return "self_use_main_manual_merge"
-    return "upstream_default_branch"
-
-
-def _should_create_restore_point(full_name, branch):
-    """Return whether sync should maintain backup/pre-sync for this branch."""
-    return not (
-        _is_mirror_only_source_repo(full_name)
-        and branch == MIRROR_ONLY_SOURCE_BRANCH
-    )
-
-
 def _base_fork_row(fork):
     """Return common report fields for fork-level verification rows."""
-    full_name = fork["full_name"]
-    branch = fork.get("branch")
     return {
         "name": fork["name"],
-        "full_name": full_name,
+        "full_name": fork["full_name"],
         "upstream": fork["parent"],
-        "source_update_policy": _source_update_policy(full_name, branch),
     }
 
 
@@ -902,11 +775,6 @@ def _add_sync_workflow_result(repo_name, branch, dry_run=False, force=False):
     return RESULT_OK
 
 
-def add_sync_workflow(repo_name, branch, _username=None, dry_run=False, force=False):
-    """Add or update sync-fork.yml in a repo. Return True on success."""
-    return _add_sync_workflow_result(repo_name, branch, dry_run, force) == RESULT_OK
-
-
 def _is_not_found_error(error_payload):
     """Return True when an error payload/message indicates HTTP 404."""
     if isinstance(error_payload, dict):
@@ -979,29 +847,11 @@ def _create_restore_point(fork_name, fork_branch):
 def _sync_now_result(fork_name, fork_branch, upstream_name, upstream_branch,
                      dry_run=False, force=False):
     """Perform a one-time sync with safety check. Return operation result."""
-    if (
-        _source_update_policy(fork_name, fork_branch)
-        == "self_use_main_manual_merge"
-        and not force
-    ):
-        print(
-            "  SKIP: self-use source policy is enabled. "
-            "Default-branch merge-upstream is skipped; review locally "
-            "against upstream/main in an isolated worktree instead."
-        )
-        return RESULT_OK
-
     if dry_run:
-        if _should_create_restore_point(fork_name, fork_branch):
-            print(
-                f"  [DRY-RUN] Would create/refresh backup/pre-sync and "
-                f"sync {upstream_name} -> {fork_name}"
-            )
-        else:
-            print(
-                f"  [DRY-RUN] Would sync {upstream_name} -> {fork_name} "
-                f"without backup/pre-sync (mirror-only source policy)"
-            )
+        print(
+            f"  [DRY-RUN] Would create/refresh backup/pre-sync and "
+            f"sync {upstream_name} -> {fork_name}"
+        )
         return RESULT_OK
 
     safety_result = safety_check(
@@ -1012,14 +862,8 @@ def _sync_now_result(fork_name, fork_branch, upstream_name, upstream_branch,
     if safety_result is ABORT:
         return RESULT_SAFETY
 
-    if _should_create_restore_point(fork_name, fork_branch):
-        if not _create_restore_point(fork_name, fork_branch):
-            return RESULT_SAFETY
-    else:
-        print(
-            "  Restore point skipped: mirror-only source policy keeps "
-            "remote branches minimal."
-        )
+    if not _create_restore_point(fork_name, fork_branch):
+        return RESULT_SAFETY
 
     result = gh_api(
         f"repos/{fork_name}/merge-upstream",
@@ -1041,17 +885,6 @@ def _sync_now_result(fork_name, fork_branch, upstream_name, upstream_branch,
 
     print(f"  Synced: {result.get('message', 'ok')}")
     return RESULT_OK
-
-
-def sync_now(fork_name, fork_branch, upstream_name, upstream_branch,
-             dry_run=False, force=False):
-    """Perform a one-time sync with safety check. Return True on success."""
-    return (
-        _sync_now_result(
-            fork_name, fork_branch, upstream_name, upstream_branch,
-            dry_run, force,
-        ) == RESULT_OK
-    )
 
 
 def _resolve_specific_forks(username, repo_names):
@@ -1107,7 +940,6 @@ def _parse_cli_args(argv):
         "dry_run": False,
         "force": False,
         "add_mode": False,
-        "verify_schedule": False,
         "verify_releases": False,
         "sync_releases": False,
         "json_output": "--json" in argv,
@@ -1130,9 +962,6 @@ def _parse_cli_args(argv):
                 continue
             if arg == "--add-workflow":
                 parsed["add_mode"] = True
-                continue
-            if arg == "--verify-schedule":
-                parsed["verify_schedule"] = True
                 continue
             if arg == "--verify-releases":
                 parsed["verify_releases"] = True
@@ -1271,121 +1100,9 @@ def _release_retention_next_action(
     return "none"
 
 
-def _is_upstream_mirror_release(release):
-    """Return whether a release looks like an upstream asset mirror."""
-    if not isinstance(release, dict):
-        return False
-    body = release.get("body")
-    return isinstance(body, str) and UPSTREAM_MIRROR_RELEASE_MARKER in body
-
-
-def _build_self_use_release_row(fork):
-    """Collect self-use release-policy details for one fork."""
-    full_name = fork["full_name"]
-    row = {
-        **_base_fork_row(fork),
-        "release_policy": "self_use_local_releases",
-        "latest_upstream_stable": None,
-        "latest_upstream_asset_count": 0,
-        "latest_upstream_installable_asset_count": 0,
-        "fork_release_count": 0,
-        "fork_latest_stable_asset_count": 0,
-        "old_stable_release_asset_count": 0,
-        "upstream_mirror_release_asset_count": 0,
-        "result": RESULT_OK,
-    }
-
-    fork_releases = gh_api(f"repos/{full_name}/releases?per_page=100")
-    if not isinstance(fork_releases, list):
-        row["result"] = RESULT_ERROR
-        row["release_error"] = _short_error(fork_releases)
-        row["next_action"] = "investigate_release_api_errors"
-        return row
-
-    fork_stable = _stable_releases(fork_releases)
-    local_stable = [
-        release for release in fork_stable
-        if not _is_upstream_mirror_release(release)
-    ]
-    upstream_mirrors = [
-        release for release in fork_releases
-        if _is_upstream_mirror_release(release)
-    ]
-
-    row["fork_release_count"] = len(fork_releases)
-    row["latest_self_use_release"] = (
-        local_stable[0].get("tag_name")
-        if local_stable and isinstance(local_stable[0], dict)
-        else None
-    )
-    row["fork_latest_stable_asset_count"] = (
-        _asset_count(local_stable[0]) if local_stable else 0
-    )
-    row["upstream_mirror_release_asset_count"] = sum(
-        _asset_count(release)
-        for release in upstream_mirrors
-    )
-    row["next_action"] = (
-        "remove_upstream_mirror_release_assets"
-        if row["upstream_mirror_release_asset_count"] > 0
-        else "none"
-    )
-    return row
-
-
-def _latest_workflow_run(runs_payload):
-    """Return normalized latest workflow run details, or None if absent/malformed."""
-    if not isinstance(runs_payload, dict) or "error" in runs_payload:
-        return None
-    runs = runs_payload.get("workflow_runs")
-    if not isinstance(runs, list) or not runs:
-        return None
-    last = runs[0]
-    if not isinstance(last, dict):
-        return None
-    return {
-        "status": last.get("status"),
-        "conclusion": last.get("conclusion"),
-        "created_at": last.get("created_at"),
-        "updated_at": last.get("updated_at"),
-        "html_url": last.get("html_url"),
-    }
-
-
-def _fetch_latest_workflow_run(full_name, event):
-    """Fetch latest sync-fork workflow run for one event type."""
-    return gh_api(
-        "repos/"
-        f"{full_name}/actions/workflows/sync-fork.yml/runs"
-        f"?event={event}&per_page=1"
-    )
-
-
-def _schedule_next_action(row):
-    """Return schedule-readiness next action from one normalized row."""
-    if row["result"] == RESULT_ERROR:
-        return "investigate_api_errors"
-    if not row["workflow_installed"]:
-        return "install_sync_workflow"
-    if not row["workflow_current"]:
-        return "update_sync_workflow"
-    if not row["secret_sync_pat_present"]:
-        return "set_sync_pat_secret"
-    if row["last_scheduled_run"] is None:
-        smoke_run = row["last_smoke_run"] or {}
-        if smoke_run.get("conclusion") == "success":
-            return "none"
-        return "wait_or_trigger_smoke_run"
-    if row["last_scheduled_run"].get("conclusion") != "success":
-        return "inspect_last_scheduled_failure"
-    return "none"
-
-
 def _build_verify_releases_row(fork):
     """Collect stable-release mirror retention details for one fork."""
     full_name = fork["full_name"]
-    if full_name.lower() in SELF_USE_RELEASE_REPO_SET:
-        return _build_self_use_release_row(fork)
     upstream = fork["parent"]
     row = {
         **_base_fork_row(fork),
@@ -1460,7 +1177,6 @@ def _verify_release_retention(forks):
         "latest_stable_assets_required": 0,
         "latest_stable_missing_or_without_assets": 0,
         "old_stable_assets_present": 0,
-        "upstream_mirror_assets_present": 0,
         "errors": 0,
     }
     for fork in forks:
@@ -1478,8 +1194,6 @@ def _verify_release_retention(forks):
             summary["latest_stable_missing_or_without_assets"] += 1
         if row["old_stable_release_asset_count"] > 0:
             summary["old_stable_assets_present"] += 1
-        if row.get("upstream_mirror_release_asset_count", 0) > 0:
-            summary["upstream_mirror_assets_present"] += 1
         if row["next_action"] == "none":
             summary["ready"] += 1
     return rows, summary
@@ -1643,9 +1357,6 @@ def _sync_releases_result(fork, dry_run=False):
         print(f"  FAIL: {row.get('release_error') or 'release verification failed'}")
         return RESULT_ERROR
 
-    if row["release_policy"] == "self_use_local_releases":
-        print("  SKIP: self-use local releases policy is managed manually.")
-        return RESULT_OK
     if row["release_policy"] == "source_only_release_notes":
         print("  SKIP: source-only release notes policy requires no mirrored assets.")
         return RESULT_OK
@@ -1683,122 +1394,8 @@ def _sync_releases_result(fork, dry_run=False):
     return RESULT_OK
 
 
-def _build_verify_schedule_row(fork):
-    """Collect schedule-readiness details for one fork repository."""
-    full_name = fork["full_name"]
-    branch = fork["branch"]
-    encoded_branch = encode_url_component(branch)
-
-    row = {
-        **_base_fork_row(fork),
-        "branch": branch,
-        "upstream_branch": fork["parent_branch"],
-        "workflow_installed": False,
-        "workflow_current": False,
-        "workflow_update_reason": None,
-        "secret_sync_pat_present": False,
-        "last_scheduled_run": None,
-        "last_smoke_run": None,
-        "result": RESULT_OK,
-    }
-
-    workflow = gh_api(
-        "repos/"
-        f"{full_name}/contents/.github/workflows/sync-fork.yml?ref={encoded_branch}"
-    )
-    if isinstance(workflow, dict) and "error" not in workflow:
-        row["workflow_installed"] = True
-        needs_update, reason = _needs_workflow_update(workflow)
-        row["workflow_current"] = not needs_update
-        if needs_update:
-            row["workflow_update_reason"] = reason
-    elif not _is_not_found_error(workflow):
-        row["result"] = RESULT_ERROR
-        row["workflow_error"] = _short_error(workflow)
-    else:
-        row["workflow_update_reason"] = "missing file"
-
-    secret = gh_api(f"repos/{full_name}/actions/secrets/SYNC_PAT")
-    if isinstance(secret, dict) and "error" not in secret:
-        row["secret_sync_pat_present"] = True
-    elif not _is_not_found_error(secret):
-        row["result"] = RESULT_ERROR
-        row["secret_error"] = _short_error(secret)
-
-    scheduled_runs = _fetch_latest_workflow_run(full_name, "schedule")
-    if isinstance(scheduled_runs, dict) and "error" not in scheduled_runs:
-        row["last_scheduled_run"] = _latest_workflow_run(scheduled_runs)
-    elif not _is_not_found_error(scheduled_runs):
-        row["result"] = RESULT_ERROR
-        row["scheduled_run_error"] = _short_error(scheduled_runs)
-
-    if (
-        row["result"] == RESULT_OK
-        and row["workflow_installed"]
-        and row["workflow_current"]
-        and row["secret_sync_pat_present"]
-        and row["last_scheduled_run"] is None
-    ):
-        smoke_runs = _fetch_latest_workflow_run(full_name, "workflow_dispatch")
-        if isinstance(smoke_runs, dict) and "error" not in smoke_runs:
-            row["last_smoke_run"] = _latest_workflow_run(smoke_runs)
-        elif not _is_not_found_error(smoke_runs):
-            row["result"] = RESULT_ERROR
-            row["smoke_run_error"] = _short_error(smoke_runs)
-
-    row["next_action"] = _schedule_next_action(row)
-
-    return row
-
-
-def _verify_schedule_readiness(forks):
-    """Return readiness rows and summary counts for schedule verification mode."""
-    rows = []
-    summary = {
-        "total": len(forks),
-        "ready": 0,
-        "missing_workflow": 0,
-        "workflow_needs_update": 0,
-        "missing_secret": 0,
-        "scheduled_run_missing_or_unhealthy": 0,
-        "mirror_only_source": 0,
-        "self_use_source": 0,
-        "errors": 0,
-    }
-
-    for fork in forks:
-        row = _build_verify_schedule_row(fork)
-        rows.append(row)
-
-        if row["result"] == RESULT_ERROR:
-            summary["errors"] += 1
-            continue
-        if row["source_update_policy"] == "mirror_upstream_main":
-            summary["mirror_only_source"] += 1
-        if row["source_update_policy"] == "self_use_main_manual_merge":
-            summary["self_use_source"] += 1
-        if not row["workflow_installed"]:
-            summary["missing_workflow"] += 1
-        elif not row["workflow_current"]:
-            summary["workflow_needs_update"] += 1
-        if not row["secret_sync_pat_present"]:
-            summary["missing_secret"] += 1
-        run = row["last_scheduled_run"] or {}
-        smoke_run = row["last_smoke_run"] or {}
-        if (
-            run.get("conclusion") != "success"
-            and smoke_run.get("conclusion") != "success"
-        ):
-            summary["scheduled_run_missing_or_unhealthy"] += 1
-        if row["next_action"] == "none":
-            summary["ready"] += 1
-
-    return rows, summary
-
-def _mode_name(add_mode, verify_schedule, verify_releases=False, sync_releases=False):
+def _mode_name(add_mode, verify_releases=False, sync_releases=False):
     """Return the machine-readable execution mode name."""
-    if verify_schedule:
-        return MODE_VERIFY_SCHEDULE
     if verify_releases:
         return MODE_VERIFY_RELEASES
     if sync_releases:
@@ -1822,7 +1419,7 @@ def _mode_writes_remotely(mode, dry_run):
         return False
     if mode in {MODE_SYNC, MODE_ADD_WORKFLOW, MODE_SYNC_RELEASES}:
         return True
-    if mode in {MODE_VERIFY_SCHEDULE, MODE_VERIFY_RELEASES}:
+    if mode == MODE_VERIFY_RELEASES:
         return False
     raise ValueError(f"Unclassified execution mode: {mode}")
 
@@ -1947,27 +1544,6 @@ def _finish_empty_forks(report, specific_repos, resolve_errors, json_output):
     return exit_code, report
 
 
-def _run_verify_schedule_mode(report, forks, json_output):
-    """Execute verify-schedule mode and return its exit result."""
-    rows, verify_summary = _verify_schedule_readiness(forks)
-    report["repos"] = rows
-    report["summary"].update(verify_summary)
-    report["message"] = (
-        "Schedule readiness verified: "
-        f"ready {verify_summary['ready']}/{verify_summary['total']}."
-    )
-    if not json_output:
-        _print_verify_schedule_rows(rows)
-        print(report["message"])
-    return (
-        _verification_exit_code(
-            verify_summary,
-            VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS,
-        ),
-        report,
-    )
-
-
 def _run_verify_releases_mode(report, forks, json_output):
     """Execute verify-releases mode and return its exit result."""
     rows, release_summary = _verify_release_retention(forks)
@@ -2018,43 +1594,6 @@ def _run_sync_releases_mode(report, forks, dry_run, resolve_errors, json_output)
     if report["summary"]["safety_abort"]:
         return EXIT_SAFETY, report
     return EXIT_OK, report
-
-
-def _format_bool_status(value):
-    """Return a compact status label for text tables."""
-    return "yes" if value else "no"
-
-
-def _format_last_scheduled_run(row):
-    """Return a compact last scheduled run label for text tables."""
-    run = row.get("last_scheduled_run")
-    if not isinstance(run, dict):
-        return "-"
-    conclusion = run.get("conclusion") or run.get("status")
-    return str(conclusion) if conclusion else "-"
-
-
-def _print_verify_schedule_rows(rows):
-    """Print per-repo readiness rows for text-mode diagnostics."""
-    if not rows:
-        return
-    print("Schedule readiness details:")
-    print(
-        f"{'Repository':<35} {'Workflow':<10} {'Current':<8} "
-        f"{'Secret':<7} {'Source policy':<23} {'Last':<10} {'Next action'}"
-    )
-    print("-" * 118)
-    for row in rows:
-        print(
-            f"{row['full_name']:<35} "
-            f"{_format_bool_status(row.get('workflow_installed')):<10} "
-            f"{_format_bool_status(row.get('workflow_current')):<8} "
-            f"{_format_bool_status(row.get('secret_sync_pat_present')):<7} "
-            f"{row.get('source_update_policy') or '-':<23} "
-            f"{_format_last_scheduled_run(row):<10} "
-            f"{row.get('next_action') or '-'}"
-        )
-    print()
 
 
 def _print_verify_release_rows(rows):
@@ -2114,10 +1653,6 @@ def _append_operation_report(report, fork, result, output, json_output):
         "branch": fork["branch"],
         "upstream": fork["parent"],
         "upstream_branch": fork["parent_branch"],
-        "source_update_policy": _source_update_policy(
-            fork["full_name"],
-            fork["branch"],
-        ),
         "result": result,
     }
     if json_output:
@@ -2176,7 +1711,6 @@ def _run(parsed):
     dry_run = parsed.get("dry_run", False)
     force = parsed.get("force", False)
     add_mode = parsed.get("add_mode", False)
-    verify_schedule = parsed.get("verify_schedule", False)
     verify_releases = parsed.get("verify_releases", False)
     sync_releases = parsed.get("sync_releases", False)
     specific_repos = parsed.get("specific_repos", [])
@@ -2187,7 +1721,7 @@ def _run(parsed):
     auth_info = auth_context["auth"]
     username = auth_context["username"]
 
-    mode = _mode_name(add_mode, verify_schedule, verify_releases, sync_releases)
+    mode = _mode_name(add_mode, verify_releases, sync_releases)
     report = _build_run_report(
         username, auth_info, mode, dry_run, force, specific_repos,
     )
@@ -2213,8 +1747,6 @@ def _run(parsed):
             report, specific_repos, resolve_errors, json_output,
         )
 
-    if verify_schedule:
-        return _run_verify_schedule_mode(report, forks, json_output)
     if verify_releases:
         return _run_verify_releases_mode(report, forks, json_output)
     if sync_releases:

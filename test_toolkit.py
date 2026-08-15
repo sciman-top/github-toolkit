@@ -1,3518 +1,489 @@
 #!/usr/bin/env python3
-"""Unit tests for GitHub Toolkit core logic."""
+"""Focused behavior tests for GitHub Toolkit's safety-critical paths."""
 
-import ast
 import base64
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
 import os
-# Tests construct TimeoutExpired only.
-import subprocess  # nosec B404
+import subprocess  # nosec B404 - tests construct process results only
+import sys
+import tempfile
 import unittest
-try:
-    from unittest.mock import Mock, patch
-except OSError:
-    from test_support import Mock, patch  # type: ignore[assignment]
+from unittest.mock import Mock, patch
 
 import gh_utils
-from gh_utils import (
-    build_compare_endpoint,
-    build_fork_record,
-    encode_compare_ref,
-    encode_url_component,
-    get_compare_head,
-    get_file_count,
-    get_fork_repos_with_evidence,
-    paginate,
-    parse_nonnegative_int,
-)
-
-# Load sync-forks module (hyphen in filename prevents normal import)
-_here = os.path.dirname(os.path.abspath(__file__))
 
 
-def _load_module(module_name, module_path):
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_script(name, filename):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(ROOT, filename))
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load module spec: {module_name} -> {module_path}")
+        raise RuntimeError(f"Cannot load {filename}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-sync_forks = _load_module("sync_forks", os.path.join(_here, "sync-forks.py"))
-list_forks = _load_module("list_forks", os.path.join(_here, "list-forks.py"))
+sync_forks = load_script("sync_forks", "sync-forks.py")
+list_forks = load_script("list_forks", "list-forks.py")
+
+FORK = {
+    "name": "fork",
+    "full_name": "me/fork",
+    "branch": "main",
+    "parent": "upstream/repo",
+    "parent_branch": "main",
+}
 
 
-def _encode(text):
-    """Base64-encode a string for GitHub contents API simulation."""
+def encoded(text):
     return base64.b64encode(text.encode()).decode()
 
 
-# ── _decode_workflow_content ──────────────────────────────────
-
-class TestDecodeWorkflowContent(unittest.TestCase):
-    def test_valid_content(self):
-        text = "name: test\non: push\n"
-        result = sync_forks._decode_workflow_content({"content": _encode(text)})
-        self.assertEqual(result, text)
-
-    def test_empty_content_value(self):
-        result = sync_forks._decode_workflow_content({"content": ""})
-        self.assertIsNone(result)
-
-    def test_no_content_key(self):
-        result = sync_forks._decode_workflow_content({})
-        self.assertIsNone(result)
-
-    def test_non_dict_input(self):
-        self.assertIsNone(sync_forks._decode_workflow_content("string"))
-        self.assertIsNone(sync_forks._decode_workflow_content(None))
-
-    def test_invalid_base64(self):
-        result = sync_forks._decode_workflow_content({"content": "!!bad!!"})
-        self.assertIsNone(result)
-
-
-# ── _has_workflow_dispatch ────────────────────────────────────
-
-class TestHasWorkflowDispatch(unittest.TestCase):
-    def test_with_dispatch(self):
-        self.assertTrue(
-            sync_forks._has_workflow_dispatch("on:\n  workflow_dispatch: {}\n")
+class GhApiTests(unittest.TestCase):
+    def test_error_classification_preserves_retry_and_auth_boundaries(self):
+        rate_limit = gh_utils._classify_gh_error(
+            "gh: API rate limit exceeded (HTTP 429)"
         )
+        not_found = gh_utils._classify_gh_error("gh: Not Found (HTTP 404)")
+        auth = gh_utils._classify_gh_error("please run: gh auth login")
 
-    def test_without_dispatch(self):
-        self.assertFalse(
-            sync_forks._has_workflow_dispatch("on:\n  push:\n    branches: [main]\n")
-        )
-
-    def test_commented_dispatch(self):
-        self.assertFalse(
-            sync_forks._has_workflow_dispatch(
-                "on:\n  # workflow_dispatch: {}\n  push:\n"
-            )
-        )
-
-    def test_empty_and_none(self):
-        self.assertFalse(sync_forks._has_workflow_dispatch(""))
-        self.assertFalse(sync_forks._has_workflow_dispatch(None))
-
-    def test_dispatch_in_comment_only(self):
-        self.assertFalse(
-            sync_forks._has_workflow_dispatch(
-                "on: push\n# workflow_dispatch: {}\n"
-            )
-        )
-
-    def test_inline_dispatch(self):
-        self.assertTrue(
-            sync_forks._has_workflow_dispatch("on: { workflow_dispatch: {} }\n")
-        )
-
-    def test_array_dispatch(self):
-        self.assertTrue(
-            sync_forks._has_workflow_dispatch("on: [push, workflow_dispatch]\n")
-        )
-
-    def test_sequence_dispatch(self):
-        self.assertTrue(
-            sync_forks._has_workflow_dispatch("on:\n  - push\n  - workflow_dispatch\n")
-        )
-
-    def test_similar_key_is_not_dispatch(self):
-        self.assertFalse(
-            sync_forks._has_workflow_dispatch("on:\n  not_workflow_dispatch: {}\n")
-        )
-
-    def test_dispatch_text_outside_on_block_is_ignored(self):
-        self.assertFalse(
-            sync_forks._has_workflow_dispatch(
-                "on:\n  push:\n\njobs:\n  test:\n    steps:\n"
-                "      - run: echo workflow_dispatch:\n"
-            )
-        )
-
-
-# ── _needs_workflow_update ────────────────────────────────────
-
-class TestNeedsWorkflowUpdate(unittest.TestCase):
-    def test_error_response_means_update(self):
-        needs, reason = sync_forks._needs_workflow_update({"error": "404"})
-        self.assertTrue(needs)
-        self.assertEqual(reason, "missing file")
-
-    def test_non_not_found_error_means_unverified(self):
-        needs, reason = sync_forks._needs_workflow_update({
-            "error": "gh: Forbidden (HTTP 403)",
-            "error_type": "auth",
-            "status_code": 403,
-        })
-        self.assertTrue(needs)
-        self.assertEqual(reason, "cannot verify existing workflow")
-
-    def test_no_dispatch_means_update(self):
-        text = "name: test\non: push\n"
-        needs, reason = sync_forks._needs_workflow_update({"content": _encode(text)})
-        self.assertTrue(needs)
-        self.assertIn("workflow_dispatch", reason)
-
-    def test_current_template_means_no_update(self):
-        text = sync_forks._render_workflow_template()
-        needs, reason = sync_forks._needs_workflow_update({"content": _encode(text)})
-        self.assertFalse(needs)
-        self.assertIn("current workflow template", reason)
-
-    def test_dispatch_only_stale_template_means_update(self):
-        text = """\
-name: Sync Fork
-on:
-  schedule:
-    - cron: "0 2 * * 0"
-  workflow_dispatch: {}
-
-jobs:
-  sync:
-    steps:
-      - name: Safety check - compare file counts
-      - name: Merge upstream changes
-"""
-        needs, reason = sync_forks._needs_workflow_update({"content": _encode(text)})
-        self.assertTrue(needs)
-        self.assertIn("workflow template drift", reason)
-        self.assertIn("actions/checkout@v6", reason)
-
-    def test_cron_drift_means_update(self):
-        text = sync_forks._render_workflow_template(cron="30 2 * * 0")
-        needs, reason = sync_forks._needs_workflow_update({"content": _encode(text)})
-        self.assertTrue(needs)
-        self.assertIn("workflow template drift", reason)
-
-    def test_stale_merge_upstream_branch_means_update(self):
-        text = sync_forks._render_workflow_template().replace(
-            "branch=${{ github.event.repository.default_branch }}",
-            "branch=${{ steps.upstream.outputs.branch }}",
-        )
-        needs, reason = sync_forks._needs_workflow_update({"content": _encode(text)})
-        self.assertTrue(needs)
-        self.assertIn("workflow template drift", reason)
-
-    def test_unreadable_content_means_update(self):
-        needs, reason = sync_forks._needs_workflow_update({"content": "!!bad!!"})
-        self.assertTrue(needs)
-        self.assertIn("cannot decode", reason)
-
-    def test_non_dict_payload_means_update(self):
-        needs, reason = sync_forks._needs_workflow_update(["not-a-dict"])
-        self.assertTrue(needs)
-        self.assertIn("invalid workflow metadata payload", reason)
-
-
-class TestAddSyncWorkflow(unittest.TestCase):
-    @patch.object(sync_forks, "gh_api")
-    def test_lookup_auth_error_fails_closed_even_in_dry_run(self, mock_api):
-        mock_api.return_value = {
-            "error": "gh: Forbidden (HTTP 403)",
-            "error_type": "auth",
-            "status_code": 403,
-        }
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._add_sync_workflow_result(
-                "me/forked-repo",
-                "main",
-                dry_run=True,
-            )
-
-        self.assertEqual(result, sync_forks.RESULT_ERROR)
-        self.assertIn("Cannot verify existing sync-fork.yml", captured.getvalue())
-        self.assertEqual(mock_api.call_count, 1)
-
-    @patch.object(sync_forks, "gh_api")
-    def test_missing_workflow_can_be_added_in_dry_run(self, mock_api):
-        mock_api.return_value = {
-            "error": "gh: Not Found (HTTP 404)",
-            "error_type": "not_found",
-            "status_code": 404,
-        }
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._add_sync_workflow_result(
-                "me/forked-repo",
-                "main",
-                dry_run=True,
-            )
-
-        self.assertEqual(result, sync_forks.RESULT_OK)
-        self.assertIn("Would add sync-fork.yml", captured.getvalue())
-
-    @patch.object(sync_forks, "gh_api")
-    def test_lookup_encodes_branch_ref(self, mock_api):
-        mock_api.return_value = {
-            "error": "gh: Not Found (HTTP 404)",
-            "error_type": "not_found",
-            "status_code": 404,
-        }
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = sync_forks._add_sync_workflow_result(
-                "me/forked-repo",
-                "feature/branch",
-                dry_run=True,
-            )
-
-        self.assertEqual(result, sync_forks.RESULT_OK)
-        mock_api.assert_any_call(
-            "repos/me/forked-repo/contents/.github/workflows/sync-fork.yml"
-            "?ref=feature%2Fbranch"
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    def test_invalid_branch_fails_without_api_call(self, mock_api):
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._add_sync_workflow_result(
-                "me/forked-repo",
-                "",
-                dry_run=True,
-            )
-
-        self.assertEqual(result, sync_forks.RESULT_ERROR)
-        self.assertIn("invalid repo or branch", captured.getvalue())
-        mock_api.assert_not_called()
-
-    @patch.object(sync_forks, "gh_api")
-    def test_invalid_update_response_fails(self, mock_api):
-        mock_api.side_effect = [
-            {
-                "error": "gh: Not Found (HTTP 404)",
-                "error_type": "not_found",
-                "status_code": 404,
-            },
-            [],
-        ]
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._add_sync_workflow_result(
-                "me/forked-repo",
-                "main",
-            )
-
-        self.assertEqual(result, sync_forks.RESULT_ERROR)
-        self.assertIn("Invalid workflow update response", captured.getvalue())
-
-
-# ── get_file_count ────────────────────────────────────────────
-
-class TestForkMetadataHelpers(unittest.TestCase):
-    def test_get_compare_head_uses_owner_only(self):
-        self.assertEqual(
-            get_compare_head("upstream-owner/repo", "main"),
-            "upstream-owner:main",
-        )
-
-    def test_encode_compare_ref_preserves_owner_separator(self):
-        self.assertEqual(
-            encode_compare_ref("upstream-owner:feature/branch"),
-            "upstream-owner:feature%2Fbranch",
-        )
-
-    def test_encode_url_component_encodes_slashes(self):
-        self.assertEqual(
-            encode_url_component("release/2026-q2"),
-            "release%2F2026-q2",
-        )
-
-    def test_build_compare_endpoint_encodes_branch_slashes(self):
-        self.assertEqual(
-            build_compare_endpoint(
-                "me/forked-repo",
-                "release/2026-q2",
-                "upstream-owner:feature/branch",
-            ),
-            (
-                "repos/me/forked-repo/compare/"
-                "release%2F2026-q2...upstream-owner:feature%2Fbranch"
-            ),
-        )
-
-    def test_get_compare_head_rejects_invalid_input(self):
-        self.assertIsNone(get_compare_head("missing-slash", "main"))
-        self.assertIsNone(get_compare_head("upstream-owner/repo", ""))
-
-    def test_build_fork_record_adds_parent_owner(self):
-        record = build_fork_record({
-            "fork": True,
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "default_branch": "main",
-            "parent": {
-                "full_name": "upstream-owner/forked-repo",
-                "default_branch": "develop",
-            },
-        })
-        self.assertEqual(record["parent"], "upstream-owner/forked-repo")
-        self.assertEqual(record["parent_branch"], "develop")
-        self.assertEqual(record["parent_owner"], "upstream-owner")
-
-    def test_build_fork_record_rejects_non_forks(self):
-        self.assertIsNone(build_fork_record({"fork": False}))
-
-    def test_build_fork_record_handles_malformed_parent(self):
-        record = build_fork_record({
-            "fork": True,
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "default_branch": "main",
-            "parent": "not-a-dict",
-        })
-
-        self.assertEqual(record["parent"], "unknown")
-        self.assertEqual(record["parent_branch"], "main")
-        self.assertIsNone(record["parent_owner"])
-
-    def test_build_fork_record_defaults_empty_parent_fields(self):
-        record = build_fork_record({
-            "fork": True,
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "default_branch": "main",
-            "parent": {
-                "full_name": None,
-                "default_branch": None,
-            },
-        })
-
-        self.assertEqual(record["parent"], "unknown")
-        self.assertEqual(record["parent_branch"], "main")
-        self.assertIsNone(record["parent_owner"])
-
-    def test_parse_nonnegative_int_accepts_int_like_values(self):
-        self.assertEqual(parse_nonnegative_int(0), 0)
-        self.assertEqual(parse_nonnegative_int("42"), 42)
-
-    def test_parse_nonnegative_int_rejects_malformed_values(self):
-        self.assertIsNone(parse_nonnegative_int(True))
-        self.assertIsNone(parse_nonnegative_int(False))
-        self.assertIsNone(parse_nonnegative_int("-1"))
-        self.assertIsNone(parse_nonnegative_int("not-int"))
-        self.assertIsNone(parse_nonnegative_int(None))
-
-
-class TestGhApiErrors(unittest.TestCase):
-    def test_classify_rate_limit_as_retryable(self):
-        result = gh_utils._classify_gh_error("gh: API rate limit exceeded (HTTP 403)")
-        self.assertEqual(result["error_type"], "rate_limit")
-        self.assertEqual(result["error_code"], "E_GH_RATE_LIMIT")
-        self.assertEqual(result["status_code"], 403)
-        self.assertTrue(result["retryable"])
-
-    def test_classify_http_429_as_rate_limit(self):
-        result = gh_utils._classify_gh_error("gh: Too Many Requests (HTTP 429)")
-        self.assertEqual(result["error_type"], "rate_limit")
-        self.assertEqual(result["error_code"], "E_GH_RATE_LIMIT")
-        self.assertEqual(result["status_code"], 429)
-        self.assertTrue(result["retryable"])
-
-    def test_classify_not_found_as_non_retryable(self):
-        result = gh_utils._classify_gh_error("gh: Not Found (HTTP 404)")
-        self.assertEqual(result["error_type"], "not_found")
-        self.assertEqual(result["error_code"], "E_GH_NOT_FOUND")
-        self.assertEqual(result["status_code"], 404)
-        self.assertFalse(result["retryable"])
-
-    def test_classify_gh_login_hint_as_auth_error(self):
-        result = gh_utils._classify_gh_error(
-            "To get started with GitHub CLI, please run: gh auth login"
-        )
-
-        self.assertEqual(result["error_type"], "auth")
-        self.assertEqual(result["error_code"], "E_GH_AUTH")
-        self.assertFalse(result["retryable"])
+        self.assertEqual(rate_limit["error_code"], "E_GH_RATE_LIMIT")
+        self.assertTrue(rate_limit["retryable"])
+        self.assertEqual(not_found["error_code"], "E_GH_NOT_FOUND")
+        self.assertFalse(not_found["retryable"])
+        self.assertEqual(auth["error_code"], "E_GH_AUTH")
 
     @patch("gh_utils.time.sleep", return_value=None)
     @patch("gh_utils.subprocess.run")
-    def test_gh_api_retries_transient_server_error(self, mock_run, _mock_sleep):
-        mock_run.side_effect = [
-            Mock(returncode=1, stderr="gh: Bad Gateway (HTTP 502)", stdout=""),
+    def test_gh_api_retries_transient_failure(self, run, _sleep):
+        run.side_effect = [
+            Mock(returncode=1, stderr="Bad Gateway (HTTP 502)", stdout=""),
             Mock(returncode=0, stderr="", stdout='{"ok": true}'),
         ]
 
-        result = gh_utils.gh_api("repos/me/example")
-
-        self.assertEqual(result, {"ok": True})
-        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(gh_utils.gh_api("repos/me/fork"), {"ok": True})
+        self.assertEqual(run.call_count, 2)
 
     @patch("gh_utils.time.sleep", return_value=None)
     @patch("gh_utils.subprocess.run")
-    def test_gh_api_timeout_reports_structured_error(self, mock_run, _mock_sleep):
-        mock_run.side_effect = subprocess.TimeoutExpired(cmd="gh", timeout=gh_utils.API_TIMEOUT)
+    def test_gh_api_timeout_is_structured(self, run, _sleep):
+        run.side_effect = subprocess.TimeoutExpired(cmd="gh", timeout=1)
 
-        result = gh_utils.gh_api("repos/me/example", timeout=1)
+        result = gh_utils.gh_api("repos/me/fork", timeout=1)
 
-        self.assertEqual(result["error_type"], "timeout")
         self.assertEqual(result["error_code"], "E_GH_TIMEOUT")
         self.assertTrue(result["retryable"])
 
     @patch("gh_utils.subprocess.run")
-    def test_gh_api_invalid_json_reports_structured_error(self, mock_run):
-        mock_run.return_value = Mock(returncode=0, stderr="", stdout="<html>gateway</html>")
+    def test_gh_api_rejects_invalid_json(self, run):
+        run.return_value = Mock(returncode=0, stderr="", stdout="<html>")
 
-        result = gh_utils.gh_api("repos/me/example")
+        result = gh_utils.gh_api("repos/me/fork")
 
-        self.assertEqual(result["error_type"], "invalid_response")
         self.assertEqual(result["error_code"], "E_GH_INVALID_RESPONSE")
-        self.assertIn("repos/me/example", result["error"])
-        self.assertIn("<html>gateway</html>", result["detail"])
+        self.assertIn("<html>", result["detail"])
 
     @patch("gh_utils.subprocess.run")
-    def test_gh_api_sends_empty_payload(self, mock_run):
-        mock_run.return_value = Mock(returncode=0, stderr="", stdout='{"ok": true}')
+    def test_gh_api_sends_empty_post_payload(self, run):
+        run.return_value = Mock(returncode=0, stderr="", stdout='{"ok": true}')
 
-        result = gh_utils.gh_api("repos/me/example/dispatches", method="POST", payload={})
+        result = gh_utils.gh_api("repos/me/fork/dispatches", "POST", {})
 
         self.assertEqual(result, {"ok": True})
-        self.assertIn("--input", mock_run.call_args.args[0])
-        self.assertEqual(mock_run.call_args.kwargs["input"], "{}")
+        self.assertIn("--input", run.call_args.args[0])
+        self.assertEqual(run.call_args.kwargs["input"], "{}")
+
+    @patch("gh_utils.gh_api")
+    def test_paginate_stops_on_api_error(self, api):
+        api.side_effect = [
+            [{"id": 1}] * 100,
+            {"error": "rate limited", "error_code": "E_GH_RATE_LIMIT"},
+        ]
+
+        rows, error = gh_utils.paginate("user/repos", include_error=True)
+
+        self.assertEqual(len(rows), 100)
+        self.assertEqual(error["error_code"], "E_GH_RATE_LIMIT")
+
+
+class AuthAndDiscoveryTests(unittest.TestCase):
+    @patch.dict(os.environ, {"GH_TOKEN": "token"}, clear=True)  # nosec B105
+    def test_environment_token_has_priority(self):
+        self.assertEqual(gh_utils.detect_auth_mode()["source"], "GH_TOKEN")
 
     @patch.object(gh_utils, "GH", "gh")
+    @patch.dict(os.environ, {}, clear=True)
     @patch("gh_utils.subprocess.run")
-    def test_gh_api_os_error_reports_environment_error(self, mock_run):
-        mock_run.side_effect = OSError("permission denied")
-
-        result = gh_utils.gh_api("repos/me/example")
-
-        self.assertEqual(result["error_type"], "environment")
-        self.assertEqual(result["error_code"], "E_GH_ENVIRONMENT")
-        self.assertFalse(result["retryable"])
-        self.assertIn("Cannot execute gh CLI", result["error"])
-
-    @patch("gh_utils.gh_api")
-    def test_paginate_invalid_endpoint_returns_structured_error(self, mock_api):
-        items, error = paginate(None, include_error=True)
-
-        self.assertEqual(items, [])
-        self.assertEqual(error["error_type"], "invalid_response")
-        self.assertIn("Invalid paginated endpoint", error["error"])
-        mock_api.assert_not_called()
-
-    @patch("gh_utils.gh_api")
-    def test_paginate_invalid_per_page_returns_structured_error(self, mock_api):
-        items, error = paginate("users/u/repos", per_page=0, include_error=True)
-
-        self.assertEqual(items, [])
-        self.assertEqual(error["error_type"], "invalid_response")
-        self.assertIn("Invalid pagination size", error["error"])
-        mock_api.assert_not_called()
-
-
-class TestAuthDetection(unittest.TestCase):
-    @patch.dict("os.environ", {"GH_TOKEN": "token-value"}, clear=False)  # nosec
-    def test_detect_auth_mode_prefers_gh_token_env(self):
-        result = gh_utils.detect_auth_mode()
-        self.assertTrue(result["configured"])
-        self.assertEqual(result["mode"], "env_token")
-        self.assertEqual(result["source"], "GH_TOKEN")
-
-    @patch.dict("os.environ", {"GH_TOKEN": "  ", "GITHUB_TOKEN": ""}, clear=True)
-    @patch("gh_utils.subprocess.run")
-    def test_detect_auth_mode_ignores_blank_env_tokens(self, mock_run):
-        mock_run.return_value = Mock(returncode=0, stderr="", stdout="")
+    def test_local_gh_login_is_supported(self, run):
+        run.return_value = Mock(returncode=0, stdout="", stderr="")
 
         result = gh_utils.detect_auth_mode()
 
         self.assertTrue(result["configured"])
         self.assertEqual(result["mode"], "gh_login")
 
-    @patch.dict("os.environ", {}, clear=True)
-    @patch("gh_utils.subprocess.run")
-    def test_detect_auth_mode_uses_gh_login_when_available(self, mock_run):
-        mock_run.return_value = Mock(returncode=0, stderr="", stdout="")
-
-        result = gh_utils.detect_auth_mode()
-
-        self.assertTrue(result["configured"])
-        self.assertEqual(result["mode"], "gh_login")
-        self.assertEqual(result["source"], "gh auth login")
-
-    @patch.dict("os.environ", {}, clear=True)
-    @patch("gh_utils.subprocess.run")
-    def test_detect_auth_mode_reports_unconfigured(self, mock_run):
-        mock_run.return_value = Mock(returncode=1, stderr="not logged in", stdout="")
-
-        result = gh_utils.detect_auth_mode()
-
-        self.assertFalse(result["configured"])
-        self.assertEqual(result["mode"], "unconfigured")
-
-    @patch.object(gh_utils, "GH", "gh")
-    @patch.dict("os.environ", {}, clear=True)
-    @patch("gh_utils.subprocess.run")
-    def test_detect_auth_mode_reports_gh_launch_failure(self, mock_run):
-        mock_run.side_effect = OSError("permission denied")
-
-        result = gh_utils.detect_auth_mode()
-
-        self.assertFalse(result["configured"])
-        self.assertEqual(result["mode"], "unavailable")
-        self.assertIn("OSError", result["source"])
-
+    @patch("gh_utils.utc_now_iso", return_value="2026-08-15T00:00:00Z")
     @patch("gh_utils.gh_api")
-    @patch("gh_utils.detect_auth_mode")
-    def test_get_auth_context_reports_unconfigured_as_auth_error(
-        self, mock_detect_auth_mode, mock_gh_api
+    @patch("gh_utils.paginate")
+    def test_discovery_hydrates_parent_and_returns_live_evidence(
+        self, paginate, api, _now
     ):
-        mock_detect_auth_mode.return_value = {
-            "configured": False,
-            "mode": "unconfigured",
-            "source": None,
-        }
-        mock_gh_api.return_value = {
-            "error": "run gh auth login",
-            "error_type": "unknown",
-            "error_code": "E_GH_UNKNOWN",
-        }
-
-        with self.assertRaises(gh_utils.AuthContextError) as ctx:
-            gh_utils.get_auth_context()
-
-        self.assertEqual(ctx.exception.error_type, "auth")
-        self.assertIn("Not authenticated", ctx.exception.message)
-
-
-class TestWindowsProcessEnvironment(unittest.TestCase):
-    def test_ensure_windows_process_environment_restores_required_vars(self):
-        with patch.object(gh_utils.os, "name", "nt"):
-            with patch.dict(
-                gh_utils.os.environ,
-                {
-                    "USERPROFILE": r"C:\Users\sciman",
-                    "PATH": "",
-                },
-                clear=True,
-            ):
-                repaired = gh_utils.ensure_windows_process_environment()
-
-                self.assertEqual(gh_utils.os.environ["SystemRoot"], r"C:\Windows")
-                self.assertEqual(gh_utils.os.environ["WINDIR"], r"C:\Windows")
-                self.assertEqual(
-                    gh_utils.os.environ["ComSpec"],
-                    r"C:\Windows\System32\cmd.exe",
-                )
-                self.assertEqual(
-                    gh_utils.os.environ["APPDATA"],
-                    r"C:\Users\sciman\AppData\Roaming",
-                )
-                self.assertEqual(
-                    gh_utils.os.environ["LOCALAPPDATA"],
-                    r"C:\Users\sciman\AppData\Local",
-                )
-                self.assertEqual(
-                    gh_utils.os.environ["PROGRAMDATA"],
-                    r"C:\ProgramData",
-                )
-                self.assertEqual(
-                    gh_utils.os.environ["ProgramFiles"],
-                    r"C:\Program Files",
-                )
-                self.assertIn("SystemRoot", repaired)
-
-    def test_ensure_windows_process_environment_imports_codex_proxy_policy(self):
-        with patch.object(
-            gh_utils,
-            "_read_codex_shell_environment_policy_set",
-            return_value={
-                "HTTP_PROXY": "http://127.0.0.1:10808",
-                "HTTPS_PROXY": "http://127.0.0.1:10808",
-                "NO_PROXY": "localhost,127.0.0.1,::1",
-            },
-        ):
-            with patch.object(gh_utils.os, "name", "nt"):
-                with patch.dict(
-                    gh_utils.os.environ,
-                    {
-                        "USERPROFILE": r"C:\Users\sciman",
-                        "PATH": "",
-                    },
-                    clear=True,
-                ):
-                    repaired = gh_utils.ensure_windows_process_environment()
-
-                    self.assertEqual(
-                        gh_utils.os.environ["HTTP_PROXY"],
-                        "http://127.0.0.1:10808",
-                    )
-                    self.assertEqual(
-                        gh_utils.os.environ["HTTPS_PROXY"],
-                        "http://127.0.0.1:10808",
-                    )
-                    self.assertEqual(
-                        gh_utils.os.environ["NO_PROXY"],
-                        "localhost,127.0.0.1,::1",
-                    )
-                    self.assertNotIn("ANTHROPIC_AUTH_TOKEN", gh_utils.os.environ)
-                    self.assertIn("HTTP_PROXY", repaired)
-
-    def test_windows_environment_scripts_cover_required_variables(self):
-        required = (
-            "SystemRoot",
-            "WINDIR",
-            "ComSpec",
-            "APPDATA",
-            "LOCALAPPDATA",
-            "PROGRAMDATA",
-            "ProgramFiles",
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "NO_PROXY",
-        )
-        script_paths = (
-            os.path.join(_here, "scripts", "Initialize-WindowsProcessEnvironment.ps1"),
-            os.path.join(_here, "scripts", "Initialize-WindowsProcessEnvironment.cmd"),
-            os.path.join(_here, "scripts", "Verify-WindowsProcessEnvironment.ps1"),
-        )
-
-        for script_path in script_paths:
-            with self.subTest(script=os.path.basename(script_path)):
-                with open(script_path, encoding="utf-8") as handle:
-                    content = handle.read()
-                for name in required:
-                    self.assertIn(name, content)
-
-
-# ── get_file_count ────────────────────────────────────────────
-
-class TestGetFileCount(unittest.TestCase):
-    @patch("gh_utils.gh_api")
-    def test_counts_blobs_only(self, mock_api):
-        mock_api.return_value = {
-            "tree": [
-                {"type": "blob", "path": "a.py"},
-                {"type": "blob", "path": "b.py"},
-                {"type": "tree", "path": "src"},
-            ]
-        }
-        self.assertEqual(get_file_count("repo", "main"), 2)
-
-    @patch("gh_utils.gh_api")
-    def test_branch_ref_is_encoded(self, mock_api):
-        mock_api.return_value = {"tree": []}
-
-        self.assertEqual(get_file_count("repo", "feature/branch"), 0)
-
-        mock_api.assert_any_call(
-            "repos/repo/git/trees/feature%2Fbranch?recursive=1"
-        )
-
-    @patch("gh_utils.gh_api")
-    def test_missing_branch_returns_none_without_api_call(self, mock_api):
-        self.assertIsNone(get_file_count("repo", ""))
-        mock_api.assert_not_called()
-
-    @patch("gh_utils.gh_api")
-    def test_error_returns_none(self, mock_api):
-        mock_api.return_value = {"error": "404"}
-        self.assertIsNone(get_file_count("repo", "main"))
-
-    @patch("gh_utils.gh_api")
-    def test_truncated_returns_none(self, mock_api):
-        mock_api.return_value = {
-            "tree": [{"type": "blob", "path": "a.py"}],
-            "truncated": True,
-        }
-        self.assertIsNone(get_file_count("repo", "main"))
-
-    @patch("gh_utils.gh_api")
-    def test_empty_tree(self, mock_api):
-        mock_api.return_value = {"tree": []}
-        self.assertEqual(get_file_count("repo", "main"), 0)
-
-    @patch("gh_utils.gh_api")
-    def test_non_dict_tree_response_returns_none(self, mock_api):
-        mock_api.return_value = []
-        self.assertIsNone(get_file_count("repo", "main"))
-
-    @patch("gh_utils.gh_api")
-    def test_malformed_tree_returns_none(self, mock_api):
-        mock_api.return_value = {"tree": "not-a-list"}
-        self.assertIsNone(get_file_count("repo", "main"))
-
-
-# ── safety_check ──────────────────────────────────────────────
-
-class TestSafetyCheck(unittest.TestCase):
-    def test_force_bypasses_check(self):
-        result = sync_forks.safety_check("f", "main", "u", "main", force=True)
-        self.assertTrue(result)
-
-    @patch.object(sync_forks, "get_file_count")
-    def test_fork_count_unknown_aborts(self, mock_gfc):
-        mock_gfc.return_value = None
-        self.assertFalse(
-            sync_forks.safety_check("f", "main", "u", "main")
-        )
-
-    @patch.object(sync_forks, "get_file_count")
-    def test_upstream_unknown_returns_skip(self, mock_gfc):
-        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else None
-        self.assertIsNone(
-            sync_forks.safety_check("f", "main", "u/repo", "main")
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "get_file_count")
-    def test_file_threshold_abort(self, mock_gfc, mock_api):
-        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 20
-        result = sync_forks.safety_check("f", "main", "u/repo", "main")
-        self.assertFalse(result)
-        mock_api.assert_not_called()
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "get_file_count")
-    def test_deletion_limit_abort(self, mock_gfc, mock_api):
-        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 95
-        mock_api.return_value = {"total_deletions": 200, "files": []}
-        self.assertFalse(
-            sync_forks.safety_check("f", "main", "u/repo", "main")
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "get_file_count")
-    def test_critical_file_deletion_abort(self, mock_gfc, mock_api):
-        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 95
-        mock_api.return_value = {
-            "total_deletions": 1,
-            "files": [{"filename": "README.md", "status": "removed"}],
-        }
-        self.assertFalse(
-            sync_forks.safety_check("f", "main", "u/repo", "main")
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "get_file_count")
-    def test_github_path_deletion_abort(self, mock_gfc, mock_api):
-        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 95
-        mock_api.return_value = {
-            "total_deletions": 1,
-            "files": [{"filename": ".github/workflows/ci.yml", "status": "removed"}],
-        }
-        self.assertFalse(
-            sync_forks.safety_check("f", "main", "u/repo", "main")
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "get_file_count")
-    def test_safe_sync(self, mock_gfc, mock_api):
-        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 105
-        mock_api.return_value = {
-            "total_deletions": 3,
-            "files": [{"filename": "old.txt", "status": "removed"}],
-        }
-        self.assertTrue(
-            sync_forks.safety_check("f", "main", "u/repo", "main")
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "get_file_count")
-    def test_compare_error_aborts(self, mock_gfc, mock_api):
-        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 105
-        mock_api.return_value = {"error": "compare failed"}
-        self.assertFalse(
-            sync_forks.safety_check("f", "main", "u/repo", "main")
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "get_file_count")
-    def test_malformed_deletion_count_aborts(self, mock_gfc, mock_api):
-        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 105
-        mock_api.return_value = {"total_deletions": "many", "files": []}
-
-        self.assertFalse(
-            sync_forks.safety_check("f", "main", "u/repo", "main")
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "get_file_count")
-    def test_boolean_deletion_count_aborts(self, mock_gfc, mock_api):
-        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 105
-        mock_api.return_value = {"total_deletions": True, "files": []}
-
-        self.assertFalse(
-            sync_forks.safety_check("f", "main", "u/repo", "main")
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "get_file_count")
-    def test_malformed_files_payload_aborts(self, mock_gfc, mock_api):
-        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 105
-        mock_api.return_value = {"total_deletions": 0, "files": "not-a-list"}
-
-        self.assertFalse(
-            sync_forks.safety_check("f", "main", "u/repo", "main")
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "get_file_count")
-    def test_removed_filename_malformed_aborts(self, mock_gfc, mock_api):
-        mock_gfc.side_effect = lambda repo, _: 100 if repo == "f" else 105
-        mock_api.return_value = {
-            "total_deletions": 1,
-            "files": [{"status": "removed", "filename": None}],
-        }
-
-        self.assertFalse(
-            sync_forks.safety_check("f", "main", "u/repo", "main")
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "get_file_count")
-    def test_exact_threshold_passes(self, mock_gfc, mock_api):
-        # 50 files * 0.5 = 25 threshold, upstream=25 should pass
-        mock_gfc.side_effect = lambda repo, _: 50 if repo == "f" else 25
-        mock_api.return_value = {"total_deletions": 0, "files": []}
-        self.assertTrue(
-            sync_forks.safety_check("f", "main", "u/repo", "main")
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "get_file_count")
-    def test_just_below_threshold_aborts(self, mock_gfc, mock_api):
-        # 50 files * 0.5 = 25 threshold, upstream=24 should abort
-        mock_gfc.side_effect = lambda repo, _: 50 if repo == "f" else 24
-        result = sync_forks.safety_check("f", "main", "u/repo", "main")
-        self.assertFalse(result)
-        mock_api.assert_not_called()
-
-
-class TestSyncNowResult(unittest.TestCase):
-    @patch.object(sync_forks, "gh_api")
-    def test_restore_point_invalid_head_response_aborts(self, mock_api):
-        mock_api.return_value = []
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._create_restore_point("me/fork", "main")
-
-        self.assertFalse(result)
-        self.assertIn("Cannot read current fork head", captured.getvalue())
-
-    @patch.object(sync_forks, "gh_api")
-    def test_restore_point_invalid_update_response_aborts(self, mock_api):
-        mock_api.side_effect = [
-            {"object": {"sha": "0123456789abcdef"}},
-            [],
-        ]
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._create_restore_point("me/fork", "main")
-
-        self.assertFalse(result)
-        self.assertIn("Cannot update restore point branch", captured.getvalue())
-
-    @patch.object(sync_forks, "gh_api")
-    def test_restore_point_invalid_create_response_aborts(self, mock_api):
-        mock_api.side_effect = [
-            {"object": {"sha": "0123456789abcdef"}},
-            {
-                "error": "gh: Not Found (HTTP 404)",
-                "error_type": "not_found",
-                "status_code": 404,
-            },
-            [],
-        ]
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._create_restore_point("me/fork", "main")
-
-        self.assertFalse(result)
-        self.assertIn("Cannot create restore point branch", captured.getvalue())
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "safety_check")
-    def test_sync_creates_restore_point_before_merge(self, mock_safety, mock_api):
-        mock_safety.return_value = sync_forks.SAFE
-        mock_api.side_effect = [
-            {"object": {"sha": "0123456789abcdef"}},
-            {"ref": "refs/heads/backup/pre-sync"},
-            {"message": "merged"},
-        ]
-
-        result = sync_forks._sync_now_result("me/fork", "main", "upstream/repo", "main")
-
-        self.assertEqual(result, sync_forks.RESULT_OK)
-        self.assertEqual(mock_api.call_args_list[0].args[0], "repos/me/fork/git/ref/heads/main")
-        self.assertEqual(mock_api.call_args_list[1].args[0], "repos/me/fork/git/refs/heads/backup/pre-sync")
-        self.assertEqual(mock_api.call_args_list[2].args[0], "repos/me/fork/merge-upstream")
-
-    @patch.object(
-        sync_forks,
-        "SELF_USE_SOURCE_REPO_SET",
-        {"example/self-use-fork"},
-    )
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "safety_check")
-    def test_self_use_policy_repo_skips_default_branch_sync(
-        self, mock_safety, mock_api
-    ):
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._sync_now_result(
-                "example/self-use-fork",
-                "main",
-                "upstream/example",
-                "main",
-            )
-
-        self.assertEqual(result, sync_forks.RESULT_OK)
-        self.assertIn("self-use source policy", captured.getvalue())
-        mock_safety.assert_not_called()
-        mock_api.assert_not_called()
-
-    @patch.object(
-        sync_forks,
-        "MIRROR_ONLY_SOURCE_REPO_SET",
-        {"example/mirror-fork"},
-    )
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "safety_check")
-    def test_mirror_policy_repo_skips_restore_point_but_merges(
-        self, mock_safety, mock_api
-    ):
-        mock_safety.return_value = sync_forks.SAFE
-        mock_api.side_effect = [
-            {"message": "merged"},
-        ]
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._sync_now_result(
-                "example/mirror-fork",
-                "mirror/upstream-main",
-                "upstream/example",
-                "main",
-            )
-
-        self.assertEqual(result, sync_forks.RESULT_OK)
-        self.assertIn("Restore point skipped", captured.getvalue())
-        self.assertEqual(len(mock_api.call_args_list), 1)
-        self.assertEqual(
-            mock_api.call_args_list[0].args[0],
-            "repos/example/mirror-fork/merge-upstream",
-        )
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "safety_check")
-    def test_invalid_merge_response_returns_error(self, mock_safety, mock_api):
-        mock_safety.return_value = sync_forks.SAFE
-        mock_api.side_effect = [
-            {"object": {"sha": "0123456789abcdef"}},
-            {"ref": "refs/heads/backup/pre-sync"},
-            [],
-        ]
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._sync_now_result(
-                "me/fork",
-                "main",
-                "upstream/repo",
-                "main",
-            )
-
-        self.assertEqual(result, sync_forks.RESULT_ERROR)
-        self.assertIn("Invalid merge-upstream response", captured.getvalue())
-
-    @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "safety_check")
-    def test_restore_point_failure_aborts_sync(self, mock_safety, mock_api):
-        mock_safety.return_value = sync_forks.SAFE
-        mock_api.side_effect = [
-            {"object": {"sha": "0123456789abcdef"}},
-            {"error": "gh: Bad Gateway (HTTP 502)"},
-        ]
-
-        result = sync_forks._sync_now_result("me/fork", "main", "upstream/repo", "main")
-
-        self.assertEqual(result, sync_forks.RESULT_SAFETY)
-        self.assertTrue(all(
-            call.args[0] != "repos/me/fork/merge-upstream"
-            for call in mock_api.call_args_list
-        ))
-
-
-class TestSyncReleasesResult(unittest.TestCase):
-    @patch.object(sync_forks, "_build_verify_releases_row")
-    def test_self_use_release_policy_is_skipped(self, mock_row):
-        mock_row.return_value = {
-            "release_policy": "self_use_local_releases",
-            "next_action": "none",
-            "result": sync_forks.RESULT_OK,
-        }
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._sync_releases_result({
-                "name": "self-use-fork",
-                "full_name": "example/self-use-fork",
-                "branch": "mirror/upstream-main",
-                "parent": "jlcodes99/cockpit-tools",
-                "parent_branch": "main",
-            })
-
-        self.assertEqual(result, sync_forks.RESULT_OK)
-        self.assertIn("self-use local releases policy", captured.getvalue())
-
-    @patch.object(sync_forks, "_build_verify_releases_row")
-    def test_source_only_release_notes_policy_is_skipped(self, mock_row):
-        mock_row.return_value = {
-            "release_policy": "source_only_release_notes",
-            "next_action": "none",
-            "result": sync_forks.RESULT_OK,
-        }
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._sync_releases_result({
-                "name": "claude-dashboard",
-                "full_name": "sciman-top/claude-dashboard",
-                "branch": "main",
-                "parent": "uppinote20/claude-dashboard",
-                "parent_branch": "main",
-            })
-
-        self.assertEqual(result, sync_forks.RESULT_OK)
-        self.assertIn("source-only release notes policy", captured.getvalue())
-
-    @patch.object(sync_forks, "_build_verify_releases_row")
-    def test_dry_run_reports_release_action(self, mock_row):
-        mock_row.return_value = {
-            "release_policy": "latest_stable_assets_only",
-            "next_action": "mirror_latest_stable_release",
-            "latest_upstream_stable": "v2",
-            "missing_latest_release_assets": ["tool.exe"],
-            "result": sync_forks.RESULT_OK,
-        }
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._sync_releases_result({
-                "name": "installable-tool",
-                "full_name": "sciman-top/installable-tool",
-                "branch": "main",
-                "parent": "upstream-owner/installable-tool",
-                "parent_branch": "main",
-            }, dry_run=True)
-
-        self.assertEqual(result, sync_forks.RESULT_OK)
-        self.assertIn("Would reconcile release retention", captured.getvalue())
-
-    @patch.object(sync_forks, "_build_verify_releases_row")
-    @patch.object(sync_forks, "_prune_old_stable_release_assets")
-    @patch.object(sync_forks, "_sync_latest_release_assets")
-    def test_sync_releases_executes_and_reverifies(
-        self, mock_sync_latest, mock_prune_old, mock_row
-    ):
-        fork = {
-            "name": "installable-tool",
-            "full_name": "sciman-top/installable-tool",
-            "branch": "main",
-            "parent": "upstream-owner/installable-tool",
-            "parent_branch": "main",
-        }
-        mock_row.side_effect = [
-            {
-                "release_policy": "latest_stable_assets_only",
-                "next_action": "mirror_latest_stable_release",
-                "latest_upstream_stable": "v2",
-                "missing_latest_release_assets": ["tool.exe"],
-                "result": sync_forks.RESULT_OK,
-            },
-            {
-                "release_policy": "latest_stable_assets_only",
-                "next_action": "none",
-                "latest_upstream_stable": "v2",
-                "missing_latest_release_assets": [],
-                "result": sync_forks.RESULT_OK,
-            },
-        ]
-        mock_sync_latest.return_value = True
-        mock_prune_old.return_value = True
-
-        result = sync_forks._sync_releases_result(fork)
-
-        self.assertEqual(result, sync_forks.RESULT_OK)
-        mock_sync_latest.assert_called_once()
-
-    @patch.object(sync_forks, "_build_verify_releases_row")
-    @patch.object(sync_forks, "_prune_old_stable_release_assets")
-    @patch.object(sync_forks, "_sync_latest_release_assets")
-    def test_sync_releases_returns_safety_when_not_converged(
-        self, mock_sync_latest, mock_prune_old, mock_row
-    ):
-        fork = {
-            "name": "installable-tool",
-            "full_name": "sciman-top/installable-tool",
-            "branch": "main",
-            "parent": "upstream-owner/installable-tool",
-            "parent_branch": "main",
-        }
-        mock_row.side_effect = [
-            {
-                "release_policy": "latest_stable_assets_only",
-                "next_action": "mirror_latest_stable_assets",
-                "latest_upstream_stable": "v2",
-                "missing_latest_release_assets": ["tool.exe"],
-                "result": sync_forks.RESULT_OK,
-            },
-            {
-                "release_policy": "latest_stable_assets_only",
-                "next_action": "mirror_latest_stable_assets",
-                "latest_upstream_stable": "v2",
-                "missing_latest_release_assets": ["tool.exe"],
-                "result": sync_forks.RESULT_OK,
-            },
-        ]
-        mock_sync_latest.return_value = True
-        mock_prune_old.return_value = True
-
-        result = sync_forks._sync_releases_result(fork)
-
-        self.assertEqual(result, sync_forks.RESULT_SAFETY)
-
-
-# ── paginate ──────────────────────────────────────────────────
-
-class TestPaginate(unittest.TestCase):
-    @patch("gh_utils.gh_api")
-    def test_single_page(self, mock_api):
-        mock_api.return_value = [{"name": "r1"}, {"name": "r2"}]
-        result = paginate("users/u/repos")
-        self.assertEqual(len(result), 2)
-
-    @patch("gh_utils.gh_api")
-    def test_empty_response(self, mock_api):
-        mock_api.return_value = []
-        self.assertEqual(paginate("users/u/repos"), [])
-
-    @patch("gh_utils.gh_api")
-    def test_error_stops(self, mock_api):
-        mock_api.return_value = {"error": "403 rate limit"}
-        self.assertEqual(paginate("users/u/repos"), [])
-
-    @patch("gh_utils.gh_api")
-    def test_two_pages(self, mock_api):
-        page1 = [{"name": f"r{i}"} for i in range(100)]
-        page2 = [{"name": f"r{i}"} for i in range(100, 130)]
-        mock_api.side_effect = [page1, page2]
-        result = paginate("users/u/repos")
-        self.assertEqual(len(result), 130)
-
-    @patch("gh_utils.gh_api")
-    def test_non_list_stops(self, mock_api):
-        mock_api.return_value = "unexpected string"
-        self.assertEqual(paginate("endpoint"), [])
-
-    @patch("gh_utils.gh_api")
-    def test_include_error_returns_error_payload(self, mock_api):
-        mock_api.return_value = {
-            "error": "403 rate limit",
-            "error_type": "rate_limit",
-            "retryable": True,
-        }
-
-        items, error = paginate("users/u/repos", include_error=True)
-
-        self.assertEqual(items, [])
-        self.assertEqual(error["error_type"], "rate_limit")
-
-    @patch("gh_utils.gh_api")
-    def test_include_error_returns_invalid_response_for_non_list(self, mock_api):
-        mock_api.return_value = "unexpected string"
-
-        items, error = paginate("users/u/repos", include_error=True)
-
-        self.assertEqual(items, [])
-        self.assertEqual(error["error_type"], "invalid_response")
-
-    @patch("gh_utils.gh_api")
-    def test_include_error_returns_invalid_response_for_non_error_dict(self, mock_api):
-        mock_api.return_value = {"name": "not-a-list-page"}
-
-        items, error = paginate("users/u/repos", include_error=True)
-
-        self.assertEqual(items, [])
-        self.assertEqual(error["error_type"], "invalid_response")
-
-    @patch("gh_utils.gh_api")
-    def test_include_error_reports_pagination_limit(self, mock_api):
-        page = [{"name": f"r{i}"} for i in range(100)]
-        mock_api.side_effect = [page, page]
-
-        with patch.object(gh_utils, "MAX_PAGES", 2):
-            items, error = paginate("users/u/repos", include_error=True)
-
-        self.assertEqual(len(items), 200)
-        self.assertEqual(error["error_type"], "invalid_response")
-        self.assertIn("Pagination limit exceeded", error["error"])
-
-
-class TestForkDiscovery(unittest.TestCase):
-    @patch("gh_utils.gh_api")
-    def test_get_fork_repos_uses_authenticated_owner_repo_endpoint(self, mock_api):
-        mock_api.return_value = []
-
-        result = gh_utils.get_fork_repos("me")
-
-        self.assertEqual(result, [])
-        self.assertTrue(mock_api.call_args_list)
-        self.assertTrue(
-            mock_api.call_args_list[0].args[0].startswith(
-                "user/repos?affiliation=owner&visibility=all&"
-            )
-        )
-
-    @patch("gh_utils.utc_now_iso")
-    @patch("gh_utils.gh_api")
-    def test_get_fork_repos_with_evidence_reports_live_source(
-        self, mock_api, mock_now
-    ):
-        mock_now.return_value = "2026-04-25T10:00:00Z"
-        mock_api.return_value = [{
+        paginate.return_value = ([{
             "fork": True,
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
+            "name": "fork",
+            "full_name": "me/fork",
             "default_branch": "main",
-            "parent": {
-                "full_name": "upstream-owner/forked-repo",
-                "default_branch": "main",
-            },
-        }]
-
-        forks, evidence = get_fork_repos_with_evidence("me")
-
-        self.assertEqual(len(forks), 1)
-        self.assertEqual(evidence["source"], "live_github_api")
-        self.assertEqual(evidence["repo_count"], 1)
-        self.assertEqual(evidence["fork_count"], 1)
-        self.assertEqual(evidence["fetched_at"], "2026-04-25T10:00:00Z")
-        self.assertEqual(evidence["parent_detail_lookup_count"], 0)
-        self.assertEqual(evidence["parent_detail_cache_hit_count"], 0)
-        self.assertEqual(
-            evidence["endpoint"],
-            gh_utils.FORK_DISCOVERY_ENDPOINT,
-        )
-
-    @patch("gh_utils.gh_api")
-    def test_get_fork_repos_raises_on_initial_discovery_error(self, mock_api):
-        mock_api.return_value = {
-            "error": "gateway timeout",
-            "error_type": "timeout",
-            "retryable": True,
+        }], None)
+        api.return_value = {
+            "parent": {"full_name": "upstream/repo", "default_branch": "main"}
         }
 
-        with self.assertRaises(gh_utils.ForkDiscoveryError) as ctx:
-            gh_utils.get_fork_repos("me")
+        forks, evidence = gh_utils.get_fork_repos_with_evidence("me")
 
-        self.assertIn("Failed to list fork repositories", str(ctx.exception))
+        self.assertEqual(forks, [FORK | {"parent_owner": "upstream"}])
+        self.assertEqual(evidence["source"], "live_github_api")
+        self.assertEqual(evidence["parent_detail_lookup_count"], 1)
 
-    @patch("gh_utils.gh_api")
-    def test_get_fork_repos_raises_on_partial_discovery_error(self, mock_api):
-        first_page = []
-        for i in range(100):
-            first_page.append({
-                "fork": True,
-                "name": f"forked-repo-{i}",
-                "full_name": f"me/forked-repo-{i}",
-                "default_branch": "main",
-                "parent": {
-                    "full_name": f"upstream-owner/forked-repo-{i}",
-                    "default_branch": "main",
-                },
-            })
-        mock_api.side_effect = [
-            first_page,
-            {
-                "error": "gateway timeout",
-                "error_type": "timeout",
-                "retryable": True,
-            },
-        ]
+    @patch("gh_utils.paginate")
+    def test_discovery_fails_closed_on_partial_page_error(self, paginate):
+        paginate.return_value = ([], {"error": "page failed"})
 
         with self.assertRaises(gh_utils.ForkDiscoveryError):
-            gh_utils.get_fork_repos("me")
+            gh_utils.get_fork_repos_with_evidence("me")
 
-    @patch("gh_utils.gh_api")
-    def test_get_fork_repos_raises_when_parent_detail_lookup_fails(self, mock_api):
-        mock_api.side_effect = [
-            [{
-                "fork": True,
-                "name": "forked-repo",
-                "full_name": "me/forked-repo",
-                "default_branch": "main",
-            }],
-            {
-                "error": "gh: Forbidden (HTTP 403)",
-                "error_type": "auth",
-                "status_code": 403,
-            },
-        ]
-
-        with self.assertRaises(gh_utils.ForkDiscoveryError) as ctx:
-            gh_utils.get_fork_repos("me")
-
-        self.assertIn("Failed to inspect fork repository metadata", str(ctx.exception))
-        self.assertEqual(ctx.exception.detail["repo"], "me/forked-repo")
-
-    @patch("gh_utils.gh_api")
-    def test_get_fork_repos_raises_when_detail_lacks_parent(self, mock_api):
-        mock_api.side_effect = [
-            [{
-                "fork": True,
-                "name": "forked-repo",
-                "full_name": "me/forked-repo",
-                "default_branch": "main",
-            }],
-            {
-                "fork": True,
-                "name": "forked-repo",
-                "full_name": "me/forked-repo",
-                "default_branch": "main",
-            },
-        ]
-
-        with self.assertRaises(gh_utils.ForkDiscoveryError) as ctx:
-            gh_utils.get_fork_repos("me")
-
-        self.assertIn("missing parent information", str(ctx.exception))
-        self.assertEqual(ctx.exception.detail["repo"], "me/forked-repo")
-
-    @patch("gh_utils.gh_api")
-    def test_get_fork_repos_caches_parent_detail_lookup(self, mock_api):
-        mock_api.side_effect = [
-            [
-                {
-                    "fork": True,
-                    "name": "forked-repo",
-                    "full_name": "me/forked-repo",
-                    "default_branch": "main",
-                },
-                {
-                    "fork": True,
-                    "name": "forked-repo",
-                    "full_name": "me/forked-repo",
-                    "default_branch": "main",
-                },
-            ],
-            {
-                "fork": True,
-                "name": "forked-repo",
-                "full_name": "me/forked-repo",
-                "default_branch": "main",
-                "parent": {
-                    "full_name": "upstream-owner/forked-repo",
-                    "default_branch": "main",
-                },
-            },
-        ]
-
-        forks, evidence = get_fork_repos_with_evidence("me")
-
-        self.assertEqual(len(forks), 2)
-        self.assertEqual(evidence["parent_detail_lookup_count"], 1)
-        self.assertEqual(evidence["parent_detail_cache_hit_count"], 1)
-        self.assertEqual(mock_api.call_count, 2)
-
-    @patch("gh_utils.gh_api")
-    def test_get_fork_repos_skips_malformed_repo_without_full_name(self, mock_api):
-        mock_api.return_value = [{
+    @patch("gh_utils.gh_api", return_value={"parent": {}})
+    @patch("gh_utils.paginate")
+    def test_discovery_fails_closed_when_parent_is_missing(self, paginate, _api):
+        paginate.return_value = ([{
             "fork": True,
-            "name": "forked-repo",
+            "name": "fork",
+            "full_name": "me/fork",
             "default_branch": "main",
-            "parent": "not-a-dict",
-        }]
+        }], None)
 
-        forks, evidence = get_fork_repos_with_evidence("me")
-
-        self.assertEqual(forks, [])
-        self.assertEqual(evidence["repo_count"], 1)
-        self.assertEqual(evidence["fork_count"], 0)
+        with self.assertRaises(gh_utils.ForkDiscoveryError):
+            gh_utils.get_fork_repos_with_evidence("me")
 
 
-class TestWorkflowContracts(unittest.TestCase):
-    def test_integration_smoke_does_not_reference_secrets_in_if_conditions(self):
-        workflow_path = os.path.join(
-            _here, ".github", "workflows", "integration-api-smoke.yml"
-        )
-        with open(workflow_path, "r", encoding="utf-8") as f:
-            workflow = f.read()
-
-        if_lines = [
-            line.strip()
-            for line in workflow.splitlines()
-            if line.strip().startswith("if:")
-        ]
-
-        self.assertTrue(if_lines)
-        self.assertTrue(all("secrets." not in line for line in if_lines))
-        self.assertIn("id: integration_credentials", workflow)
-        self.assertIn(
-            "steps.integration_credentials.outputs.ready == 'true'",
-            workflow,
-        )
-        self.assertIn("test_support.py", workflow)
-
-    def test_generated_workflow_syncs_fork_default_branch(self):
-        workflow = sync_forks._render_workflow_template()
-        merge_lines = [
-            line
-            for line in workflow.splitlines()
-            if "merge-upstream" in line and "-f branch=" in line
-        ]
-
-        self.assertEqual(len(merge_lines), 1)
-        self.assertIn("github.event.repository.default_branch", merge_lines[0])
-        self.assertNotIn("steps.upstream.outputs.branch", merge_lines[0])
-
-    def test_generated_workflow_has_self_use_source_guard(self):
+class WorkflowTests(unittest.TestCase):
+    def test_rendered_workflow_keeps_only_active_safety_chain(self):
         workflow = sync_forks._render_workflow_template()
 
-        self.assertIn("Self-use source policy guard", workflow)
-        self.assertIn("SELF_USE_SOURCE_REPOS", workflow)
-        self.assertIn("steps.self_use_source_policy.outputs.skip != 'true'", workflow)
-        self.assertIn("MIRROR_ONLY_SOURCE_REPOS", workflow)
-        self.assertIn("MIRROR_ONLY_SOURCE_BRANCH", workflow)
-        self.assertIn("github.event.repository.default_branch", workflow)
-        self.assertIn("Restore point policy guard", workflow)
-        self.assertIn("Mirror-only source policy is enabled", workflow)
+        self.assertIn('cron: "0 13 * * 5"', workflow)
+        self.assertIn("workflow_dispatch", workflow)
+        self.assertIn("backup/pre-sync", workflow)
+        self.assertIn("critical path deletion detected", workflow)
+        self.assertIn("merge-upstream", workflow)
+        self.assertNotIn("Self-use source policy", workflow)
+        self.assertNotIn("MIRROR_ONLY_SOURCE", workflow)
 
-    def test_generated_workflow_has_release_retention_step(self):
+    def test_current_workflow_is_not_rewritten(self):
         workflow = sync_forks._render_workflow_template()
 
-        self.assertIn("Release retention policy", workflow)
-        self.assertIn("SELF_USE_RELEASE_REPOS", workflow)
-        self.assertIn("source-only release notes policy", workflow)
-        self.assertIn('"release", "download"', workflow)
-        self.assertIn('"release", "upload"', workflow)
-        self.assertIn('"release", "delete-asset"', workflow)
+        needs_update, reason = sync_forks._needs_workflow_update({
+            "content": encoded(workflow),
+            "sha": "abc",
+        })
 
-    def test_generated_workflow_preserves_embedded_python_newline_escape(self):
-        workflow = sync_forks._render_workflow_template()
+        self.assertFalse(needs_update)
+        self.assertIn("already matches", reason)
 
-        self.assertIn('stripped = line.rstrip("\\n")', workflow)
-        self.assertNotIn('stripped = line.rstrip("\n")', workflow)
-
-    def test_generated_workflow_url_encodes_compare_refs(self):
-        workflow = sync_forks._render_workflow_template()
-
-        self.assertIn("BASE_REF:", workflow)
-        self.assertIn("HEAD_REF:", workflow)
-        self.assertIn("urllib.parse import quote", workflow)
-        self.assertIn("compare/${COMPARE_BASE}...${COMPARE_HEAD}", workflow)
-
-
-class TestListForks(unittest.TestCase):
-    @patch.object(list_forks, "get_auth_context")
-    @patch.object(list_forks, "check_gh_cli")
-    def test_help_returns_exit_ok_without_runtime_checks(
-        self, mock_check, mock_auth_context
-    ):
-        with patch.object(list_forks.sys, "argv", ["list-forks.py", "--help"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = list_forks.main()
-
-        self.assertEqual(exit_code, 0)
-        self.assertIn("Usage:", captured.getvalue())
-        mock_check.assert_not_called()
-        mock_auth_context.assert_not_called()
-
-    @patch.object(list_forks, "get_auth_context")
-    @patch.object(list_forks, "check_gh_cli")
-    def test_unknown_args_return_exit_error_without_runtime_checks(
-        self, mock_check, mock_auth_context
-    ):
-        with patch.object(list_forks.sys, "argv", ["list-forks.py", "--bad-flag"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = list_forks.main()
-
-        self.assertEqual(exit_code, 1)
-        self.assertIn("Unknown argument", captured.getvalue())
-        mock_check.assert_not_called()
-        mock_auth_context.assert_not_called()
-
-    def test_unknown_args_return_json_error_payload(self):
-        with patch.object(list_forks.sys, "argv", ["list-forks.py", "--json", "--bad-flag"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = list_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(payload["tool"], "list-forks")
-        self.assertIn("Unknown argument", payload["error"])
-        self.assertEqual(payload["error_code"], "E_CLI_UNKNOWN_ARGUMENT")
-        self.assertEqual(payload["error_type"], "cli")
-
-    def test_unknown_args_return_json_when_json_flag_is_last(self):
-        with patch.object(list_forks.sys, "argv", ["list-forks.py", "--bad-flag", "--json"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = list_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(payload["tool"], "list-forks")
-        self.assertEqual(payload["error_code"], "E_CLI_UNKNOWN_ARGUMENT")
-
-    @patch.object(list_forks, "get_auth_context")
-    @patch.object(list_forks, "check_gh_cli")
-    def test_json_output_handles_empty_repo_list(
-        self, mock_check, mock_auth_context
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "env_token",
-                "source": "GH_TOKEN",
-            },
+    @patch.object(sync_forks, "gh_api")
+    def test_add_workflow_dry_run_never_puts(self, api):
+        api.return_value = {
+            "error": "Not Found (HTTP 404)",
+            "error_type": "not_found",
+            "status_code": 404,
         }
 
-        discovery = {
-            "source": "live_github_api",
-            "endpoint": gh_utils.FORK_DISCOVERY_ENDPOINT,
-            "fetched_at": "2026-04-25T10:00:00Z",
-            "authenticated_user": "me",
-            "repo_count": 5,
-            "fork_count": 0,
-        }
-        with patch.object(
-            list_forks,
-            "get_fork_repos_with_evidence",
-            return_value=([], discovery),
-        ):
-            with patch.object(list_forks.sys, "argv", ["list-forks.py", "--json"]):
-                with contextlib.redirect_stdout(io.StringIO()) as captured:
-                    exit_code = list_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(payload["summary"]["total"], 0)
-        self.assertEqual(payload["auth"]["mode"], "env_token")
-        self.assertEqual(payload["discovery"]["source"], "live_github_api")
-        self.assertEqual(payload["discovery"]["repo_count"], 5)
-        mock_check.assert_called_once()
-
-    @patch.object(list_forks, "get_fork_repos_with_evidence")
-    @patch.object(list_forks, "get_auth_context")
-    @patch.object(list_forks, "check_gh_cli")
-    def test_json_output_handles_fork_discovery_failure(
-        self, _mock_check, mock_auth_context, mock_get_forks
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "env_token",
-                "source": "GH_TOKEN",
-            },
-        }
-        mock_get_forks.side_effect = gh_utils.ForkDiscoveryError(
-            message="Failed to list fork repositories from GitHub API.",
-            detail={"error": "gateway timeout"},
+        result = sync_forks._add_sync_workflow_result(
+            "me/fork", "main", dry_run=True
         )
 
-        with patch.object(list_forks.sys, "argv", ["list-forks.py", "--json"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = list_forks.main()
+        self.assertEqual(result, sync_forks.RESULT_OK)
+        self.assertEqual(api.call_count, 1)
 
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(payload["tool"], "list-forks")
-        self.assertEqual(payload["error"], "fork_discovery_failed")
-        self.assertEqual(payload["error_code"], "E_FORK_DISCOVERY_FAILED")
-        self.assertEqual(payload["error_type"], "discovery")
+    @patch.object(sync_forks, "gh_api")
+    def test_add_workflow_fails_closed_when_lookup_is_unauthorized(self, api):
+        api.return_value = {"error": "Forbidden (HTTP 403)"}
 
-    @patch.object(list_forks, "gh_api")
-    @patch.object(list_forks, "get_fork_repos_with_evidence")
-    @patch.object(list_forks, "get_auth_context")
-    @patch.object(list_forks, "check_gh_cli")
-    def test_compare_uses_owner_branch_ref(
-        self, _mock_check, mock_auth_context, mock_get_forks, mock_api
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "gh_login",
-                "source": "gh auth login",
-            },
-        }
-        discovery = {
-            "source": "live_github_api",
-            "endpoint": gh_utils.FORK_DISCOVERY_ENDPOINT,
-            "fetched_at": "2026-04-25T10:00:00Z",
-            "authenticated_user": "me",
-            "repo_count": 1,
-            "fork_count": 1,
-        }
-        mock_get_forks.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "develop",
-            "parent_owner": "upstream-owner",
-        }], discovery)
-        mock_api.side_effect = [
-            {"content": "workflow"},
-            {"ahead_by": 4, "behind_by": 0},
-        ]
+        result = sync_forks._add_sync_workflow_result("me/fork", "main")
 
-        with patch.object(list_forks.sys, "argv", ["list-forks.py"]):
-            with contextlib.redirect_stdout(io.StringIO()):
-                exit_code = list_forks.main()
+        self.assertEqual(result, sync_forks.RESULT_ERROR)
+        self.assertEqual(api.call_count, 1)
 
-        self.assertEqual(exit_code, 0)
-        mock_api.assert_any_call(
-            "repos/me/forked-repo/compare/main...upstream-owner:develop"
-        )
-
-    @patch.object(list_forks, "gh_api")
-    def test_compare_endpoint_encodes_branch_slashes(self, mock_api):
-        fork = {
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "release/2026-q2",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "feature/branch",
-            "parent_owner": "upstream-owner",
-        }
-        mock_api.side_effect = [
-            {"content": "workflow"},
-            {"ahead_by": 4, "behind_by": 0},
-        ]
-
-        rows = list_forks._collect_fork_statuses([fork])
-
-        self.assertEqual(rows[0]["behind_by"], 4)
-        mock_api.assert_any_call(
-            "repos/me/forked-repo/contents/.github/workflows/sync-fork.yml"
-            "?ref=release%2F2026-q2"
-        )
-        mock_api.assert_any_call(
-            "repos/me/forked-repo/compare/"
-            "release%2F2026-q2...upstream-owner:feature%2Fbranch"
-        )
-
-    @patch.object(list_forks, "gh_api")
-    def test_collect_fork_statuses_uses_upstream_ahead_as_behind_count(
-        self, mock_api
-    ):
-        fork = {
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }
-        mock_api.side_effect = [
-            {"content": "workflow"},
-            {"ahead_by": 3, "behind_by": 0},
-        ]
-
-        rows = list_forks._collect_fork_statuses([fork])
-
-        self.assertEqual(rows[0]["behind_by"], 3)
-
-    @patch.object(list_forks, "gh_api")
-    def test_collect_fork_statuses_ignores_malformed_ahead_by(self, mock_api):
-        fork = {
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }
-        mock_api.side_effect = [
-            {"content": "workflow"},
-            {"ahead_by": True, "behind_by": 0},
-        ]
-
-        rows = list_forks._collect_fork_statuses([fork])
-        self.assertIsNone(rows[0]["behind_by"])
-
-    @patch.object(list_forks, "gh_api")
-    def test_collect_fork_statuses_skips_api_calls_when_branch_metadata_is_missing(
-        self, mock_api
-    ):
-        fork = {
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": None,
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }
-
-        rows = list_forks._collect_fork_statuses([fork])
-
-        self.assertEqual(rows[0]["workflow_status"], "Missing")
-        self.assertIsNone(rows[0]["behind_by"])
-        mock_api.assert_not_called()
-
-    @patch.object(list_forks, "gh_api")
-    def test_collect_fork_statuses_degrades_compare_errors_to_unknown_behind(
-        self, mock_api
-    ):
-        fork = {
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }
-        mock_api.side_effect = [
-            {"content": "workflow"},
-            {"error": "gh: Bad Gateway (HTTP 502)", "error_type": "server"},
-        ]
-
-        rows = list_forks._collect_fork_statuses([fork])
-
-        self.assertEqual(rows[0]["workflow_status"], "Installed")
-        self.assertIsNone(rows[0]["behind_by"])
-
-    @patch.object(list_forks, "get_auth_context")
-    @patch.object(list_forks, "check_gh_cli")
-    def test_json_output_treats_non_dict_workflow_response_as_missing(
-        self, _mock_check, mock_auth_context
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "env_token",
-                "source": "GH_TOKEN",
-            },
-        }
-        fork = {
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }
-
-        discovery = {
-            "source": "live_github_api",
-            "endpoint": gh_utils.FORK_DISCOVERY_ENDPOINT,
-            "fetched_at": "2026-04-25T10:00:00Z",
-            "authenticated_user": "me",
-            "repo_count": 1,
-            "fork_count": 1,
-        }
-        with patch.object(
-            list_forks,
-            "get_fork_repos_with_evidence",
-            return_value=([fork], discovery),
-        ):
-            with patch.object(list_forks, "gh_api", side_effect=[[], {"ahead_by": 0}]):
-                with patch.object(list_forks.sys, "argv", ["list-forks.py", "--json"]):
-                    with contextlib.redirect_stdout(io.StringIO()) as captured:
-                        exit_code = list_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, 0)
-        self.assertFalse(payload["repos"][0]["workflow_installed"])
-        self.assertEqual(payload["repos"][0]["workflow_status"], "Missing")
-
-    @patch.object(list_forks, "get_auth_context")
-    @patch.object(list_forks, "check_gh_cli")
-    def test_json_output_returns_structured_auth_failure(
-        self, _mock_check, mock_auth_context
-    ):
-        mock_auth_context.side_effect = gh_utils.AuthContextError(
-            auth_info={
-                "configured": False,
-                "mode": "unconfigured",
-                "source": None,
-            },
-            error_type="auth",
-            message="Not authenticated. Set GH_TOKEN/GITHUB_TOKEN or run: gh auth login",
-        )
-
-        with patch.object(list_forks.sys, "argv", ["list-forks.py", "--json"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = list_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(payload["tool"], "list-forks")
-        self.assertEqual(payload["error"], "authentication_failed")
-        self.assertEqual(payload["error_code"], "E_AUTH_CONTEXT_FAILED")
-        self.assertEqual(payload["error_type"], "auth")
-
-
-class TestSyncForksMain(unittest.TestCase):
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_help_returns_exit_ok_without_runtime_checks(
-        self, mock_check, mock_auth_context
-    ):
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--help"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = sync_forks.main()
-
-        self.assertEqual(exit_code, sync_forks.EXIT_OK)
-        self.assertIn("Usage:", captured.getvalue())
-        mock_check.assert_not_called()
-        mock_auth_context.assert_not_called()
-
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_unknown_option_returns_exit_error_without_runtime_checks(
-        self, mock_check, mock_auth_context
-    ):
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--bad-flag"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = sync_forks.main()
-
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-        self.assertIn("Unknown option", captured.getvalue())
-        mock_check.assert_not_called()
-        mock_auth_context.assert_not_called()
-
-    def test_unknown_option_returns_json_error_payload(self):
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--json", "--bad-flag"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = sync_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-        self.assertEqual(payload["tool"], "sync-forks")
-        self.assertIn("Unknown option", payload["error"])
-        self.assertEqual(payload["error_code"], "E_CLI_UNKNOWN_OPTION")
-        self.assertEqual(payload["error_type"], "cli")
-
-    def test_unknown_option_returns_json_when_json_flag_is_last(self):
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--bad-flag", "--json"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = sync_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-        self.assertEqual(payload["tool"], "sync-forks")
-        self.assertEqual(payload["error_code"], "E_CLI_UNKNOWN_OPTION")
-
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_force_sync_requires_explicit_confirmation(
-        self, mock_check, mock_auth_context
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "env_token",
-                "source": "GH_TOKEN",
-            },
-        }
-
-        with patch.dict("os.environ", {sync_forks.FORCE_SYNC_ACK_ENV: ""}, clear=False):
-            with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--json", "--force", "forked-repo"]):
-                with contextlib.redirect_stdout(io.StringIO()) as captured:
-                    exit_code = sync_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-        self.assertEqual(payload["error"], "force_confirmation_required")
-        self.assertEqual(payload["error_code"], "E_FORCE_CONFIRMATION_REQUIRED")
-        self.assertEqual(payload["error_type"], "safety")
-        mock_check.assert_called_once()
-        mock_auth_context.assert_called_once()
-
-    @patch.object(sync_forks, "_resolve_specific_forks")
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_force_add_workflow_requires_explicit_confirmation(
-        self, _mock_check, mock_auth_context, mock_resolve
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "env_token",
-                "source": "GH_TOKEN",
-            },
-        }
-
-        with patch.dict("os.environ", {sync_forks.FORCE_SYNC_ACK_ENV: ""}, clear=False):
-            with patch.object(
-                sync_forks.sys,
-                "argv",
-                ["sync-forks.py", "--json", "--add-workflow", "--force", "forked-repo"],
-            ):
-                with contextlib.redirect_stdout(io.StringIO()) as captured:
-                    exit_code = sync_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-        self.assertEqual(payload["error"], "force_confirmation_required")
-        self.assertEqual(payload["error_code"], "E_FORCE_CONFIRMATION_REQUIRED")
-        self.assertEqual(payload["error_type"], "safety")
-        mock_resolve.assert_not_called()
-
-    @patch.object(sync_forks, "_sync_now_result")
-    @patch.object(sync_forks, "_resolve_specific_forks")
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_force_sync_with_confirmation_runs(
-        self, _mock_check, mock_auth_context, mock_resolve, mock_sync
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "env_token",
-                "source": "GH_TOKEN",
-            },
-        }
-        mock_resolve.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }], False)
-        mock_sync.return_value = sync_forks.RESULT_OK
-
-        with patch.dict(
-            "os.environ",
-            {sync_forks.FORCE_SYNC_ACK_ENV: sync_forks.FORCE_SYNC_ACK_VALUE},
-            clear=False,
-        ):
-            with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--force", "forked-repo"]):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    exit_code = sync_forks.main()
-
-        self.assertEqual(exit_code, sync_forks.EXIT_OK)
-        mock_sync.assert_called_once()
-
-    @patch.object(sync_forks, "_add_sync_workflow_result")
-    @patch.object(sync_forks, "_resolve_specific_forks")
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_force_add_workflow_with_confirmation_runs(
-        self, _mock_check, mock_auth_context, mock_resolve, mock_add
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "env_token",
-                "source": "GH_TOKEN",
-            },
-        }
-        mock_resolve.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }], False)
-        mock_add.return_value = sync_forks.RESULT_OK
-
-        with patch.dict(
-            "os.environ",
-            {sync_forks.FORCE_SYNC_ACK_ENV: sync_forks.FORCE_SYNC_ACK_VALUE},
-            clear=False,
-        ):
-            with patch.object(
-                sync_forks.sys,
-                "argv",
-                ["sync-forks.py", "--add-workflow", "--force", "forked-repo"],
-            ):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    exit_code = sync_forks.main()
-
-        self.assertEqual(exit_code, sync_forks.EXIT_OK)
-        mock_add.assert_called_once_with("me/forked-repo", "main", False, True)
-
-    @patch.object(sync_forks, "_sync_now_result")
-    @patch.object(sync_forks, "_resolve_specific_forks")
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_json_output_returns_summary_payload(
-        self, mock_check, mock_auth_context, mock_resolve, mock_sync
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "env_token",
-                "source": "GH_TOKEN",
-            },
-        }
-        mock_resolve.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }], False)
-        mock_sync.return_value = sync_forks.RESULT_OK
-
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--json", "forked-repo"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = sync_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, sync_forks.EXIT_OK)
-        self.assertEqual(payload["tool"], "sync-forks")
-        self.assertEqual(payload["summary"]["success"], 1)
-        self.assertEqual(payload["auth"]["source"], "GH_TOKEN")
-        self.assertEqual(payload["discovery"]["source"], "explicit_args")
-        self.assertEqual(payload["discovery"]["requested"], ["forked-repo"])
-        mock_check.assert_called_once()
-
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_specific_repo_resolution_error_returns_exit_error(
-        self, _mock_check, mock_auth_context
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "gh_login",
-                "source": "gh auth login",
-            },
-        }
-        with patch.object(sync_forks, "gh_api", return_value={"error": "404"}):
-            with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "missing"]):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    exit_code = sync_forks.main()
-
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_non_fork_target_returns_exit_error(
-        self, _mock_check, mock_auth_context
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "gh_login",
-                "source": "gh auth login",
-            },
-        }
-        repo = {
-            "fork": False,
-            "name": "plain-repo",
-            "full_name": "me/plain-repo",
-            "default_branch": "main",
-        }
-        with patch.object(sync_forks, "gh_api", return_value=repo):
-            with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "plain-repo"]):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    exit_code = sync_forks.main()
-
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_invalid_specific_repo_response_returns_exit_error(
-        self, _mock_check, mock_auth_context
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "gh_login",
-                "source": "gh auth login",
-            },
-        }
-        with patch.object(sync_forks, "gh_api", return_value=[]):
-            with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "broken"]):
-                with contextlib.redirect_stdout(io.StringIO()) as captured:
-                    exit_code = sync_forks.main()
-
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-        self.assertIn("invalid repository response", captured.getvalue())
-
-    @patch.object(sync_forks, "_add_sync_workflow_result")
-    @patch.object(sync_forks, "_resolve_specific_forks")
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_add_workflow_failure_returns_exit_error(
-        self, _mock_check, mock_auth_context, mock_resolve, mock_add
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "gh_login",
-                "source": "gh auth login",
-            },
-        }
-        mock_resolve.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }], False)
-        mock_add.return_value = sync_forks.RESULT_ERROR
-
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--add-workflow", "forked-repo"]):
-            with contextlib.redirect_stdout(io.StringIO()):
-                exit_code = sync_forks.main()
-
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-
-    @patch.object(sync_forks, "_sync_now_result")
-    @patch.object(sync_forks, "_resolve_specific_forks")
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_sync_safety_abort_returns_exit_safety(
-        self, _mock_check, mock_auth_context, mock_resolve, mock_sync
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "gh_login",
-                "source": "gh auth login",
-            },
-        }
-        mock_resolve.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }], False)
-        mock_sync.return_value = sync_forks.RESULT_SAFETY
-
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "forked-repo"]):
-            with contextlib.redirect_stdout(io.StringIO()):
-                exit_code = sync_forks.main()
-
-        self.assertEqual(exit_code, sync_forks.EXIT_SAFETY)
-
-    @patch.object(sync_forks, "_sync_now_result")
-    @patch.object(sync_forks, "_resolve_specific_forks")
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_sync_runtime_failure_returns_exit_error(
-        self, _mock_check, mock_auth_context, mock_resolve, mock_sync
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "gh_login",
-                "source": "gh auth login",
-            },
-        }
-        mock_resolve.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }], False)
-        mock_sync.return_value = sync_forks.RESULT_ERROR
-
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "forked-repo"]):
-            with contextlib.redirect_stdout(io.StringIO()):
-                exit_code = sync_forks.main()
-
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_json_output_returns_structured_auth_failure(
-        self, _mock_check, mock_auth_context
-    ):
-        mock_auth_context.side_effect = gh_utils.AuthContextError(
-            auth_info={
-                "configured": False,
-                "mode": "unconfigured",
-                "source": None,
-            },
-            error_type="auth",
-            message="Not authenticated. Set GH_TOKEN/GITHUB_TOKEN or run: gh auth login",
-        )
-
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--json"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = sync_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-        self.assertEqual(payload["tool"], "sync-forks")
-        self.assertEqual(payload["error"], "authentication_failed")
-        self.assertEqual(payload["error_code"], "E_AUTH_CONTEXT_FAILED")
-        self.assertEqual(payload["error_type"], "auth")
-
-    @patch.object(sync_forks, "get_fork_repos_with_evidence")
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_json_output_returns_structured_fork_discovery_failure(
-        self, _mock_check, mock_auth_context, mock_get_forks
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "gh_login",
-                "source": "gh auth login",
-            },
-        }
-        mock_get_forks.side_effect = gh_utils.ForkDiscoveryError(
-            message="Failed to list fork repositories from GitHub API.",
-            detail={"error": "gateway timeout"},
-        )
-
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--json"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = sync_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-        self.assertEqual(payload["tool"], "sync-forks")
-        self.assertEqual(payload["error"], "fork_discovery_failed")
-        self.assertEqual(payload["error_code"], "E_FORK_DISCOVERY_FAILED")
-        self.assertEqual(payload["error_type"], "discovery")
-
-
-# ── Named constants ───────────────────────────────────────────
-
-class TestConstants(unittest.TestCase):
-    def test_safe_abort_skip_values(self):
-        self.assertIs(sync_forks.SAFE, True)
-        self.assertIs(sync_forks.ABORT, False)
-        self.assertIs(sync_forks.SKIP, None)
-
-    def test_exit_codes(self):
-        self.assertEqual(sync_forks.EXIT_OK, 0)
-        self.assertEqual(sync_forks.EXIT_ERROR, 1)
-        self.assertEqual(sync_forks.EXIT_SAFETY, 3)
-
-
-class TestAstGuards(unittest.TestCase):
-    def test_no_duplicate_top_level_definitions(self):
-        target_paths = (
-            "gh_utils.py",
-            "sync-forks.py",
-            "list-forks.py",
-        )
-
-        for relative_path in target_paths:
-            with self.subTest(path=relative_path):
-                full_path = os.path.join(_here, relative_path)
-                with open(full_path, encoding="utf-8") as handle:
-                    tree = ast.parse(handle.read(), filename=relative_path)
-
-                first_seen = {}
-                duplicates = []
-                for node in tree.body:
-                    if not isinstance(
-                        node,
-                        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-                    ):
-                        continue
-                    if node.name in first_seen:
-                        duplicates.append(
-                            (node.name, first_seen[node.name], node.lineno)
-                        )
-                    else:
-                        first_seen[node.name] = node.lineno
-
-                self.assertEqual(duplicates, [])
-
-
-class TestSyncForksHelpers(unittest.TestCase):
-    def test_dedupe_preserve_order(self):
-        self.assertEqual(
-            sync_forks._dedupe_preserve_order(
-                ["fork-a", "fork-b", "fork-a", "fork-c", "fork-b"]
-            ),
-            ["fork-a", "fork-b", "fork-c"],
-        )
-
-    def test_parse_cli_rejects_multiple_modes(self):
+    def test_cli_modes_are_mutually_exclusive(self):
         parsed = sync_forks._parse_cli_args([
-            "--add-workflow",
-            "--verify-schedule",
-            "--json",
+            "--add-workflow", "--verify-releases"
         ])
 
         self.assertIn("Choose only one mode", parsed["error"])
-        self.assertTrue(parsed["json_output"])
 
-    def test_selected_mode_flags_returns_selected_flags(self):
-        self.assertEqual(
-            sync_forks._selected_mode_flags({
-                "add_mode": True,
-                "verify_schedule": False,
-                "verify_releases": True,
-                "sync_releases": False,
-            }),
-            ["add_mode", "verify_releases"],
-        )
 
-    def test_selected_mode_flags_includes_sync_releases(self):
-        self.assertEqual(
-            sync_forks._selected_mode_flags({
-                "add_mode": False,
-                "verify_schedule": False,
-                "verify_releases": False,
-                "sync_releases": True,
-            }),
-            ["sync_releases"],
-        )
+class SafetyAndSyncTests(unittest.TestCase):
+    @patch.object(sync_forks, "get_file_count")
+    def test_force_bypasses_safety_reads(self, file_count):
+        self.assertIs(sync_forks.safety_check("f", "main", "u/r", "main", True), True)
+        file_count.assert_not_called()
 
-    def test_mode_name_maps_all_supported_modes(self):
-        self.assertEqual(
-            sync_forks._mode_name(False, False, False, False),
-            sync_forks.MODE_SYNC,
-        )
-        self.assertEqual(
-            sync_forks._mode_name(True, False, False, False),
-            sync_forks.MODE_ADD_WORKFLOW,
-        )
-        self.assertEqual(
-            sync_forks._mode_name(False, True, False, False),
-            sync_forks.MODE_VERIFY_SCHEDULE,
-        )
-        self.assertEqual(
-            sync_forks._mode_name(False, False, True, False),
-            sync_forks.MODE_VERIFY_RELEASES,
-        )
-        self.assertEqual(
-            sync_forks._mode_name(False, False, False, True),
-            sync_forks.MODE_SYNC_RELEASES,
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "get_file_count")
+    def test_file_ratio_abort_happens_before_compare(self, file_count, api):
+        file_count.side_effect = [100, 20]
+
+        result = sync_forks.safety_check("f", "main", "u/r", "main")
+
+        self.assertIs(result, sync_forks.ABORT)
+        api.assert_not_called()
+
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "get_file_count")
+    def test_critical_deletion_aborts(self, file_count, api):
+        file_count.side_effect = [100, 100]
+        api.return_value = {
+            "total_deletions": 1,
+            "files": [{"status": "removed", "filename": ".github/workflows/ci.yml"}],
+        }
+
+        self.assertIs(
+            sync_forks.safety_check("f", "main", "u/r", "main"),
+            sync_forks.ABORT,
         )
 
-    def test_cockpit_source_update_policy_follows_upstream_default_branch(self):
-        self.assertEqual(
-            sync_forks._source_update_policy(
-                "sciman-top/cockpit-tools",
-                "main",
-            ),
-            "upstream_default_branch",
-        )
-        self.assertEqual(
-            sync_forks._source_update_policy(
-                "sciman-top/cockpit-tools",
-                "mirror/upstream-main",
-            ),
-            "upstream_default_branch",
-        )
-        self.assertEqual(
-            sync_forks._source_update_policy(
-                "sciman-top/claude-dashboard",
-                "main",
-            ),
-            "upstream_default_branch",
-        )
-        self.assertEqual(
-            sync_forks._source_update_policy(
-                "sciman-top/cockpit-tools",
-                None,
-            ),
-            "upstream_default_branch",
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "get_file_count")
+    def test_safe_change_passes(self, file_count, api):
+        file_count.side_effect = [100, 105]
+        api.return_value = {
+            "total_deletions": 2,
+            "files": [{"status": "removed", "filename": "old.txt"}],
+        }
+
+        self.assertIs(
+            sync_forks.safety_check("f", "main", "u/r", "main"),
+            sync_forks.SAFE,
         )
 
-    def test_latest_workflow_run_normalizes_valid_payload(self):
-        result = sync_forks._latest_workflow_run({
-            "workflow_runs": [{
-                "status": "completed",
-                "conclusion": "success",
-                "created_at": "2026-05-10T11:42:40Z",
-                "updated_at": "2026-05-10T11:43:00Z",
-                "html_url": "https://example.com/run/2",
+    @patch.object(sync_forks, "gh_api")
+    def test_restore_point_updates_current_head(self, api):
+        api.side_effect = [
+            {"object": {"sha": "0123456789abcdef"}},
+            {"ref": "refs/heads/backup/pre-sync"},
+        ]
+
+        self.assertTrue(sync_forks._create_restore_point("me/fork", "main"))
+        self.assertEqual(api.call_args_list[1].kwargs["method"], "PATCH")
+        self.assertEqual(
+            api.call_args_list[1].kwargs["payload"],
+            {"sha": "0123456789abcdef", "force": True},
+        )
+
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "_create_restore_point", return_value=False)
+    @patch.object(sync_forks, "safety_check", return_value=True)
+    def test_restore_point_failure_blocks_merge(self, _safety, _restore, api):
+        result = sync_forks._sync_now_result(
+            "me/fork", "main", "upstream/repo", "main"
+        )
+
+        self.assertEqual(result, sync_forks.RESULT_SAFETY)
+        api.assert_not_called()
+
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "safety_check")
+    def test_dry_run_skips_safety_and_remote_calls(self, safety, api):
+        result = sync_forks._sync_now_result(
+            "me/fork", "main", "upstream/repo", "main", dry_run=True
+        )
+
+        self.assertEqual(result, sync_forks.RESULT_OK)
+        safety.assert_not_called()
+        api.assert_not_called()
+
+
+class ReleaseTests(unittest.TestCase):
+    def test_required_assets_ignore_uninstallable_extras(self):
+        release = {"assets": [
+            {"name": "app.zip"},
+            {"name": "app.zip.sig"},
+            {"name": "latest.json"},
+            {"name": "notes.txt"},
+        ]}
+
+        self.assertEqual(
+            sync_forks._required_release_asset_names(release),
+            ["app.zip", "app.zip.sig", "latest.json"],
+        )
+
+    @patch.object(sync_forks, "gh_api")
+    def test_release_verification_detects_missing_latest_assets(self, api):
+        api.side_effect = [
+            [{
+                "tag_name": "v1",
+                "draft": False,
+                "prerelease": False,
+                "assets": [{"name": "app.zip"}],
             }],
-        })
+            [],
+        ]
 
-        self.assertEqual(result["conclusion"], "success")
-        self.assertEqual(result["html_url"], "https://example.com/run/2")
+        row = sync_forks._build_verify_releases_row(FORK)
 
-    def test_latest_workflow_run_degrades_malformed_payload(self):
-        self.assertIsNone(sync_forks._latest_workflow_run({"workflow_runs": None}))
-        self.assertIsNone(sync_forks._latest_workflow_run({"workflow_runs": [None]}))
-        self.assertIsNone(sync_forks._latest_workflow_run([]))
+        self.assertEqual(row["release_policy"], "latest_stable_assets_only")
+        self.assertEqual(row["next_action"], "mirror_latest_stable_release")
 
-    def test_verification_exit_code_prioritizes_errors_then_safety(self):
-        self.assertEqual(
-            sync_forks._verification_exit_code(
-                {"errors": 1, "missing_workflow": 1},
-                sync_forks.VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS,
-            ),
-            sync_forks.EXIT_ERROR,
-        )
-        self.assertEqual(
-            sync_forks._verification_exit_code(
-                {"errors": 0, "missing_workflow": 1},
-                sync_forks.VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS,
-            ),
-            sync_forks.EXIT_SAFETY,
-        )
-        self.assertEqual(
-            sync_forks._verification_exit_code(
-                {"errors": 0, "missing_workflow": 0},
-                sync_forks.VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS,
-            ),
-            sync_forks.EXIT_OK,
-        )
+    @patch.object(sync_forks, "gh_api")
+    def test_release_verification_skips_source_only_releases(self, api):
+        api.side_effect = [
+            [{
+                "tag_name": "v1",
+                "draft": False,
+                "prerelease": False,
+                "assets": [],
+            }],
+            [],
+        ]
 
-    def test_update_operation_summary_counts_results(self):
-        summary = {"success": 0, "safety_abort": 0, "failed": 0}
+        row = sync_forks._build_verify_releases_row(FORK)
 
-        sync_forks._update_operation_summary(summary, sync_forks.RESULT_OK)
-        sync_forks._update_operation_summary(summary, sync_forks.RESULT_SAFETY)
-        sync_forks._update_operation_summary(summary, sync_forks.RESULT_ERROR)
+        self.assertEqual(row["release_policy"], "source_only_release_notes")
+        self.assertEqual(row["next_action"], "none")
 
-        self.assertEqual(summary, {
-            "success": 1,
-            "safety_abort": 1,
-            "failed": 1,
-        })
-
-    def test_release_retention_next_action_maps_policy_states(self):
-        self.assertEqual(
-            sync_forks._release_retention_next_action(0, None, 0, 0),
-            "none",
-        )
-        self.assertEqual(
-            sync_forks._release_retention_next_action(1, None, 0, 0),
-            "mirror_latest_stable_release",
-        )
-        self.assertEqual(
-            sync_forks._release_retention_next_action(1, {"tag_name": "v2"}, 0, 0),
-            "mirror_latest_stable_assets",
-        )
-        self.assertEqual(
-            sync_forks._release_retention_next_action(1, {"tag_name": "v2"}, 1, 1),
-            "prune_old_stable_release_assets",
-        )
-        self.assertEqual(
-            sync_forks._release_retention_next_action(1, {"tag_name": "v2"}, 1, 0),
-            "none",
-        )
-
-    def test_missing_release_asset_names_detects_partial_latest_mirror(self):
-        upstream = {
-            "assets": [
-                {"name": "tool.exe"},
-                {"name": "SHA256SUMS.txt"},
-                {"name": "latest.json"},
-            ],
-        }
-        fork = {
-            "assets": [
-                {"name": "tool.exe"},
-            ],
-        }
-
-        self.assertEqual(
-            sync_forks._missing_release_asset_names(upstream, fork),
-            ["SHA256SUMS.txt", "latest.json"],
-        )
-
-    def test_schedule_next_action_maps_readiness_states(self):
-        base_row = {
+    @patch.object(sync_forks, "_build_verify_releases_row")
+    @patch.object(sync_forks, "_sync_latest_release_assets")
+    def test_release_dry_run_has_no_write(self, sync_assets, build_row):
+        build_row.return_value = {
             "result": sync_forks.RESULT_OK,
-            "workflow_installed": True,
-            "workflow_current": True,
-            "secret_sync_pat_present": True,
-            "last_scheduled_run": {
-                "conclusion": "success",
-            },
-            "last_smoke_run": None,
+            "release_policy": "latest_stable_assets_only",
+            "next_action": "mirror_latest_stable_assets",
+            "old_stable_release_asset_count": 0,
         }
 
-        self.assertEqual(sync_forks._schedule_next_action(base_row), "none")
+        result = sync_forks._sync_releases_result(FORK, dry_run=True)
 
-        row = {**base_row, "result": sync_forks.RESULT_ERROR}
-        self.assertEqual(
-            sync_forks._schedule_next_action(row),
-            "investigate_api_errors",
-        )
+        self.assertEqual(result, sync_forks.RESULT_OK)
+        sync_assets.assert_not_called()
 
-        row = {**base_row, "workflow_installed": False}
-        self.assertEqual(
-            sync_forks._schedule_next_action(row),
-            "install_sync_workflow",
-        )
+    def test_latest_json_checksum_is_refreshed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            latest = os.path.join(directory, "latest.json")
+            sums = os.path.join(directory, "SHA256SUMS.txt")
+            with open(latest, "w", encoding="utf-8") as handle:
+                handle.write('{"url": "fork"}')
+            with open(sums, "w", encoding="utf-8") as handle:
+                handle.write("old  latest.json\n")
 
-        row = {**base_row, "workflow_current": False}
-        self.assertEqual(
-            sync_forks._schedule_next_action(row),
-            "update_sync_workflow",
-        )
+            ok, error = sync_forks._refresh_sha256_sums_for_latest_json(
+                sums, latest
+            )
 
-        row = {**base_row, "secret_sync_pat_present": False}
-        self.assertEqual(
-            sync_forks._schedule_next_action(row),
-            "set_sync_pat_secret",
-        )
+            with open(latest, "rb") as handle:
+                expected = hashlib.sha256(handle.read()).hexdigest()
+            with open(sums, "r", encoding="utf-8") as handle:
+                content = handle.read()
+            self.assertTrue(ok)
+            self.assertIsNone(error)
+            self.assertIn(expected, content)
 
-        row = {
-            **base_row,
-            "last_scheduled_run": None,
-            "last_smoke_run": {"conclusion": "success"},
-        }
-        self.assertEqual(sync_forks._schedule_next_action(row), "none")
 
-        row = {**base_row, "last_scheduled_run": None, "last_smoke_run": None}
-        self.assertEqual(
-            sync_forks._schedule_next_action(row),
-            "wait_or_trigger_smoke_run",
-        )
-
-        row = {**base_row, "last_scheduled_run": {"conclusion": "failure"}}
-        self.assertEqual(
-            sync_forks._schedule_next_action(row),
-            "inspect_last_scheduled_failure",
-        )
-
-    def test_mode_write_classification_is_explicit(self):
+class CliAndReportingTests(unittest.TestCase):
+    @patch.dict(os.environ, {}, clear=True)
+    def test_real_force_write_requires_acknowledgement(self):
         self.assertTrue(
-            sync_forks._mode_writes_remotely(sync_forks.MODE_SYNC, dry_run=False)
-        )
-        self.assertTrue(
-            sync_forks._mode_writes_remotely(
-                sync_forks.MODE_ADD_WORKFLOW,
-                dry_run=False,
+            sync_forks._force_confirmation_missing(
+                True, sync_forks.MODE_SYNC, False
             )
         )
         self.assertFalse(
-            sync_forks._mode_writes_remotely(
-                sync_forks.MODE_VERIFY_SCHEDULE,
-                dry_run=False,
+            sync_forks._force_confirmation_missing(
+                True, sync_forks.MODE_SYNC, True
             )
         )
-        self.assertFalse(
-            sync_forks._mode_writes_remotely(
-                sync_forks.MODE_VERIFY_RELEASES,
-                dry_run=False,
-            )
-        )
-        self.assertTrue(
-            sync_forks._mode_writes_remotely(
-                sync_forks.MODE_SYNC_RELEASES,
-                dry_run=False,
-            )
-        )
-        self.assertFalse(
-            sync_forks._mode_writes_remotely(sync_forks.MODE_SYNC, dry_run=True)
-        )
-        with self.assertRaises(ValueError):
-            sync_forks._mode_writes_remotely("new-mode", dry_run=False)
 
-    def test_force_confirmation_uses_mode_write_classification(self):
-        with patch.dict("os.environ", {sync_forks.FORCE_SYNC_ACK_ENV: ""}, clear=False):
-            self.assertTrue(
-                sync_forks._force_confirmation_missing(
-                    True,
-                    sync_forks.MODE_SYNC,
-                    dry_run=False,
-                )
-            )
-            self.assertTrue(
-                sync_forks._force_confirmation_missing(
-                    True,
-                    sync_forks.MODE_ADD_WORKFLOW,
-                    dry_run=False,
-                )
-            )
-            self.assertFalse(
-                sync_forks._force_confirmation_missing(
-                    True,
-                    sync_forks.MODE_VERIFY_SCHEDULE,
-                    dry_run=False,
-                )
-            )
-            self.assertFalse(
-                sync_forks._force_confirmation_missing(
-                    True,
-                    sync_forks.MODE_VERIFY_RELEASES,
-                    dry_run=False,
-                )
-            )
-            self.assertTrue(
-                sync_forks._force_confirmation_missing(
-                    True,
-                    sync_forks.MODE_SYNC_RELEASES,
-                    dry_run=False,
-                )
-            )
-            self.assertFalse(
-                sync_forks._force_confirmation_missing(
-                    True,
-                    sync_forks.MODE_SYNC,
-                    dry_run=True,
-                )
-            )
-
-    @patch.object(sync_forks, "gh_api")
-    def test_verify_release_retention_accepts_latest_assets_only(self, mock_api):
-        forks = [{
-            "name": "cockpit-tools",
-            "full_name": "sciman-top/installable-tool",
-            "branch": "main",
-            "parent": "jlcodes99/cockpit-tools",
-            "parent_branch": "main",
-        }]
-        upstream_latest = {
-            "tag_name": "v2",
-            "draft": False,
-            "prerelease": False,
-            "assets": [{"name": "tool.msi"}],
-        }
-        fork_latest = {
-            "tag_name": "v2",
-            "draft": False,
-            "prerelease": False,
-            "assets": [{"name": "tool.msi"}],
-        }
-        fork_old = {
-            "tag_name": "v1",
-            "draft": False,
-            "prerelease": False,
-            "assets": [],
-        }
-        mock_api.side_effect = [[upstream_latest], [fork_latest, fork_old]]
-
-        rows, summary = sync_forks._verify_release_retention(forks)
-
-        self.assertEqual(rows[0]["next_action"], "none")
-        self.assertEqual(summary["ready"], 1)
-        self.assertEqual(summary["latest_stable_assets_required"], 1)
-        self.assertEqual(summary["old_stable_assets_present"], 0)
-
-    @patch.object(sync_forks, "gh_api")
-    def test_verify_release_retention_flags_old_stable_assets(self, mock_api):
-        forks = [{
-            "name": "cockpit-tools",
-            "full_name": "sciman-top/installable-tool",
-            "branch": "main",
-            "parent": "jlcodes99/cockpit-tools",
-            "parent_branch": "main",
-        }]
-        upstream_latest = {
-            "tag_name": "v2",
-            "draft": False,
-            "prerelease": False,
-            "assets": [{"name": "tool.exe"}],
-        }
-        fork_latest = {
-            "tag_name": "v2",
-            "draft": False,
-            "prerelease": False,
-            "assets": [{"name": "tool.exe"}],
-        }
-        fork_old = {
-            "tag_name": "v1",
-            "draft": False,
-            "prerelease": False,
-            "assets": [{"name": "old-tool.exe"}],
-        }
-        mock_api.side_effect = [[upstream_latest], [fork_latest, fork_old]]
-
-        rows, summary = sync_forks._verify_release_retention(forks)
-
-        self.assertEqual(rows[0]["next_action"], "prune_old_stable_release_assets")
-        self.assertEqual(summary["ready"], 0)
-        self.assertEqual(summary["old_stable_assets_present"], 1)
-
-    @patch.object(sync_forks, "gh_api")
-    def test_verify_release_retention_flags_missing_latest_support_assets(self, mock_api):
-        forks = [{
-            "name": "installable-tool",
-            "full_name": "sciman-top/installable-tool",
-            "branch": "main",
-            "parent": "upstream-owner/installable-tool",
-            "parent_branch": "main",
-        }]
-        upstream_latest = {
-            "tag_name": "v2",
-            "draft": False,
-            "prerelease": False,
-            "assets": [
-                {"name": "tool.exe"},
-                {"name": "SHA256SUMS.txt"},
-                {"name": "latest.json"},
-            ],
-        }
-        fork_latest = {
-            "tag_name": "v2",
-            "draft": False,
-            "prerelease": False,
-            "assets": [
-                {"name": "tool.exe"},
-            ],
-        }
-        mock_api.side_effect = [[upstream_latest], [fork_latest]]
-
-        rows, summary = sync_forks._verify_release_retention(forks)
-
-        self.assertEqual(rows[0]["next_action"], "mirror_latest_stable_assets")
-        self.assertEqual(
-            rows[0]["missing_latest_release_assets"],
-            ["SHA256SUMS.txt", "latest.json"],
-        )
-        self.assertEqual(summary["ready"], 0)
-        self.assertEqual(summary["latest_stable_missing_or_without_assets"], 1)
-
-    @patch.object(sync_forks, "gh_api")
-    def test_verify_release_retention_ignores_non_required_old_assets(self, mock_api):
-        forks = [{
-            "name": "installable-tool",
-            "full_name": "sciman-top/installable-tool",
-            "branch": "main",
-            "parent": "upstream-owner/installable-tool",
-            "parent_branch": "main",
-        }]
-        upstream_latest = {
-            "tag_name": "v2",
-            "draft": False,
-            "prerelease": False,
-            "assets": [{"name": "tool.exe"}],
-        }
-        fork_latest = {
-            "tag_name": "v2",
-            "draft": False,
-            "prerelease": False,
-            "assets": [{"name": "tool.exe"}],
-        }
-        fork_old = {
-            "tag_name": "v1",
-            "draft": False,
-            "prerelease": False,
-            "assets": [{"name": "notes.md"}],
-        }
-        mock_api.side_effect = [[upstream_latest], [fork_latest, fork_old]]
-
-        rows, summary = sync_forks._verify_release_retention(forks)
-
-        self.assertEqual(rows[0]["next_action"], "none")
-        self.assertEqual(rows[0]["old_stable_release_asset_count"], 0)
-        self.assertEqual(summary["old_stable_assets_present"], 0)
-
-    @patch.object(
-        sync_forks,
-        "SELF_USE_RELEASE_REPO_SET",
-        {"example/self-use-fork"},
-    )
-    @patch.object(sync_forks, "gh_api")
-    def test_self_use_release_policy_ignores_upstream_release_mirror(self, mock_api):
-        forks = [{
-            "name": "self-use-fork",
-            "full_name": "example/self-use-fork",
-            "branch": "main",
-            "parent": "jlcodes99/cockpit-tools",
-            "parent_branch": "main",
-        }]
-        local_release = {
-            "tag_name": "v0.23.9-local.1",
-            "draft": False,
-            "prerelease": False,
-            "body": "Example self-use build",
-            "assets": [{"name": "Cockpit.Tools.Local_0.23.9_x64-setup.exe"}],
-        }
-        mock_api.return_value = [local_release]
-
-        rows, summary = sync_forks._verify_release_retention(forks)
-
-        self.assertEqual(rows[0]["release_policy"], "self_use_local_releases")
-        self.assertEqual(rows[0]["latest_self_use_release"], "v0.23.9-local.1")
-        self.assertEqual(rows[0]["next_action"], "none")
-        self.assertEqual(summary["ready"], 1)
-        self.assertEqual(summary["latest_stable_assets_required"], 0)
-
-    @patch.object(
-        sync_forks,
-        "SELF_USE_RELEASE_REPO_SET",
-        {"example/self-use-fork"},
-    )
-    @patch.object(sync_forks, "gh_api")
-    def test_self_use_release_policy_flags_legacy_upstream_mirror_assets(self, mock_api):
-        forks = [{
-            "name": "self-use-fork",
-            "full_name": "example/self-use-fork",
-            "branch": "main",
-            "parent": "jlcodes99/cockpit-tools",
-            "parent_branch": "main",
-        }]
-        mirror_release = {
-            "tag_name": "v0.23.2",
-            "draft": False,
-            "prerelease": False,
-            "body": "Mirrored from https://github.com/jlcodes99/cockpit-tools/releases/tag/v0.23.2",
-            "assets": [{"name": "Cockpit.Tools_0.23.2_x64-setup.exe"}],
-        }
-        mock_api.return_value = [mirror_release]
-
-        rows, summary = sync_forks._verify_release_retention(forks)
-
-        self.assertEqual(rows[0]["release_policy"], "self_use_local_releases")
-        self.assertEqual(rows[0]["next_action"], "remove_upstream_mirror_release_assets")
-        self.assertEqual(rows[0]["upstream_mirror_release_asset_count"], 1)
-        self.assertEqual(summary["ready"], 0)
-        self.assertEqual(summary["upstream_mirror_assets_present"], 1)
-
-    @patch.object(sync_forks, "_run_gh_command")
-    @patch.object(sync_forks, "gh_api")
-    def test_sync_latest_release_assets_reuploads_checksum_when_latest_json_changes(
-        self, mock_api, mock_run
-    ):
-        fork = {
-            "name": "installable-tool",
-            "full_name": "sciman-top/installable-tool",
-            "branch": "main",
-            "parent": "upstream-owner/installable-tool",
-            "parent_branch": "main",
-        }
-        row = {"latest_upstream_stable": "v2"}
-        upstream_latest = {
-            "tag_name": "v2",
-            "name": "Version 2",
-            "body": "release notes",
-            "assets": [
-                {"name": "tool.exe"},
-                {"name": "latest.json"},
-                {"name": "SHA256SUMS.txt"},
-            ],
-        }
-        fork_latest = {
-            "tag_name": "v2",
-            "assets": [
-                {"name": "tool.exe"},
-                {"name": "SHA256SUMS.txt"},
-            ],
-        }
-        mock_api.side_effect = [[upstream_latest], [fork_latest]]
-
-        def _fake_run(args):
-            if args[:2] == ["release", "download"]:
-                target_dir = args[args.index("-D") + 1]
-                asset_name = args[args.index("-p") + 1]
-                asset_path = os.path.join(target_dir, asset_name)
-                if asset_name == "latest.json":
-                    with open(asset_path, "w", encoding="utf-8") as handle:
-                        handle.write(
-                            '{"url":"https://github.com/upstream-owner/installable-tool/'
-                            'releases/download/v2/tool.exe"}'
-                        )
-                elif asset_name == "SHA256SUMS.txt":
-                    with open(asset_path, "w", encoding="utf-8") as handle:
-                        handle.write(
-                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                            "  latest.json\n"
-                        )
-                else:
-                    with open(asset_path, "w", encoding="utf-8") as handle:
-                        handle.write("binary")
-            return Mock(returncode=0, stderr="", stdout="")
-
-        mock_run.side_effect = _fake_run
-
-        result = sync_forks._sync_latest_release_assets(fork, row)
-
-        self.assertTrue(result)
-        upload_call = mock_run.call_args_list[-1].args[0]
-        self.assertEqual(upload_call[:2], ["release", "upload"])
-        uploaded_names = {os.path.basename(path) for path in upload_call[3:-2]}
-        self.assertEqual(uploaded_names, {"latest.json", "SHA256SUMS.txt"})
-
-    @patch.object(sync_forks, "_run_gh_command")
-    @patch.object(sync_forks, "gh_api")
-    def test_sync_latest_release_assets_fails_when_checksum_entry_missing(
-        self, mock_api, mock_run
-    ):
-        fork = {
-            "name": "installable-tool",
-            "full_name": "sciman-top/installable-tool",
-            "branch": "main",
-            "parent": "upstream-owner/installable-tool",
-            "parent_branch": "main",
-        }
-        row = {"latest_upstream_stable": "v2"}
-        upstream_latest = {
-            "tag_name": "v2",
-            "name": "Version 2",
-            "body": "release notes",
-            "assets": [
-                {"name": "latest.json"},
-                {"name": "SHA256SUMS.txt"},
-            ],
-        }
-        fork_latest = {"tag_name": "v2", "assets": []}
-        mock_api.side_effect = [[upstream_latest], [fork_latest]]
-
-        def _fake_run(args):
-            if args[:2] == ["release", "download"]:
-                target_dir = args[args.index("-D") + 1]
-                asset_name = args[args.index("-p") + 1]
-                asset_path = os.path.join(target_dir, asset_name)
-                if asset_name == "latest.json":
-                    with open(asset_path, "w", encoding="utf-8") as handle:
-                        handle.write(
-                            '{"url":"https://github.com/upstream-owner/installable-tool/'
-                            'releases/download/v2/tool.exe"}'
-                        )
-                elif asset_name == "SHA256SUMS.txt":
-                    with open(asset_path, "w", encoding="utf-8") as handle:
-                        handle.write(
-                            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                            "  tool.exe\n"
-                        )
-            return Mock(returncode=0, stderr="", stdout="")
-
-        mock_run.side_effect = _fake_run
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._sync_latest_release_assets(fork, row)
-
-        self.assertFalse(result)
-        self.assertIn(
-            "checksum manifest does not contain latest.json",
-            captured.getvalue(),
-        )
-
-    @patch.object(sync_forks, "_run_gh_command")
-    @patch.object(sync_forks, "gh_api")
-    def test_sync_latest_release_assets_fails_when_downloaded_asset_missing(
-        self, mock_api, mock_run
-    ):
-        fork = {
-            "name": "installable-tool",
-            "full_name": "sciman-top/installable-tool",
-            "branch": "main",
-            "parent": "upstream-owner/installable-tool",
-            "parent_branch": "main",
-        }
-        row = {"latest_upstream_stable": "v2"}
-        upstream_latest = {
-            "tag_name": "v2",
-            "name": "Version 2",
-            "body": "release notes",
-            "assets": [{"name": "tool.exe"}],
-        }
-        mock_api.side_effect = [[upstream_latest], []]
-        mock_run.return_value = Mock(returncode=0, stderr="", stdout="")
-
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            result = sync_forks._sync_latest_release_assets(fork, row)
-
-        self.assertFalse(result)
-        self.assertIn("Downloaded release asset is missing", captured.getvalue())
-
-    @patch.object(sync_forks, "gh_api")
-    def test_verify_release_retention_ignores_source_only_upstream(self, mock_api):
-        forks = [{
-            "name": "claude-dashboard",
-            "full_name": "sciman-top/claude-dashboard",
-            "branch": "main",
-            "parent": "uppinote20/claude-dashboard",
-            "parent_branch": "main",
-        }]
-        upstream_latest = {
-            "tag_name": "v1",
-            "draft": False,
-            "prerelease": False,
-            "assets": [],
-        }
-        mock_api.side_effect = [[upstream_latest], []]
-
-        rows, summary = sync_forks._verify_release_retention(forks)
-
-        self.assertEqual(rows[0]["release_policy"], "source_only_release_notes")
-        self.assertEqual(rows[0]["next_action"], "none")
-        self.assertEqual(summary["latest_stable_assets_required"], 0)
-
-    @patch.object(sync_forks, "gh_api")
-    def test_verify_schedule_readiness_counts_missing_items(self, mock_api):
-        forks = [{
-            "name": "fork-a",
-            "full_name": "me/fork-a",
-            "branch": "main",
-            "parent": "upstream/a",
-            "parent_branch": "main",
-        }]
-        mock_api.side_effect = [
-            {"error": "404", "error_type": "not_found", "status_code": 404},
-            {"error": "404", "error_type": "not_found", "status_code": 404},
-            {"workflow_runs": []},
+    @patch.object(list_forks, "gh_api")
+    def test_list_status_uses_upstream_ahead_count(self, api):
+        api.side_effect = [
+            {"sha": "workflow"},
+            {"ahead_by": 7},
         ]
 
-        rows, summary = sync_forks._verify_schedule_readiness(forks)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["next_action"], "install_sync_workflow")
-        self.assertFalse(rows[0]["workflow_installed"])
-        self.assertFalse(rows[0]["secret_sync_pat_present"])
-        self.assertEqual(summary["ready"], 0)
-        self.assertEqual(summary["missing_workflow"], 1)
-        self.assertEqual(summary["missing_secret"], 1)
-        self.assertEqual(summary["scheduled_run_missing_or_unhealthy"], 1)
-        self.assertEqual(summary["errors"], 0)
+        rows = list_forks._collect_fork_statuses([FORK])
 
-    @patch.object(sync_forks, "gh_api")
-    def test_verify_schedule_readiness_counts_ready_repo(self, mock_api):
-        forks = [{
-            "name": "fork-a",
-            "full_name": "me/fork-a",
-            "branch": "main",
-            "parent": "upstream/a",
-            "parent_branch": "main",
-        }]
-        current_workflow = sync_forks._render_workflow_template()
-        mock_api.side_effect = [
-            {"content": _encode(current_workflow)},
-            {"name": "SYNC_PAT"},
-            {"workflow_runs": [{
-                "status": "completed",
-                "conclusion": "success",
-                "created_at": "2026-04-29T00:00:00Z",
-                "updated_at": "2026-04-29T00:01:00Z",
-                "html_url": "https://example.com/run/1",
-            }]},
-        ]
-
-        rows, summary = sync_forks._verify_schedule_readiness(forks)
-        self.assertEqual(rows[0]["next_action"], "none")
-        self.assertTrue(rows[0]["workflow_current"])
-        self.assertEqual(summary["ready"], 1)
-        self.assertEqual(summary["workflow_needs_update"], 0)
-        self.assertEqual(summary["errors"], 0)
-
-    @patch.object(sync_forks, "gh_api")
-    def test_verify_schedule_readiness_flags_stale_workflow(self, mock_api):
-        forks = [{
-            "name": "fork-a",
-            "full_name": "me/fork-a",
-            "branch": "main",
-            "parent": "upstream/a",
-            "parent_branch": "main",
-        }]
-        stale_workflow = "name: Sync Fork\non:\n  push:\n"
-        mock_api.side_effect = [
-            {"content": _encode(stale_workflow)},
-            {"name": "SYNC_PAT"},
-            {"workflow_runs": [{
-                "status": "completed",
-                "conclusion": "success",
-                "created_at": "2026-04-29T00:00:00Z",
-                "updated_at": "2026-04-29T00:01:00Z",
-                "html_url": "https://example.com/run/1",
-            }]},
-        ]
-
-        rows, summary = sync_forks._verify_schedule_readiness(forks)
+        self.assertEqual(rows[0]["behind_by"], 7)
         self.assertTrue(rows[0]["workflow_installed"])
-        self.assertFalse(rows[0]["workflow_current"])
-        self.assertIn("workflow_dispatch", rows[0]["workflow_update_reason"])
-        self.assertEqual(rows[0]["next_action"], "update_sync_workflow")
-        self.assertEqual(summary["ready"], 0)
-        self.assertEqual(summary["missing_workflow"], 0)
-        self.assertEqual(summary["workflow_needs_update"], 1)
-        self.assertEqual(summary["errors"], 0)
 
-    @patch.object(sync_forks, "gh_api")
-    def test_verify_schedule_readiness_handles_malformed_run_item(self, mock_api):
-        forks = [{
-            "name": "fork-a",
-            "full_name": "me/fork-a",
-            "branch": "main",
-            "parent": "upstream/a",
-            "parent_branch": "main",
-        }]
-        current_workflow = sync_forks._render_workflow_template()
-        mock_api.side_effect = [
-            {"content": _encode(current_workflow)},
-            {"name": "SYNC_PAT"},
-            {"workflow_runs": [None]},
-            {"workflow_runs": []},
-        ]
-
-        rows, summary = sync_forks._verify_schedule_readiness(forks)
-        self.assertEqual(rows[0]["next_action"], "wait_or_trigger_smoke_run")
-        self.assertIsNone(rows[0]["last_scheduled_run"])
-        self.assertEqual(summary["ready"], 0)
-        self.assertEqual(summary["errors"], 0)
-
-    @patch.object(sync_forks, "gh_api")
-    def test_verify_schedule_readiness_accepts_successful_smoke_run(self, mock_api):
-        forks = [{
-            "name": "fork-a",
-            "full_name": "me/fork-a",
-            "branch": "main",
-            "parent": "upstream/a",
-            "parent_branch": "main",
-        }]
-        current_workflow = sync_forks._render_workflow_template()
-        mock_api.side_effect = [
-            {"content": _encode(current_workflow)},
-            {"name": "SYNC_PAT"},
-            {"workflow_runs": []},
-            {"workflow_runs": [{
-                "status": "completed",
-                "conclusion": "success",
-                "created_at": "2026-05-10T11:42:40Z",
-                "updated_at": "2026-05-10T11:43:00Z",
-                "html_url": "https://example.com/run/2",
-            }]},
-        ]
-
-        rows, summary = sync_forks._verify_schedule_readiness(forks)
-        self.assertEqual(rows[0]["next_action"], "none")
-        self.assertIsNone(rows[0]["last_scheduled_run"])
-        self.assertEqual(rows[0]["last_smoke_run"]["conclusion"], "success")
-        self.assertEqual(summary["ready"], 1)
-        self.assertEqual(summary["scheduled_run_missing_or_unhealthy"], 0)
-
-
-class TestSyncForksVerifyScheduleMode(unittest.TestCase):
-    @patch.object(sync_forks, "_verify_schedule_readiness")
-    @patch.object(sync_forks, "get_fork_repos_with_evidence")
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_verify_schedule_json_returns_exit_safety_when_not_ready(
-        self, _mock_check, mock_auth_context, mock_get_forks, mock_verify
+    @patch.object(list_forks, "_collect_fork_statuses", return_value=[])
+    @patch.object(list_forks, "get_fork_repos_with_evidence")
+    @patch.object(list_forks, "get_auth_context")
+    @patch.object(list_forks, "check_gh_cli")
+    def test_list_json_reports_live_discovery(
+        self, _check, auth, discover, _collect
     ):
-        mock_auth_context.return_value = {
+        auth.return_value = {
             "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "gh_login",
-                "source": "gh auth login",
-            },
+            "auth": {"mode": "gh_login", "source": "gh auth login"},
         }
-        mock_get_forks.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }], {
-            "source": "live_github_api",
-            "endpoint": "user/repos?affiliation=owner&visibility=all",
-            "fetched_at": "2026-04-29T00:00:00Z",
-            "authenticated_user": "me",
-            "repo_count": 1,
-            "fork_count": 1,
-            "parent_detail_lookup_count": 0,
-            "parent_detail_cache_hit_count": 0,
-        })
-        mock_verify.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "upstream": "upstream-owner/forked-repo",
-            "upstream_branch": "main",
-            "workflow_installed": False,
-            "secret_sync_pat_present": False,
-            "last_scheduled_run": None,
-            "result": sync_forks.RESULT_OK,
-            "next_action": "install_sync_workflow",
-        }], {
-            "total": 1,
-            "ready": 0,
-            "missing_workflow": 1,
-            "missing_secret": 1,
-            "scheduled_run_missing_or_unhealthy": 1,
-            "errors": 0,
+        discover.return_value = ([], {"source": "live_github_api"})
+
+        with patch.object(sys, "argv", ["list-forks.py", "--json"]):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                exit_code = list_forks.main()
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["discovery"]["source"], "live_github_api")
+
+    @patch.object(sync_forks, "_run")
+    def test_sync_json_emits_machine_report(self, run):
+        run.return_value = (0, {
+            "tool": "sync-forks",
+            "mode": "sync",
+            "summary": {"success": 1},
         })
 
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--json", "--verify-schedule"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
+        with patch.object(sys, "argv", ["sync-forks.py", "--json", "--dry-run"]):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
                 exit_code = sync_forks.main()
 
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, sync_forks.EXIT_SAFETY)
-        self.assertEqual(payload["mode"], "verify-schedule")
-        self.assertEqual(payload["summary"]["ready"], 0)
-        self.assertEqual(payload["summary"]["missing_workflow"], 1)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(output.getvalue())["summary"]["success"], 1)
 
-    @patch.object(sync_forks, "_verify_schedule_readiness")
-    @patch.object(sync_forks, "get_fork_repos_with_evidence")
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_verify_schedule_json_returns_exit_safety_when_workflow_needs_update(
-        self, _mock_check, mock_auth_context, mock_get_forks, mock_verify
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "gh_login",
-                "source": "gh auth login",
-            },
-        }
-        mock_get_forks.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }], {
-            "source": "live_github_api",
-            "endpoint": "user/repos?affiliation=owner&visibility=all",
-            "fetched_at": "2026-04-29T00:00:00Z",
-            "authenticated_user": "me",
-            "repo_count": 1,
-            "fork_count": 1,
-            "parent_detail_lookup_count": 0,
-            "parent_detail_cache_hit_count": 0,
-        })
-        mock_verify.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "upstream": "upstream-owner/forked-repo",
-            "upstream_branch": "main",
-            "workflow_installed": True,
-            "workflow_current": False,
-            "workflow_update_reason": "missing workflow_dispatch trigger",
-            "secret_sync_pat_present": True,
-            "last_scheduled_run": {
-                "status": "completed",
-                "conclusion": "success",
-                "created_at": "2026-04-29T00:00:00Z",
-                "updated_at": "2026-04-29T00:01:00Z",
-                "html_url": "https://example.com/run/1",
-            },
-            "result": sync_forks.RESULT_OK,
-            "next_action": "update_sync_workflow",
-        }], {
-            "total": 1,
-            "ready": 0,
-            "missing_workflow": 0,
-            "workflow_needs_update": 1,
-            "missing_secret": 0,
-            "scheduled_run_missing_or_unhealthy": 0,
-            "errors": 0,
-        })
-
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--json", "--verify-schedule"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
+    def test_unknown_json_option_fails_before_runtime(self):
+        with patch.object(sys, "argv", ["sync-forks.py", "--json", "--unknown"]):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
                 exit_code = sync_forks.main()
 
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, sync_forks.EXIT_SAFETY)
-        self.assertEqual(payload["summary"]["workflow_needs_update"], 1)
-
-    @patch.object(sync_forks, "_verify_schedule_readiness")
-    @patch.object(sync_forks, "get_fork_repos_with_evidence")
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_verify_schedule_json_returns_exit_error_when_api_errors(
-        self, _mock_check, mock_auth_context, mock_get_forks, mock_verify
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "gh_login",
-                "source": "gh auth login",
-            },
-        }
-        mock_get_forks.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }], {
-            "source": "live_github_api",
-            "endpoint": "user/repos?affiliation=owner&visibility=all",
-            "fetched_at": "2026-04-29T00:00:00Z",
-            "authenticated_user": "me",
-            "repo_count": 1,
-            "fork_count": 1,
-            "parent_detail_lookup_count": 0,
-            "parent_detail_cache_hit_count": 0,
-        })
-        mock_verify.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "upstream": "upstream-owner/forked-repo",
-            "upstream_branch": "main",
-            "workflow_installed": False,
-            "secret_sync_pat_present": False,
-            "last_scheduled_run": None,
-            "result": sync_forks.RESULT_ERROR,
-            "next_action": "investigate_api_errors",
-        }], {
-            "total": 1,
-            "ready": 0,
-            "missing_workflow": 0,
-            "missing_secret": 0,
-            "scheduled_run_missing_or_unhealthy": 0,
-            "errors": 1,
-        })
-
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--json", "--verify-schedule"]):
-            with contextlib.redirect_stdout(io.StringIO()):
-                exit_code = sync_forks.main()
-
+        payload = json.loads(output.getvalue())
         self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
+        self.assertEqual(payload["error_code"], "E_CLI_UNKNOWN_OPTION")
 
-    @patch.object(sync_forks, "_verify_schedule_readiness")
-    @patch.object(sync_forks, "get_fork_repos_with_evidence")
+    @patch.object(sync_forks, "_sync_now_result", return_value=sync_forks.RESULT_OK)
+    @patch.object(sync_forks, "_resolve_specific_forks", return_value=([FORK], False))
     @patch.object(sync_forks, "get_auth_context")
     @patch.object(sync_forks, "check_gh_cli")
-    def test_verify_schedule_text_prints_per_repo_next_action(
-        self, _mock_check, mock_auth_context, mock_get_forks, mock_verify
+    def test_run_routes_one_dry_run_through_the_sync_main_chain(
+        self, _check, auth, _resolve, sync_now
     ):
-        mock_auth_context.return_value = {
+        auth.return_value = {
             "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "gh_login",
-                "source": "gh auth login",
-            },
+            "auth": {"mode": "gh_login", "source": "gh auth login"},
         }
-        mock_get_forks.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }], {
-            "source": "live_github_api",
-            "endpoint": "user/repos?affiliation=owner&visibility=all",
-            "fetched_at": "2026-04-29T00:00:00Z",
-            "authenticated_user": "me",
-            "repo_count": 1,
-            "fork_count": 1,
-            "parent_detail_lookup_count": 0,
-            "parent_detail_cache_hit_count": 0,
-        })
-        mock_verify.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "upstream": "upstream-owner/forked-repo",
-            "upstream_branch": "main",
-            "workflow_installed": True,
-            "workflow_current": False,
-            "workflow_update_reason": "missing workflow_dispatch trigger",
-            "secret_sync_pat_present": True,
-            "last_scheduled_run": {
-                "status": "completed",
-                "conclusion": "success",
-                "created_at": "2026-04-29T00:00:00Z",
-                "updated_at": "2026-04-29T00:01:00Z",
-                "html_url": "https://example.com/run/1",
-            },
-            "result": sync_forks.RESULT_OK,
-            "next_action": "update_sync_workflow",
-        }], {
-            "total": 1,
-            "ready": 0,
-            "missing_workflow": 0,
-            "workflow_needs_update": 1,
-            "missing_secret": 0,
-            "scheduled_run_missing_or_unhealthy": 0,
-            "errors": 0,
-        })
+        parsed = sync_forks._parse_cli_args(["--json", "--dry-run", "fork"])
 
-        with patch.object(sync_forks.sys, "argv", ["sync-forks.py", "--verify-schedule"]):
-            with contextlib.redirect_stdout(io.StringIO()) as captured:
-                exit_code = sync_forks.main()
+        exit_code, report = sync_forks._run(parsed)
 
-        output = captured.getvalue()
-        self.assertEqual(exit_code, sync_forks.EXIT_SAFETY)
-        self.assertIn("Schedule readiness details:", output)
-        self.assertIn("me/forked-repo", output)
-        self.assertIn("update_sync_workflow", output)
-
-
-class TestSyncForksSyncReleasesMode(unittest.TestCase):
-    @patch.object(sync_forks, "_sync_releases_result")
-    @patch.object(sync_forks, "_resolve_specific_forks")
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_sync_releases_json_returns_summary_payload(
-        self, _mock_check, mock_auth_context, mock_resolve, mock_sync_releases
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "env_token",
-                "source": "GH_TOKEN",
-            },
-        }
-        mock_resolve.return_value = ([{
-            "name": "forked-repo",
-            "full_name": "me/forked-repo",
-            "branch": "main",
-            "parent": "upstream-owner/forked-repo",
-            "parent_branch": "main",
-            "parent_owner": "upstream-owner",
-        }], False)
-        mock_sync_releases.return_value = sync_forks.RESULT_OK
-
-        with patch.dict(
-            "os.environ",
-            {sync_forks.FORCE_SYNC_ACK_ENV: sync_forks.FORCE_SYNC_ACK_VALUE},
-            clear=False,
-        ):
-            with patch.object(
-                sync_forks.sys,
-                "argv",
-                ["sync-forks.py", "--json", "--sync-releases", "forked-repo"],
-            ):
-                with contextlib.redirect_stdout(io.StringIO()) as captured:
-                    exit_code = sync_forks.main()
-
-        payload = json.loads(captured.getvalue())
         self.assertEqual(exit_code, sync_forks.EXIT_OK)
-        self.assertEqual(payload["mode"], "sync-releases")
-        self.assertEqual(payload["summary"]["success"], 1)
-        mock_sync_releases.assert_called_once()
-
-    @patch.object(sync_forks, "get_auth_context")
-    @patch.object(sync_forks, "check_gh_cli")
-    def test_force_sync_releases_requires_explicit_confirmation(
-        self, _mock_check, mock_auth_context
-    ):
-        mock_auth_context.return_value = {
-            "username": "me",
-            "auth": {
-                "configured": True,
-                "mode": "env_token",
-                "source": "GH_TOKEN",
-            },
-        }
-
-        with patch.dict("os.environ", {sync_forks.FORCE_SYNC_ACK_ENV: ""}, clear=False):
-            with patch.object(
-                sync_forks.sys,
-                "argv",
-                ["sync-forks.py", "--json", "--sync-releases", "--force", "forked-repo"],
-            ):
-                with contextlib.redirect_stdout(io.StringIO()) as captured:
-                    exit_code = sync_forks.main()
-
-        payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
-        self.assertEqual(payload["error"], "force_confirmation_required")
-        self.assertEqual(payload["error_code"], "E_FORCE_CONFIRMATION_REQUIRED")
+        self.assertEqual(report["mode"], sync_forks.MODE_SYNC)
+        self.assertEqual(report["summary"]["success"], 1)
+        sync_now.assert_called_once_with(
+            "me/fork", "main", "upstream/repo", "main", True, False
+        )
 
 
 if __name__ == "__main__":

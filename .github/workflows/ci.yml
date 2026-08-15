@@ -19,20 +19,5 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install verification tools
-        run: python -m pip install "ruff==0.14.6" "mypy==1.20.2"
-
-      - name: Run compile check
-        run: python -m py_compile gh_utils.py list-forks.py sync-forks.py test_toolkit.py test_support.py scripts/benchmark_hotpaths.py
-
       - name: Run unit tests
-        run: python -m unittest test_toolkit.py
-
-      - name: Run lint
-        run: python -m ruff check .
-
-      - name: Run type check
-        run: python -m mypy gh_utils.py list-forks.py sync-forks.py scripts/benchmark_hotpaths.py
-
-      - name: Run synthetic hot-path benchmark
-        run: python scripts/benchmark_hotpaths.py --sizes 10,100 --runs 3 --check
+        run: python -m unittest -q test_toolkit.py

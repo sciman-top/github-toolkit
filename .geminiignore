@@ -2,7 +2,6 @@
 __pycache__/
 *.pyc
 backup/
-docs/runtime-probe-*.txt
 
 # Local credentials and logs
 .env

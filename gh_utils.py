@@ -6,8 +6,7 @@ Provides:
   - Cross-platform gh CLI detection
   - gh_api(): GitHub API calls with timeout, retry, rate-limit awareness
   - paginate(): Generic paginated API queries
-  - get_current_user(): Authenticated user lookup
-  - get_fork_repos(): List all fork repos with parent info
+  - get_fork_repos_with_evidence(): Discover forks with live evidence
   - get_file_count(): File count via git trees API
   - check_gh_cli(): Pre-flight CLI check
 
@@ -18,7 +17,6 @@ remains a future option if the repository adopts a stricter auth posture.
 """
 
 import json
-import ntpath
 import os
 import re
 import shutil
@@ -38,37 +36,6 @@ MAX_RETRIES = 2            # Retries on transient failures
 RETRY_BASE_DELAY = 2       # Seconds (multiplied by attempt number)
 MAX_PAGES = 50             # Safety limit for pagination (5000 items)
 AUTH_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
-WINDOWS_REQUIRED_ENV_VARS = (
-    "SystemRoot",
-    "WINDIR",
-    "ComSpec",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "PROGRAMDATA",
-    "ProgramFiles",
-)
-NETWORK_PROXY_ENV_VARS = (
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "no_proxy",
-)
-CODEX_SAFE_ENV_POLICY_VARS = (
-    "COMSPEC",
-    "ComSpec",
-    "WINDIR",
-    "windir",
-    "SYSTEMROOT",
-    "SystemRoot",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "PROGRAMDATA",
-    "ProgramFiles",
-) + NETWORK_PROXY_ENV_VARS
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 NETWORK_ERROR_MARKERS = (
     "connection reset",
@@ -104,191 +71,6 @@ ERROR_CODE_BY_ERROR_TYPE = {
     "unknown": "E_GH_UNKNOWN",
 }
 
-# ── Windows process environment ───────────────────────────────
-
-def _prepend_path_entry(entry):
-    """Prepend a PATH entry if it exists and is not already present."""
-    if not entry or not os.path.isdir(entry):
-        return
-    current = os.environ.get("PATH", "")
-    parts = [p for p in current.split(os.pathsep) if p]
-    if any(os.path.normcase(p) == os.path.normcase(entry) for p in parts):
-        return
-    os.environ["PATH"] = os.pathsep.join([entry] + parts)
-
-
-def _set_default_env_var(name, value, repaired):
-    """Set an environment variable only when the current process lacks it."""
-    if not name or not value or os.environ.get(name):
-        return
-    os.environ[name] = value
-    repaired[name] = value
-
-
-def _ensure_canonical_env_var(name, value, repaired):
-    """Ensure Windows-critical variables exist with their canonical key."""
-    if not name or not value:
-        return
-    existing = os.environ.get(name)
-    if existing == value and name in os.environ and "%" not in existing:
-        repaired.setdefault(name, value)
-        return
-    os.environ[name] = value
-    repaired.setdefault(name, value)
-
-
-def _codex_config_candidates():
-    codex_home = os.environ.get("CODEX_HOME")
-    if codex_home:
-        yield os.path.join(codex_home, "config.toml")
-    user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
-    if user_profile:
-        yield os.path.join(user_profile, ".codex", "config.toml")
-
-
-def _read_codex_shell_environment_policy_set():
-    """Read safe env values from Codex config.toml without importing secrets."""
-    try:
-        import tomllib
-    except ModuleNotFoundError:
-        return {}
-
-    for config_path in _codex_config_candidates():
-        if not os.path.isfile(config_path):
-            continue
-        try:
-            with open(config_path, "rb") as handle:
-                data = tomllib.load(handle)
-        except (OSError, tomllib.TOMLDecodeError):
-            continue
-        policy = data.get("shell_environment_policy")
-        if not isinstance(policy, dict):
-            continue
-        policy_set = policy.get("set")
-        if not isinstance(policy_set, dict):
-            continue
-        return {
-            name: value
-            for name, value in policy_set.items()
-            if name in CODEX_SAFE_ENV_POLICY_VARS
-            and isinstance(value, str)
-            and value.strip()
-        }
-    return {}
-
-
-def _read_windows_registry_environment():
-    """Read allowlisted User/Machine env vars for reduced agent processes."""
-    try:
-        import winreg
-    except ImportError:
-        return {}
-
-    roots = (
-        (winreg.HKEY_CURRENT_USER, "Environment"),
-        (
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
-        ),
-    )
-    values = {}
-    for root, subkey in roots:
-        try:
-            key = winreg.OpenKey(root, subkey)
-        except OSError:
-            continue
-        try:
-            for name in CODEX_SAFE_ENV_POLICY_VARS:
-                if name in values:
-                    continue
-                try:
-                    value, _kind = winreg.QueryValueEx(key, name)
-                except OSError:
-                    continue
-                if isinstance(value, str) and value.strip():
-                    values[name] = value
-        finally:
-            winreg.CloseKey(key)
-    return values
-
-
-def _restore_safe_codex_shell_environment_policy(repaired):
-    """Restore non-secret Codex/Windows env values into this process."""
-    sources = (
-        _read_codex_shell_environment_policy_set(),
-        _read_windows_registry_environment(),
-    )
-    for source in sources:
-        for name, value in source.items():
-            _set_default_env_var(name, value, repaired)
-
-
-def _resolved_windows_root():
-    for name in ("SystemRoot", "WINDIR"):
-        value = os.environ.get(name)
-        if value and "%" not in value:
-            return value
-    return r"C:\Windows"
-
-
-def _windows_join(*parts):
-    return ntpath.join(*parts)
-
-
-def ensure_windows_process_environment():
-    """Restore Windows base environment variables commonly stripped by hosts."""
-    if os.name != "nt":
-        return {}
-
-    repaired = {}
-    _restore_safe_codex_shell_environment_policy(repaired)
-    system_root = _resolved_windows_root()
-    if ntpath.basename(system_root).lower() == "system32":
-        system_root = ntpath.dirname(system_root)
-
-    user_profile = os.environ.get("USERPROFILE")
-    if not user_profile:
-        home_drive = os.environ.get("HOMEDRIVE", "")
-        home_path = os.environ.get("HOMEPATH", "")
-        user_profile = f"{home_drive}{home_path}" if home_drive and home_path else None
-
-    defaults = {
-        "SystemRoot": system_root,
-        "WINDIR": system_root,
-        "ComSpec": _windows_join(system_root, "System32", "cmd.exe"),
-        "PROGRAMDATA": os.environ.get("PROGRAMDATA") or r"C:\ProgramData",
-        "ProgramFiles": os.environ.get("ProgramFiles") or r"C:\Program Files",
-    }
-    if user_profile:
-        defaults["APPDATA"] = _windows_join(user_profile, "AppData", "Roaming")
-        defaults["LOCALAPPDATA"] = _windows_join(user_profile, "AppData", "Local")
-
-    for key in WINDOWS_REQUIRED_ENV_VARS:
-        value = os.environ.get(key) or defaults.get(key)
-        if isinstance(value, str) and "%" in value:
-            value = defaults.get(key)
-        if key in {"SystemRoot", "WINDIR", "ComSpec"}:
-            _ensure_canonical_env_var(key, value, repaired)
-        else:
-            _set_default_env_var(key, value, repaired)
-
-    _prepend_path_entry(_windows_join(system_root, "System32"))
-    _prepend_path_entry(system_root)
-    _prepend_path_entry(_windows_join(
-        system_root,
-        "System32",
-        "WindowsPowerShell",
-        "v1.0",
-    ))
-    _prepend_path_entry(_windows_join(
-        os.environ.get("ProgramFiles", r"C:\Program Files"),
-        "GitHub CLI",
-    ))
-    return repaired
-
-
-ensure_windows_process_environment()
-
 # ── gh CLI path ───────────────────────────────────────────────
 
 def _find_gh():
@@ -312,7 +94,7 @@ def check_gh_cli():
     """Verify gh CLI is available. Exit with code 1 if not."""
     if GH is None:
         print("ERROR: GitHub CLI not found.")
-        print("Run: setup.bat  or  winget install GitHub.cli")
+        print("Install it from https://cli.github.com/ or with: winget install GitHub.cli")
         sys.exit(1)
 
 
@@ -668,15 +450,6 @@ def paginate(endpoint, per_page=100, include_error=False):
 
 # ── Domain helpers ────────────────────────────────────────────
 
-def get_current_user():
-    """Return authenticated username. Exit on auth failure."""
-    try:
-        return get_auth_context()["username"]
-    except AuthContextError as exc:
-        print(f"ERROR: {exc.message}")
-        sys.exit(1)
-
-
 def get_repo_owner(full_name):
     """Return the owner/login portion of a repo full_name, or None."""
     if not full_name or "/" not in full_name:
@@ -840,14 +613,6 @@ def get_fork_repos_with_evidence(username):
         "parent_detail_cache_hit_count": parent_detail_cache_hit_count,
     }
     return forks, evidence
-
-
-def get_fork_repos(username):
-    """Return list of fork repo dicts with keys:
-    name, full_name, branch, parent, parent_branch.
-    """
-    forks, _evidence = get_fork_repos_with_evidence(username)
-    return forks
 
 
 def get_file_count(repo_name, branch):
