@@ -15,12 +15,15 @@ from gh_utils import (
     build_compare_endpoint,
     encode_url_component,
     ForkDiscoveryError,
+    GhCliUnavailableError,
     check_gh_cli,
     get_compare_head,
     get_auth_context,
     get_fork_repos_with_evidence,
     gh_api,
+    is_not_found_error,
     parse_nonnegative_int,
+    short_error,
 )
 
 HELP_TEXT = """\
@@ -66,16 +69,36 @@ def _collect_fork_statuses(forks):
         parent_branch = fork.get("parent_branch")
         full_name = fork.get("full_name")
 
-        has_workflow = False
+        row = {
+            "name": fork["name"],
+            "full_name": fork["full_name"],
+            "branch": fork["branch"],
+            "upstream": fork["parent"],
+            "upstream_branch": fork["parent_branch"],
+            "behind_by": None,
+            "workflow_installed": False,
+            "workflow_status": "Unknown",
+            "result": "ok",
+        }
+
         encoded_branch = encode_url_component(branch)
         if full_name and encoded_branch:
             wf = gh_api(
                 f"repos/{full_name}/contents/.github/workflows/sync-fork.yml"
                 f"?ref={encoded_branch}"
             )
-            has_workflow = isinstance(wf, dict) and "error" not in wf
+            if isinstance(wf, dict) and "error" not in wf:
+                row["workflow_installed"] = True
+                row["workflow_status"] = "Installed"
+            elif is_not_found_error(wf):
+                row["workflow_status"] = "Missing"
+            else:
+                row["result"] = "error"
+                row["workflow_error"] = short_error(wf)
+        else:
+            row["result"] = "error"
+            row["workflow_error"] = "invalid repository or branch metadata"
 
-        behind_by = None
         compare_head = get_compare_head(parent, parent_branch)
         compare_endpoint = build_compare_endpoint(
             full_name,
@@ -84,19 +107,21 @@ def _collect_fork_statuses(forks):
         )
         if compare_endpoint:
             compare = gh_api(compare_endpoint)
-            if isinstance(compare, dict) and "ahead_by" in compare:
-                behind_by = parse_nonnegative_int(compare["ahead_by"])
+            if isinstance(compare, dict) and "error" not in compare:
+                behind_by = parse_nonnegative_int(compare.get("ahead_by"))
+                if behind_by is not None:
+                    row["behind_by"] = behind_by
+                else:
+                    row["result"] = "error"
+                    row["compare_error"] = "compare response has malformed ahead_by"
+            else:
+                row["result"] = "error"
+                row["compare_error"] = short_error(compare)
+        else:
+            row["result"] = "error"
+            row["compare_error"] = "invalid fork or upstream branch metadata"
 
-        rows.append({
-            "name": fork["name"],
-            "full_name": fork["full_name"],
-            "branch": fork["branch"],
-            "upstream": fork["parent"],
-            "upstream_branch": fork["parent_branch"],
-            "behind_by": behind_by,
-            "workflow_installed": has_workflow,
-            "workflow_status": "Installed" if has_workflow else "Missing",
-        })
+        rows.append(row)
 
     return rows
 
@@ -120,13 +145,13 @@ def main():
         _print_help()
         return 1
 
-    check_gh_cli()
     try:
+        check_gh_cli()
         auth_context = get_auth_context()
         auth_info = auth_context["auth"]
         username = auth_context["username"]
         forks, discovery = get_fork_repos_with_evidence(username)
-    except (AuthContextError, ForkDiscoveryError) as exc:
+    except (GhCliUnavailableError, AuthContextError, ForkDiscoveryError) as exc:
         if parsed["json_output"]:
             print(json.dumps(exc.to_dict("list-forks"), ensure_ascii=False, indent=2))
             return 1
@@ -134,6 +159,7 @@ def main():
         return 1
 
     rows = _collect_fork_statuses(forks)
+    error_count = sum(row["result"] == "error" for row in rows)
 
     if parsed["json_output"]:
         payload = {
@@ -143,11 +169,12 @@ def main():
             "discovery": discovery,
             "summary": {
                 "total": len(rows),
+                "errors": error_count,
             },
             "repos": rows,
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0
+        return 1 if error_count else 0
 
     if not forks:
         print("No fork repos found.")
@@ -175,6 +202,9 @@ def main():
         )
 
     print()
+    if error_count:
+        print(f"ERROR: {error_count} repo status check(s) were incomplete.")
+        return 1
     return 0
 
 

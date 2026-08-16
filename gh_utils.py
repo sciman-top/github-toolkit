@@ -22,8 +22,8 @@ import re
 import shutil
 # gh CLI is invoked with argv lists only.
 import subprocess  # nosec B404
-import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -35,6 +35,7 @@ API_TIMEOUT = 30           # Seconds per API call
 MAX_RETRIES = 2            # Retries on transient failures
 RETRY_BASE_DELAY = 2       # Seconds (multiplied by attempt number)
 MAX_PAGES = 50             # Safety limit for pagination (5000 items)
+MAX_PARENT_LOOKUP_WORKERS = 4
 AUTH_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 NETWORK_ERROR_MARKERS = (
@@ -90,12 +91,31 @@ def _find_gh():
 GH = _find_gh()
 
 
+class GhCliUnavailableError(RuntimeError):
+    """Structured local-environment failure for text and JSON callers."""
+
+    def __init__(self):
+        self.message = (
+            "GitHub CLI not found. Install it from https://cli.github.com/ "
+            "or with: winget install GitHub.cli"
+        )
+        super().__init__(self.message)
+
+    def to_dict(self, tool):
+        """Serialize the missing-CLI failure for JSON output."""
+        return {
+            "tool": tool,
+            "error": "github_cli_unavailable",
+            "error_code": "E_GH_ENVIRONMENT",
+            "error_type": "environment",
+            "message": self.message,
+        }
+
+
 def check_gh_cli():
-    """Verify gh CLI is available. Exit with code 1 if not."""
+    """Verify gh CLI is available, raising a structured error if not."""
     if GH is None:
-        print("ERROR: GitHub CLI not found.")
-        print("Install it from https://cli.github.com/ or with: winget install GitHub.cli")
-        sys.exit(1)
+        raise GhCliUnavailableError()
 
 
 class AuthContextError(RuntimeError):
@@ -255,6 +275,39 @@ def _build_error_result(message, error_type="unknown", status_code=None,
     if detail is not None:
         payload["detail"] = detail
     return payload
+
+
+def short_error(payload, default="invalid response payload", limit=200):
+    """Return a bounded API/CLI error string suitable for reports."""
+    if isinstance(payload, dict):
+        value = payload.get("error", default)
+    elif isinstance(payload, str):
+        value = payload
+    else:
+        value = default
+    return str(value)[:limit]
+
+
+def is_not_found_error(error_payload):
+    """Return True when a normalized error payload indicates HTTP 404."""
+    if isinstance(error_payload, dict):
+        if (
+            error_payload.get("error_type") == "not_found"
+            or error_payload.get("error_code") == "E_GH_NOT_FOUND"
+            or error_payload.get("status_code") == 404
+        ):
+            return True
+        error_message = error_payload.get("error")
+    else:
+        error_message = error_payload
+
+    lowered = str(error_message or "").strip().lower()
+    return (
+        lowered == "404"
+        or "not found" in lowered
+        or "http 404" in lowered
+        or "(404)" in lowered
+    )
 
 
 def _extract_status_code(text):
@@ -554,10 +607,7 @@ def get_fork_repos_with_evidence(username):
             detail=page_error,
         )
 
-    forks = []
-    parent_detail_cache = {}
-    parent_detail_lookup_count = 0
-    parent_detail_cache_hit_count = 0
+    missing_parent_names = []
     for r in all_repos:
         if not isinstance(r, dict):
             continue
@@ -571,33 +621,44 @@ def get_fork_repos_with_evidence(username):
         if not isinstance(parent_info, dict):
             parent_info = {}
         if not parent_info or not parent_info.get("full_name"):
-            if full_name in parent_detail_cache:
-                parent_detail_cache_hit_count += 1
-                parent_info = parent_detail_cache[full_name]
-            else:
-                detail = gh_api(f"repos/{full_name}")
-                parent_detail_lookup_count += 1
-                if isinstance(detail, dict) and "error" not in detail:
-                    parent_info = detail.get("parent") or {}
-                    if not isinstance(parent_info, dict):
-                        parent_info = {}
-                    if not parent_info.get("full_name"):
-                        raise ForkDiscoveryError(
-                            "Fork repository metadata is missing parent information.",
-                            detail={
-                                "repo": full_name,
-                                "response": detail,
-                            },
-                        )
-                    parent_detail_cache[full_name] = parent_info
-                else:
-                    raise ForkDiscoveryError(
-                        "Failed to inspect fork repository metadata.",
-                        detail={
-                            "repo": full_name,
-                            "response": detail,
-                        },
-                    )
+            missing_parent_names.append(full_name)
+
+    unique_parent_names = list(dict.fromkeys(missing_parent_names))
+    parent_details = {}
+    if unique_parent_names:
+        worker_count = min(MAX_PARENT_LOOKUP_WORKERS, len(unique_parent_names))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            detail_results = executor.map(
+                lambda full_name: gh_api(f"repos/{full_name}"),
+                unique_parent_names,
+            )
+            parent_details = dict(zip(unique_parent_names, detail_results))
+
+    for full_name in unique_parent_names:
+        detail = parent_details[full_name]
+        if not isinstance(detail, dict) or "error" in detail:
+            raise ForkDiscoveryError(
+                "Failed to inspect fork repository metadata.",
+                detail={"repo": full_name, "response": detail},
+            )
+        parent_info = detail.get("parent") or {}
+        if not isinstance(parent_info, dict) or not parent_info.get("full_name"):
+            raise ForkDiscoveryError(
+                "Fork repository metadata is missing parent information.",
+                detail={"repo": full_name, "response": detail},
+            )
+        parent_details[full_name] = parent_info
+
+    forks = []
+    for r in all_repos:
+        if not isinstance(r, dict) or not r.get("fork"):
+            continue
+        full_name = r.get("full_name")
+        if not full_name:
+            continue
+        parent_info = r.get("parent")
+        if not isinstance(parent_info, dict) or not parent_info.get("full_name"):
+            parent_info = parent_details[full_name]
         fork = build_fork_record({**r, "parent": parent_info})
         if fork:
             forks.append(fork)
@@ -609,8 +670,10 @@ def get_fork_repos_with_evidence(username):
         "authenticated_user": username,
         "repo_count": len(all_repos),
         "fork_count": len(forks),
-        "parent_detail_lookup_count": parent_detail_lookup_count,
-        "parent_detail_cache_hit_count": parent_detail_cache_hit_count,
+        "parent_detail_lookup_count": len(unique_parent_names),
+        "parent_detail_cache_hit_count": (
+            len(missing_parent_names) - len(unique_parent_names)
+        ),
     }
     return forks, evidence
 

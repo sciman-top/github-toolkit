@@ -36,6 +36,7 @@ from gh_utils import (
     DELETION_THRESHOLD,
     ForkDiscoveryError,
     GH,
+    GhCliUnavailableError,
     SYNC_CRON,
     build_compare_endpoint,
     build_fork_record,
@@ -46,7 +47,9 @@ from gh_utils import (
     get_file_count,
     get_fork_repos_with_evidence,
     gh_api,
+    is_not_found_error,
     parse_nonnegative_int,
+    short_error,
 )
 
 # ── Exit codes ────────────────────────────────────────────────
@@ -78,6 +81,8 @@ VERIFY_RELEASE_SAFETY_SUMMARY_KEYS = (
 )
 FORCE_SYNC_ACK_ENV = "SYNC_FORKS_FORCE_ACK"
 FORCE_SYNC_ACK_VALUE = "I_UNDERSTAND"
+RELEASE_COMMAND_TIMEOUT = 600
+COMPARE_FILES_LIMIT = 300
 INSTALLABLE_RELEASE_ASSET_RE = re.compile(
     r"\.(?:exe|msi|deb|rpm|appimage|dmg|pkg|zip|tar\.gz)$",
     re.IGNORECASE,
@@ -86,12 +91,12 @@ SIGNED_RELEASE_ASSET_RE = re.compile(
     r"\.(?:sig|minisig|sigstore)$",
     re.IGNORECASE,
 )
-WORKFLOW_DISPATCH_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])workflow_dispatch(?![A-Za-z0-9_-])"
-)
-WORKFLOW_DISPATCH_KEY_RE = re.compile(
-    r"^(?:-\s*)?workflow_dispatch(?:\s*:|\s*$)"
-)
+CHECKSUM_MANIFEST_ALGORITHMS = {
+    "sha256sums": "sha256",
+    "sha256sums.txt": "sha256",
+    "sha512sums": "sha512",
+    "sha512sums.txt": "sha512",
+}
 
 HELP_TEXT = """\
 Usage:
@@ -133,6 +138,7 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout fork
         uses: actions/checkout@v6
@@ -183,14 +189,6 @@ jobs:
           fi
           echo "Safety check passed."
 
-      - name: Create restore point
-        if: steps.upstream.outputs.skip != 'true'
-        run: |
-          set -euo pipefail
-          BACKUP_BRANCH="backup/pre-sync"
-          git branch -f "$BACKUP_BRANCH" HEAD
-          git push origin "$BACKUP_BRANCH" --force
-
       - name: Diff guard - inspect deletions
         if: steps.upstream.outputs.skip != 'true'
         env:
@@ -203,19 +201,36 @@ jobs:
           COMPARE_BASE=$(python3 -c 'import os; from urllib.parse import quote; print(quote(os.environ["BASE_REF"], safe=":"))')
           COMPARE_HEAD=$(python3 -c 'import os; from urllib.parse import quote; print(quote(os.environ["HEAD_REF"], safe=":"))')
           COMPARE_JSON=$(gh api "repos/${{{{ github.repository }}}}/compare/${{COMPARE_BASE}}...${{COMPARE_HEAD}}")
-          TOTAL_DELETIONS=$(printf '%s' "$COMPARE_JSON" | jq -r '.total_deletions // 0')
+          if ! printf '%s' "$COMPARE_JSON" | jq -e '.files | type == "array"' >/dev/null; then
+            echo "::error::SAFETY ABORT: compare response files payload is malformed."
+            exit 1
+          fi
+          COMPARE_FILE_COUNT=$(printf '%s' "$COMPARE_JSON" | jq -r '.files | length')
+          if [ "$COMPARE_FILE_COUNT" -ge 300 ]; then
+            echo "::error::SAFETY ABORT: compare file list may be truncated at 300 entries."
+            exit 1
+          fi
           DELETED_FILES=$(printf '%s' "$COMPARE_JSON" | jq -r '.files[]? | select(.status == "removed") | .filename')
+          DELETED_FILE_COUNT=$(printf '%s' "$COMPARE_JSON" | jq -r '[.files[]? | select(.status == "removed")] | length')
           DELETE_LIMIT=$(( 5 + (FORK_FILES / 10) ))
-          echo "Total deletions: $TOTAL_DELETIONS"
+          echo "Deleted files: $DELETED_FILE_COUNT"
           echo "Deletion limit: $DELETE_LIMIT"
-          if [ "$TOTAL_DELETIONS" -gt "$DELETE_LIMIT" ]; then
+          if [ "$DELETED_FILE_COUNT" -gt "$DELETE_LIMIT" ]; then
             echo "::error::SAFETY ABORT: deletion volume is too large for a safe sync."
             exit 1
           fi
-          if printf '%s\\n' "$DELETED_FILES" | grep -Eq '^(\\.github/|README\\.md$|LICENSE$|sync-fork\\.yml$)'; then
+          if printf '%s\\n' "$DELETED_FILES" | grep -Eqi '^(\\.github/|README(?:\\.[^/]*)?$|LICENSE(?:\\.[^/]*)?$|sync-fork\\.yml$)'; then
             echo "::error::SAFETY ABORT: critical path deletion detected."
             exit 1
           fi
+
+      - name: Create restore point
+        if: steps.upstream.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          BACKUP_BRANCH="backup/pre-sync"
+          git branch -f "$BACKUP_BRANCH" HEAD
+          git push origin "$BACKUP_BRANCH" --force
 
       - name: Merge upstream changes
         if: steps.upstream.outputs.skip != 'true'
@@ -237,25 +252,33 @@ jobs:
           import os
           import pathlib
           import re
-          import shutil
           import subprocess
-          import sys
           import tempfile
 
           repo = os.environ["GITHUB_REPOSITORY"]
           installable_re = re.compile(r"\\.(?:exe|msi|deb|rpm|appimage|dmg|pkg|zip|tar\\.gz)$", re.IGNORECASE)
           signed_re = re.compile(r"\\.(?:sig|minisig|sigstore)$", re.IGNORECASE)
+          checksum_algorithms = {{
+              "sha256sums": "sha256",
+              "sha256sums.txt": "sha256",
+              "sha512sums": "sha512",
+              "sha512sums.txt": "sha512",
+          }}
 
           def gh_json(args):
               cmd = ["gh", *args]
-              result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+              result = subprocess.run(
+                  cmd, capture_output=True, text=True, check=False, timeout=600
+              )
               if result.returncode != 0:
                   raise RuntimeError(result.stderr.strip() or "gh command failed")
               return json.loads(result.stdout)
 
           def gh_run(args):
               cmd = ["gh", *args]
-              result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+              result = subprocess.run(
+                  cmd, capture_output=True, text=True, check=False, timeout=600
+              )
               if result.returncode != 0:
                   raise RuntimeError(result.stderr.strip() or "gh command failed")
 
@@ -274,17 +297,21 @@ jobs:
                   name = asset.get("name")
                   if not isinstance(name, str):
                       continue
+                  if (
+                      not name
+                      or name in {{".", ".."}}
+                      or name.startswith("-")
+                      or "/" in name
+                      or "\\\\" in name
+                      or "\\0" in name
+                  ):
+                      raise RuntimeError(f"unsafe release asset name: {{name!r}}")
                   lowered = name.lower()
                   if (
                       installable_re.search(name)
                       or signed_re.search(name)
-                      or lowered in {{
-                          "latest.json",
-                          "sha256sums",
-                          "sha256sums.txt",
-                          "sha512sums",
-                          "sha512sums.txt",
-                      }}
+                      or lowered == "latest.json"
+                      or lowered in checksum_algorithms
                   ):
                       names.append(name)
               return names
@@ -344,6 +371,13 @@ jobs:
               if isinstance(asset, dict) and isinstance(asset.get("name"), str)
           }}
           missing = [name for name in required if name not in fork_asset_names]
+          required_by_lower = {{name.lower(): name for name in required}}
+          metadata_names = {{"latest.json", *checksum_algorithms}}
+          if any(name.lower() in metadata_names for name in missing):
+              for lowered in ("latest.json", *checksum_algorithms):
+                  asset_name = required_by_lower.get(lowered)
+                  if asset_name and asset_name not in missing:
+                      missing.append(asset_name)
 
           if missing:
               with tempfile.TemporaryDirectory() as tmpdir:
@@ -356,28 +390,53 @@ jobs:
                           "--clobber",
                       ])
 
-                  latest_json = pathlib.Path(tmpdir) / "latest.json"
-                  if latest_json.exists():
+                  latest_name = required_by_lower.get("latest.json")
+                  latest_json = pathlib.Path(tmpdir) / latest_name if latest_name else None
+                  if latest_json is not None and latest_json.exists():
                       upstream_prefix = f"https://github.com/{{upstream}}/releases/download/{{tag}}/"
                       fork_prefix = f"https://github.com/{{repo}}/releases/download/{{tag}}/"
                       text = latest_json.read_text(encoding="utf-8")
                       latest_json.write_text(text.replace(upstream_prefix, fork_prefix), encoding="utf-8")
 
-                  sha_sums = pathlib.Path(tmpdir) / "SHA256SUMS.txt"
-                  if sha_sums.exists() and latest_json.exists():
-                      latest_hash = hashlib.sha256(latest_json.read_bytes()).hexdigest()
+                  for lowered, algorithm in checksum_algorithms.items():
+                      manifest_name = required_by_lower.get(lowered)
+                      if not manifest_name or latest_json is None:
+                          continue
+                      manifest = pathlib.Path(tmpdir) / manifest_name
+                      if not manifest.exists() or not latest_json.exists():
+                          continue
+                      latest_hash = hashlib.new(
+                          algorithm, latest_json.read_bytes()
+                      ).hexdigest()
                       updated = []
-                      for line in sha_sums.read_text(encoding="utf-8").splitlines():
-                          stripped = line.rstrip("\\n")
-                          if stripped.strip().endswith("latest.json"):
-                              filename = stripped.split()[-1]
+                      matched = False
+                      for line in manifest.read_text(encoding="utf-8").splitlines():
+                          parts = line.split()
+                          filename = parts[-1] if parts else ""
+                          normalized = (
+                              filename.lstrip("*")
+                              .replace("\\\\", "/")
+                              .rsplit("/", 1)[-1]
+                              .lower()
+                          )
+                          if normalized == "latest.json":
                               updated.append(f"{{latest_hash}}  {{filename}}")
+                              matched = True
                           else:
-                              updated.append(stripped)
-                      sha_sums.write_text("\\n".join(updated) + "\\n", encoding="utf-8")
+                              updated.append(line)
+                      if not matched:
+                          raise RuntimeError(
+                              f"{{manifest_name}} does not contain latest.json"
+                          )
+                      manifest.write_text(
+                          "\\n".join(updated) + "\\n", encoding="utf-8"
+                      )
 
                   upload_files = [str(pathlib.Path(tmpdir) / asset_name) for asset_name in missing]
-                  gh_run(["release", "upload", tag, *upload_files, "-R", repo])
+                  gh_run([
+                      "release", "upload", tag, *upload_files,
+                      "-R", repo, "--clobber",
+                  ])
 
           old_stable = [
               release for release in stable(fork_releases)
@@ -395,13 +454,8 @@ jobs:
                   if (
                       installable_re.search(name)
                       or signed_re.search(name)
-                      or lowered in {{
-                          "latest.json",
-                          "sha256sums",
-                          "sha256sums.txt",
-                          "sha512sums",
-                          "sha512sums.txt",
-                      }}
+                      or lowered == "latest.json"
+                      or lowered in checksum_algorithms
                   ):
                       gh_run(["release", "delete-asset", old_tag, name, "-R", repo, "--yes"])
           PY
@@ -429,64 +483,13 @@ def _render_workflow_template(cron=SYNC_CRON):
     return WORKFLOW_TEMPLATE.format(cron=cron)
 
 
-def _has_workflow_dispatch(workflow_text):
-    """Best-effort trigger detection without YAML parser dependency."""
-    if not workflow_text:
-        return False
-    in_on_block = False
-    on_indent = None
-    for line in workflow_text.splitlines():
-        line_without_comment = line.split("#", 1)[0].rstrip()
-        stripped = line_without_comment.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = len(line_without_comment) - len(line_without_comment.lstrip())
-
-        if in_on_block and indent <= on_indent:
-            in_on_block = False
-            on_indent = None
-
-        if stripped.startswith("on:"):
-            on_value = stripped[3:].strip()
-            if WORKFLOW_DISPATCH_TOKEN_RE.search(on_value):
-                return True
-            if not on_value:
-                in_on_block = True
-                on_indent = indent
-            continue
-
-        if in_on_block and WORKFLOW_DISPATCH_KEY_RE.search(stripped):
-            return True
-    return False
-
-
-def _missing_workflow_template_markers(workflow_text):
-    """Return current-template markers missing from an existing workflow."""
-    required_markers = (
-        f'cron: "{SYNC_CRON}"',
-        "actions/checkout@v6",
-        "Resolve upstream",
-        "Create restore point",
-        "Diff guard - inspect deletions",
-        "backup/pre-sync",
-        "critical path deletion detected",
-        "merge-upstream",
-        "merge-upstream -X POST -f branch=${{ github.event.repository.default_branch }}",
-    )
-    return [
-        marker
-        for marker in required_markers
-        if marker not in workflow_text
-    ]
-
-
 def _needs_workflow_update(existing_file):
     """Return (needs_update: bool, reason: str)."""
     if not isinstance(existing_file, dict):
         return True, "invalid workflow metadata payload"
 
     if "error" in existing_file:
-        if not _is_not_found_error(existing_file):
+        if not is_not_found_error(existing_file):
             return True, "cannot verify existing workflow"
         return True, "missing file"
 
@@ -494,24 +497,12 @@ def _needs_workflow_update(existing_file):
     if workflow_text is None:
         return True, "cannot decode existing workflow"
 
-    if not _has_workflow_dispatch(workflow_text):
-        return True, "missing workflow_dispatch trigger"
-
-    missing_markers = _missing_workflow_template_markers(workflow_text)
-    if missing_markers:
-        preview = ", ".join(missing_markers[:3])
-        if len(missing_markers) > 3:
-            preview += ", ..."
-        return True, f"workflow template drift: missing {preview}"
+    normalized_current = "\n".join(workflow_text.splitlines())
+    normalized_expected = "\n".join(_render_workflow_template().splitlines())
+    if normalized_current != normalized_expected:
+        return True, "workflow template drift"
 
     return False, "already matches current workflow template"
-
-
-def _short_error(payload, default="invalid response payload"):
-    """Return a bounded, printable error detail for CLI logs."""
-    if isinstance(payload, dict):
-        return str(payload.get("error", default))[:200]
-    return default
 
 
 def _base_fork_row(fork):
@@ -534,14 +525,17 @@ def _safe_compare_payload(compare):
     """Normalize compare response payload or return an abort reason."""
     if not isinstance(compare, dict) or "error" in compare:
         return None, "Cannot inspect upstream diff safely."
-
-    total_deletions = parse_nonnegative_int(compare.get("total_deletions", 0) or 0)
-    if total_deletions is None:
-        return None, "Compare response deletion count is malformed."
+    if "files" not in compare:
+        return None, "Compare response is missing files."
 
     files = compare.get("files", [])
     if not isinstance(files, list):
         return None, "Compare response files payload is malformed."
+    if len(files) >= COMPARE_FILES_LIMIT:
+        return None, (
+            "Compare response file list may be truncated at "
+            f"{COMPARE_FILES_LIMIT} entries."
+        )
 
     deleted_files = []
     for item in files:
@@ -555,9 +549,23 @@ def _safe_compare_payload(compare):
         deleted_files.append(filename)
 
     return {
-        "total_deletions": total_deletions,
+        "deleted_file_count": len(deleted_files),
         "deleted_files": deleted_files,
     }, None
+
+
+def _is_critical_deleted_path(path):
+    """Return whether deleting a path crosses the sync safety boundary."""
+    lowered = path.replace("\\", "/").lower()
+    is_root_file = "/" not in lowered
+    return (
+        lowered.startswith(".github/")
+        or lowered == "sync-fork.yml"
+        or (is_root_file and lowered == "readme")
+        or (is_root_file and lowered.startswith("readme."))
+        or (is_root_file and lowered == "license")
+        or (is_root_file and lowered.startswith("license."))
+    )
 
 
 def _old_stable_required_asset_count(releases, latest_tag):
@@ -590,20 +598,29 @@ def _rewrite_latest_json(latest_json_path, upstream, full_name, tag):
     return True
 
 
-def _refresh_sha256_sums_for_latest_json(sha_sums_path, latest_json_path):
-    """Refresh latest.json hash in SHA256SUMS.txt, fail closed if entry is missing."""
-    if not os.path.isfile(sha_sums_path) or not os.path.isfile(latest_json_path):
+def _refresh_checksum_manifest_for_latest_json(
+    manifest_path, latest_json_path, algorithm
+):
+    """Refresh a latest.json checksum entry, failing closed if absent."""
+    if not os.path.isfile(manifest_path) or not os.path.isfile(latest_json_path):
         return True, None
 
     with open(latest_json_path, "rb") as handle:
-        latest_hash = hashlib.sha256(handle.read()).hexdigest()
+        latest_hash = hashlib.new(algorithm, handle.read()).hexdigest()
 
     updated_lines = []
     matched_latest_json = False
-    with open(sha_sums_path, "r", encoding="utf-8") as handle:
+    with open(manifest_path, "r", encoding="utf-8") as handle:
         for line in handle.read().splitlines():
-            if line.strip().endswith("latest.json"):
-                filename = line.split()[-1]
+            parts = line.split()
+            filename = parts[-1] if parts else ""
+            normalized_name = (
+                filename.lstrip("*")
+                .replace("\\", "/")
+                .rsplit("/", 1)[-1]
+                .lower()
+            )
+            if normalized_name == "latest.json":
                 updated_lines.append(f"{latest_hash}  {filename}")
                 matched_latest_json = True
             else:
@@ -612,14 +629,42 @@ def _refresh_sha256_sums_for_latest_json(sha_sums_path, latest_json_path):
     if not matched_latest_json:
         return False, "checksum manifest does not contain latest.json"
 
-    _write_release_file(sha_sums_path, "\n".join(updated_lines) + "\n")
+    _write_release_file(manifest_path, "\n".join(updated_lines) + "\n")
     return True, None
+
+
+def _expand_release_metadata_bundle(release, missing_assets):
+    """Keep latest.json and checksum manifests synchronized as one bundle."""
+    expanded = list(missing_assets)
+    metadata_names = {"latest.json", *CHECKSUM_MANIFEST_ALGORITHMS}
+    if not any(name.lower() in metadata_names for name in expanded):
+        return expanded
+
+    for asset_name in _required_release_asset_names(release):
+        if asset_name.lower() in metadata_names and asset_name not in expanded:
+            expanded.append(asset_name)
+    return expanded
+
+
+def _is_safe_release_asset_name(asset_name):
+    """Reject asset names that can escape a temp dir or alter CLI parsing."""
+    return (
+        isinstance(asset_name, str)
+        and bool(asset_name)
+        and asset_name not in {".", ".."}
+        and not asset_name.startswith("-")
+        and "/" not in asset_name
+        and "\\" not in asset_name
+        and "\0" not in asset_name
+    )
 
 
 def _download_missing_release_assets(upstream, tag, missing_assets, temp_dir):
     """Download all missing assets and verify every expected file exists."""
     downloaded_paths = []
     for asset_name in missing_assets:
+        if not _is_safe_release_asset_name(asset_name):
+            return None, f"Unsafe release asset name: {asset_name!r}"
         result = _run_gh_command([
             "release",
             "download",
@@ -684,20 +729,18 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
         print(f"  ABORT: {compare_error}")
         return ABORT
 
-    total_deletions = compare_summary["total_deletions"]
+    deleted_file_count = compare_summary["deleted_file_count"]
     deleted_files = compare_summary["deleted_files"]
     deletion_limit = 5 + (fork_count // 10)
 
-    print(f"  Deletions: {total_deletions} (limit: {deletion_limit})")
-    if total_deletions > deletion_limit:
+    print(f"  Deleted files: {deleted_file_count} (limit: {deletion_limit})")
+    if deleted_file_count > deletion_limit:
         _print_safety_abort(("Deletion volume is too large for a safe sync.",))
         return ABORT
 
     critical_deleted = [
         path for path in deleted_files
-        if path.startswith(".github/") or path in {
-            "README.md", "LICENSE", "sync-fork.yml",
-        }
+        if _is_critical_deleted_path(path)
     ]
     if critical_deleted:
         _print_safety_abort(("Critical path deletions detected:",))
@@ -705,6 +748,33 @@ def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
             print(f"    - {path}")
         return ABORT
 
+    return True
+
+
+def _verify_upstream_convergence(
+    fork_name, fork_branch, upstream_name, upstream_branch
+):
+    """Verify a completed merge left no upstream commits unapplied."""
+    compare_head = get_compare_head(upstream_name, upstream_branch)
+    compare_endpoint = build_compare_endpoint(fork_name, fork_branch, compare_head)
+    if not compare_endpoint:
+        print("  SAFETY: Cannot build post-sync compare endpoint.")
+        return False
+
+    compare = gh_api(compare_endpoint)
+    if not isinstance(compare, dict) or "error" in compare:
+        print(f"  SAFETY: Cannot verify post-sync state: {short_error(compare)}")
+        return False
+
+    behind_by = parse_nonnegative_int(compare.get("ahead_by"))
+    if behind_by is None:
+        print("  SAFETY: Post-sync compare response has malformed ahead_by.")
+        return False
+    if behind_by:
+        print(f"  SAFETY: Fork remains {behind_by} upstream commit(s) behind.")
+        return False
+
+    print("  Verified: fork is not behind upstream.")
     return True
 
 
@@ -722,7 +792,7 @@ def _add_sync_workflow_result(repo_name, branch, dry_run=False, force=False):
     if not isinstance(existing, dict):
         print("  FAIL: Cannot verify existing sync-fork.yml: invalid metadata payload")
         return RESULT_ERROR
-    if "error" in existing and not _is_not_found_error(existing):
+    if "error" in existing and not is_not_found_error(existing):
         print(f"  FAIL: Cannot verify existing sync-fork.yml: {existing['error'][:200]}")
         return RESULT_ERROR
 
@@ -766,7 +836,7 @@ def _add_sync_workflow_result(repo_name, branch, dry_run=False, force=False):
         print("  FAIL: Invalid workflow update response.")
         return RESULT_ERROR
     if "error" in result:
-        print(f"  FAIL: {_short_error(result)}")
+        print(f"  FAIL: {short_error(result)}")
         return RESULT_ERROR
 
     url = result.get("content", {}).get("html_url", "ok")
@@ -775,35 +845,13 @@ def _add_sync_workflow_result(repo_name, branch, dry_run=False, force=False):
     return RESULT_OK
 
 
-def _is_not_found_error(error_payload):
-    """Return True when an error payload/message indicates HTTP 404."""
-    if isinstance(error_payload, dict):
-        if (
-            error_payload.get("error_type") == "not_found"
-            or error_payload.get("error_code") == "E_GH_NOT_FOUND"
-            or error_payload.get("status_code") == 404
-        ):
-            return True
-        error_message = error_payload.get("error")
-    else:
-        error_message = error_payload
-
-    lowered = (error_message or "").strip().lower()
-    return (
-        lowered == "404"
-        or "not found" in lowered
-        or "http 404" in lowered
-        or "(404)" in lowered
-    )
-
-
 def _create_restore_point(fork_name, fork_branch):
     """Create or update backup/pre-sync to the current fork branch head."""
     backup_ref = "backup/pre-sync"
     head_ref = gh_api(f"repos/{fork_name}/git/ref/heads/{fork_branch}")
     if not isinstance(head_ref, dict) or "error" in head_ref:
         print("  ABORT: Cannot read current fork head for restore point.")
-        print(f"  Detail: {_short_error(head_ref)}")
+        print(f"  Detail: {short_error(head_ref)}")
         return False
 
     head_sha = (head_ref.get("object") or {}).get("sha")
@@ -822,12 +870,12 @@ def _create_restore_point(fork_name, fork_branch):
 
     if not isinstance(update_result, dict):
         print("  ABORT: Cannot update restore point branch.")
-        print(f"  Detail: {_short_error(update_result)}")
+        print(f"  Detail: {short_error(update_result)}")
         return False
 
-    if not _is_not_found_error(update_result):
+    if not is_not_found_error(update_result):
         print("  ABORT: Cannot update restore point branch.")
-        print(f"  Detail: {_short_error(update_result)}")
+        print(f"  Detail: {short_error(update_result)}")
         return False
 
     create_result = gh_api(
@@ -837,7 +885,7 @@ def _create_restore_point(fork_name, fork_branch):
     )
     if not isinstance(create_result, dict) or "error" in create_result:
         print("  ABORT: Cannot create restore point branch.")
-        print(f"  Detail: {_short_error(create_result)}")
+        print(f"  Detail: {short_error(create_result)}")
         return False
 
     print(f"  Restore point created: {backup_ref} -> {head_sha[:12]}")
@@ -847,20 +895,20 @@ def _create_restore_point(fork_name, fork_branch):
 def _sync_now_result(fork_name, fork_branch, upstream_name, upstream_branch,
                      dry_run=False, force=False):
     """Perform a one-time sync with safety check. Return operation result."""
-    if dry_run:
-        print(
-            f"  [DRY-RUN] Would create/refresh backup/pre-sync and "
-            f"sync {upstream_name} -> {fork_name}"
-        )
-        return RESULT_OK
-
     safety_result = safety_check(
         fork_name, fork_branch, upstream_name, upstream_branch, force
     )
     if safety_result is SKIP:
-        return RESULT_OK
+        return RESULT_SAFETY
     if safety_result is ABORT:
         return RESULT_SAFETY
+
+    if dry_run:
+        print(
+            f"  [DRY-RUN] Safety checks passed; would create/refresh "
+            f"backup/pre-sync and sync {upstream_name} -> {fork_name}"
+        )
+        return RESULT_OK
 
     if not _create_restore_point(fork_name, fork_branch):
         return RESULT_SAFETY
@@ -879,11 +927,16 @@ def _sync_now_result(fork_name, fork_branch, upstream_name, upstream_branch,
         err = result["error"].lower()
         if "already up to date" in err or "no new commits" in err:
             print("  Already up to date.")
-            return RESULT_OK
-        print(f"  FAIL: {result['error'][:200]}")
-        return RESULT_ERROR
+        else:
+            print(f"  FAIL: {result['error'][:200]}")
+            return RESULT_ERROR
+    else:
+        print(f"  Synced: {result.get('message', 'ok')}")
 
-    print(f"  Synced: {result.get('message', 'ok')}")
+    if not _verify_upstream_convergence(
+        fork_name, fork_branch, upstream_name, upstream_branch
+    ):
+        return RESULT_SAFETY
     return RESULT_OK
 
 
@@ -895,7 +948,7 @@ def _resolve_specific_forks(username, repo_names):
         full = name if "/" in name else f"{username}/{name}"
         repo = gh_api(f"repos/{full}")
         if isinstance(repo, dict) and "error" in repo:
-            print(f"Error: {name} - {_short_error(repo)[:100]}")
+            print(f"Error: {name} - {short_error(repo, limit=100)}")
             had_errors = True
             continue
         if not isinstance(repo, dict):
@@ -1055,13 +1108,8 @@ def _required_release_asset_names(release):
         if (
             INSTALLABLE_RELEASE_ASSET_RE.search(name)
             or SIGNED_RELEASE_ASSET_RE.search(name)
-            or lowered in {
-                "latest.json",
-                "sha256sums",
-                "sha256sums.txt",
-                "sha512sums",
-                "sha512sums.txt",
-            }
+            or lowered == "latest.json"
+            or lowered in CHECKSUM_MANIFEST_ALGORITHMS
         ):
             required.append(name)
     return required
@@ -1121,12 +1169,12 @@ def _build_verify_releases_row(fork):
     fork_releases = gh_api(f"repos/{full_name}/releases?per_page=100")
     if not isinstance(upstream_releases, list):
         row["result"] = RESULT_ERROR
-        row["release_error"] = _short_error(upstream_releases)
+        row["release_error"] = short_error(upstream_releases)
         row["next_action"] = "investigate_release_api_errors"
         return row
     if not isinstance(fork_releases, list):
         row["result"] = RESULT_ERROR
-        row["release_error"] = _short_error(fork_releases)
+        row["release_error"] = short_error(fork_releases)
         row["next_action"] = "investigate_release_api_errors"
         return row
 
@@ -1199,15 +1247,39 @@ def _verify_release_retention(forks):
     return rows, summary
 
 
-def _run_gh_command(args):
-    """Run gh CLI with argv list and return CompletedProcess."""
-    return subprocess.run(
-        [GH, *args],
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        shell=False,
-    )  # nosec B603
+def _run_gh_command(args, timeout=RELEASE_COMMAND_TIMEOUT):
+    """Run gh with a bounded wait and normalize local execution failures."""
+    cmd = [GH, *args] if GH else ["gh", *args]
+    if GH is None:
+        return subprocess.CompletedProcess(
+            cmd,
+            returncode=127,
+            stdout="",
+            stderr="gh CLI not found",
+        )
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+            timeout=timeout,
+        )  # nosec B603
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            cmd,
+            returncode=124,
+            stdout="",
+            stderr=f"gh command timed out after {timeout}s",
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess(
+            cmd,
+            returncode=127,
+            stdout="",
+            stderr=f"cannot execute gh CLI: {exc}",
+        )
 
 
 def _sync_latest_release_assets(fork, row):
@@ -1269,11 +1341,14 @@ def _sync_latest_release_assets(fork, row):
         print(f"  Latest stable release already has required assets: {tag}")
         return True
 
-    if "latest.json" in missing_assets:
-        for asset_name in _required_release_asset_names(latest_upstream):
-            lowered = asset_name.lower()
-            if lowered in {"sha256sums", "sha256sums.txt"} and asset_name not in missing_assets:
-                missing_assets.append(asset_name)
+    missing_assets = _expand_release_metadata_bundle(
+        latest_upstream,
+        missing_assets,
+    )
+    required_by_lower = {
+        name.lower(): name
+        for name in _required_release_asset_names(latest_upstream)
+    }
 
     with tempfile.TemporaryDirectory() as temp_dir:
         download_paths, download_error = _download_missing_release_assets(
@@ -1283,21 +1358,28 @@ def _sync_latest_release_assets(fork, row):
             print(f"  FAIL: {download_error}")
             return False
 
-        latest_json_path = os.path.join(temp_dir, "latest.json")
-        if _rewrite_latest_json(latest_json_path, upstream, full_name, tag):
-            if latest_json_path not in download_paths:
-                download_paths.append(latest_json_path)
-
-        sha_sums_path = os.path.join(temp_dir, "SHA256SUMS.txt")
-        refreshed, refresh_error = _refresh_sha256_sums_for_latest_json(
-            sha_sums_path,
-            latest_json_path,
+        latest_name = required_by_lower.get("latest.json")
+        latest_json_path = (
+            os.path.join(temp_dir, latest_name)
+            if latest_name else os.path.join(temp_dir, "latest.json")
         )
-        if not refreshed:
-            print(f"  FAIL: {refresh_error}")
-            return False
-        if os.path.isfile(sha_sums_path) and sha_sums_path not in download_paths:
-            download_paths.append(sha_sums_path)
+        _rewrite_latest_json(latest_json_path, upstream, full_name, tag)
+
+        for manifest_name, algorithm in CHECKSUM_MANIFEST_ALGORITHMS.items():
+            actual_name = required_by_lower.get(manifest_name)
+            if not actual_name:
+                continue
+            manifest_path = os.path.join(temp_dir, actual_name)
+            refreshed, refresh_error = (
+                _refresh_checksum_manifest_for_latest_json(
+                    manifest_path,
+                    latest_json_path,
+                    algorithm,
+                )
+            )
+            if not refreshed:
+                print(f"  FAIL: {actual_name}: {refresh_error}")
+                return False
 
         upload_paths = download_paths
         result = _run_gh_command([
@@ -1307,6 +1389,7 @@ def _sync_latest_release_assets(fork, row):
             *upload_paths,
             "-R",
             full_name,
+            "--clobber",
         ])
         if result.returncode != 0:
             print(f"  FAIL: {result.stderr.strip()[:200] or 'cannot upload release assets'}")
@@ -1333,6 +1416,9 @@ def _prune_old_stable_release_assets(fork, row):
         if old_tag == latest_tag or not old_tag:
             continue
         for asset_name in _required_release_asset_names(release):
+            if not _is_safe_release_asset_name(asset_name):
+                print(f"  FAIL: Unsafe release asset name: {asset_name!r}")
+                return False
             result = _run_gh_command([
                 "release",
                 "delete-asset",
@@ -1583,9 +1669,15 @@ def _run_sync_releases_mode(report, forks, dry_run, resolve_errors, json_output)
         if not json_output:
             print()
 
-    report["message"] = (
-        f"Done: {report['summary']['success']}/{len(forks)} repos release-synced."
-    )
+    if dry_run:
+        report["message"] = (
+            "Dry-run complete: "
+            f"{report['summary']['success']}/{len(forks)} repos checked."
+        )
+    else:
+        report["message"] = (
+            f"Done: {report['summary']['success']}/{len(forks)} repos release-synced."
+        )
     if not json_output:
         print(report["message"])
 
@@ -1692,10 +1784,16 @@ def _run_mutating_or_dryrun_mode(report, forks, mode, dry_run, force,
         if not json_output:
             print()
 
-    action = "updated" if mode == MODE_ADD_WORKFLOW else "synced"
-    report["message"] = (
-        f"Done: {report['summary']['success']}/{len(forks)} repos {action}."
-    )
+    if dry_run:
+        report["message"] = (
+            "Dry-run complete: "
+            f"{report['summary']['success']}/{len(forks)} repos checked."
+        )
+    else:
+        action = "updated" if mode == MODE_ADD_WORKFLOW else "synced"
+        report["message"] = (
+            f"Done: {report['summary']['success']}/{len(forks)} repos {action}."
+        )
     if not json_output:
         print(report["message"])
 
@@ -1781,7 +1879,7 @@ def main():
         return EXIT_ERROR
     try:
         exit_code, report = _run(parsed)
-    except (AuthContextError, ForkDiscoveryError) as exc:
+    except (GhCliUnavailableError, AuthContextError, ForkDiscoveryError) as exc:
         if parsed["json_output"]:
             print(json.dumps(exc.to_dict("sync-forks"), ensure_ascii=False, indent=2))
             return EXIT_ERROR

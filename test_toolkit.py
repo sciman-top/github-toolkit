@@ -11,6 +11,7 @@ import os
 import subprocess  # nosec B404 - tests construct process results only
 import sys
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import Mock, patch
 
@@ -180,6 +181,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("backup/pre-sync", workflow)
         self.assertIn("critical path deletion detected", workflow)
         self.assertIn("merge-upstream", workflow)
+        self.assertIn("timeout-minutes: 30", workflow)
+        self.assertIn('"--clobber"', workflow)
+        self.assertIn("DELETED_FILE_COUNT", workflow)
+        self.assertNotIn("TOTAL_DELETIONS", workflow)
+        self.assertLess(
+            workflow.index("Diff guard - inspect deletions"),
+            workflow.index("Create restore point"),
+        )
         self.assertNotIn("Self-use source policy", workflow)
         self.assertNotIn("MIRROR_ONLY_SOURCE", workflow)
 
@@ -193,6 +202,30 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertFalse(needs_update)
         self.assertIn("already matches", reason)
+
+    def test_unmanaged_workflow_step_is_rewritten(self):
+        workflow = sync_forks._render_workflow_template()
+        workflow += "\n  exfiltrate:\n    runs-on: ubuntu-latest\n"
+
+        needs_update, reason = sync_forks._needs_workflow_update({
+            "content": encoded(workflow),
+            "sha": "abc",
+        })
+
+        self.assertTrue(needs_update)
+        self.assertIn("drift", reason)
+
+    def test_embedded_release_python_compiles(self):
+        workflow = sync_forks._render_workflow_template()
+        embedded = workflow.split("python3 - <<'PY'\n", 1)[1].split(
+            "\n          PY", 1
+        )[0]
+
+        compile(
+            textwrap.dedent(embedded),
+            "<embedded-release-retention>",
+            "exec",
+        )
 
     @patch.object(sync_forks, "gh_api")
     def test_add_workflow_dry_run_never_puts(self, api):
@@ -270,6 +303,29 @@ class SafetyAndSyncTests(unittest.TestCase):
             sync_forks.SAFE,
         )
 
+    @patch.object(sync_forks, "gh_api", return_value={"total_deletions": 0})
+    @patch.object(sync_forks, "get_file_count", side_effect=[100, 100])
+    def test_missing_compare_files_aborts(self, _file_count, _api):
+        self.assertIs(
+            sync_forks.safety_check("f", "main", "u/r", "main"),
+            sync_forks.ABORT,
+        )
+
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "get_file_count", side_effect=[100, 100])
+    def test_deleted_file_limit_aborts(self, _file_count, api):
+        api.return_value = {
+            "files": [
+                {"status": "removed", "filename": f"old-{index}.txt"}
+                for index in range(16)
+            ],
+        }
+
+        self.assertIs(
+            sync_forks.safety_check("f", "main", "u/r", "main"),
+            sync_forks.ABORT,
+        )
+
     @patch.object(sync_forks, "gh_api")
     def test_restore_point_updates_current_head(self, api):
         api.side_effect = [
@@ -295,16 +351,62 @@ class SafetyAndSyncTests(unittest.TestCase):
         self.assertEqual(result, sync_forks.RESULT_SAFETY)
         api.assert_not_called()
 
+    @patch.object(sync_forks, "_create_restore_point")
     @patch.object(sync_forks, "gh_api")
-    @patch.object(sync_forks, "safety_check")
-    def test_dry_run_skips_safety_and_remote_calls(self, safety, api):
+    @patch.object(sync_forks, "safety_check", return_value=sync_forks.ABORT)
+    def test_dry_run_propagates_safety_abort_without_remote_writes(
+        self, safety, api, restore
+    ):
+        result = sync_forks._sync_now_result(
+            "me/fork", "main", "upstream/repo", "main", dry_run=True
+        )
+
+        self.assertEqual(result, sync_forks.RESULT_SAFETY)
+        safety.assert_called_once_with(
+            "me/fork", "main", "upstream/repo", "main", False
+        )
+        api.assert_not_called()
+        restore.assert_not_called()
+
+    @patch.object(sync_forks, "_create_restore_point")
+    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "safety_check", return_value=sync_forks.SAFE)
+    def test_safe_dry_run_still_has_no_remote_writes(self, safety, api, restore):
         result = sync_forks._sync_now_result(
             "me/fork", "main", "upstream/repo", "main", dry_run=True
         )
 
         self.assertEqual(result, sync_forks.RESULT_OK)
-        safety.assert_not_called()
+        safety.assert_called_once()
         api.assert_not_called()
+        restore.assert_not_called()
+
+    @patch.object(sync_forks, "_verify_upstream_convergence", return_value=False)
+    @patch.object(sync_forks, "gh_api", return_value={"message": "merged"})
+    @patch.object(sync_forks, "_create_restore_point", return_value=True)
+    @patch.object(sync_forks, "safety_check", return_value=sync_forks.SAFE)
+    def test_post_sync_verification_failure_is_safety_abort(
+        self, _safety, _restore, _api, verify
+    ):
+        result = sync_forks._sync_now_result(
+            "me/fork", "main", "upstream/repo", "main"
+        )
+
+        self.assertEqual(result, sync_forks.RESULT_SAFETY)
+        verify.assert_called_once_with(
+            "me/fork", "main", "upstream/repo", "main"
+        )
+
+    @patch.object(sync_forks, "gh_api")
+    def test_post_sync_verification_requires_zero_behind(self, api):
+        api.side_effect = [{"ahead_by": 0}, {"ahead_by": 1}]
+
+        self.assertTrue(sync_forks._verify_upstream_convergence(
+            "me/fork", "main", "upstream/repo", "main"
+        ))
+        self.assertFalse(sync_forks._verify_upstream_convergence(
+            "me/fork", "main", "upstream/repo", "main"
+        ))
 
 
 class ReleaseTests(unittest.TestCase):
@@ -379,8 +481,8 @@ class ReleaseTests(unittest.TestCase):
             with open(sums, "w", encoding="utf-8") as handle:
                 handle.write("old  latest.json\n")
 
-            ok, error = sync_forks._refresh_sha256_sums_for_latest_json(
-                sums, latest
+            ok, error = sync_forks._refresh_checksum_manifest_for_latest_json(
+                sums, latest, "sha256"
             )
 
             with open(latest, "rb") as handle:
@@ -390,6 +492,86 @@ class ReleaseTests(unittest.TestCase):
             self.assertTrue(ok)
             self.assertIsNone(error)
             self.assertIn(expected, content)
+
+    @patch.object(sync_forks, "_run_gh_command")
+    @patch.object(sync_forks, "gh_api")
+    def test_missing_checksum_reuploads_latest_metadata_bundle_with_clobber(
+        self, api, run
+    ):
+        upstream_latest = {
+            "tag_name": "v1",
+            "name": "Version 1",
+            "body": "notes",
+            "assets": [
+                {"name": "app.zip"},
+                {"name": "latest.json"},
+                {"name": "SHA256SUMS.txt"},
+            ],
+        }
+        fork_latest = {
+            "tag_name": "v1",
+            "assets": [
+                {"name": "app.zip"},
+                {"name": "latest.json"},
+            ],
+        }
+        api.side_effect = [[upstream_latest], [fork_latest]]
+
+        def fake_run(args):
+            if args[:2] == ["release", "download"]:
+                target_dir = args[args.index("-D") + 1]
+                asset_name = args[args.index("-p") + 1]
+                asset_path = os.path.join(target_dir, asset_name)
+                if asset_name == "latest.json":
+                    with open(asset_path, "w", encoding="utf-8") as handle:
+                        handle.write(
+                            '{"url":"https://github.com/upstream/repo/'
+                            'releases/download/v1/app.zip"}'
+                        )
+                else:
+                    with open(asset_path, "w", encoding="utf-8") as handle:
+                        handle.write("old  latest.json\n")
+            return Mock(returncode=0, stderr="", stdout="")
+
+        run.side_effect = fake_run
+
+        result = sync_forks._sync_latest_release_assets(
+            FORK, {"latest_upstream_stable": "v1"}
+        )
+
+        self.assertTrue(result)
+        download_names = [
+            call.args[0][call.args[0].index("-p") + 1]
+            for call in run.call_args_list
+            if call.args[0][:2] == ["release", "download"]
+        ]
+        self.assertEqual(download_names, ["SHA256SUMS.txt", "latest.json"])
+        upload_args = run.call_args_list[-1].args[0]
+        self.assertIn("--clobber", upload_args)
+
+    @patch.object(sync_forks.subprocess, "run")
+    @patch.object(sync_forks, "GH", "gh")
+    def test_release_command_timeout_is_normalized(self, run):
+        run.side_effect = subprocess.TimeoutExpired(cmd="gh", timeout=1)
+
+        result = sync_forks._run_gh_command(["api", "user"], timeout=1)
+
+        self.assertEqual(result.returncode, 124)
+        self.assertIn("timed out", result.stderr)
+
+    @patch.object(sync_forks, "_run_gh_command")
+    def test_release_download_rejects_unsafe_asset_name(self, run):
+        with tempfile.TemporaryDirectory() as directory:
+            paths, error = sync_forks._download_missing_release_assets(
+                "upstream/repo",
+                "v1",
+                ["../escape.zip"],
+                directory,
+            )
+
+        self.assertIsNone(paths)
+        self.assertIn("Unsafe release asset name", error)
+        run.assert_not_called()
 
 
 class CliAndReportingTests(unittest.TestCase):
@@ -418,6 +600,20 @@ class CliAndReportingTests(unittest.TestCase):
         self.assertEqual(rows[0]["behind_by"], 7)
         self.assertTrue(rows[0]["workflow_installed"])
 
+    @patch.object(list_forks, "gh_api")
+    def test_list_status_preserves_api_errors_as_unknown(self, api):
+        api.side_effect = [
+            {"error": "Forbidden (HTTP 403)", "status_code": 403},
+            {"error": "Bad Gateway (HTTP 502)", "status_code": 502},
+        ]
+
+        rows = list_forks._collect_fork_statuses([FORK])
+
+        self.assertEqual(rows[0]["result"], "error")
+        self.assertEqual(rows[0]["workflow_status"], "Unknown")
+        self.assertIn("workflow_error", rows[0])
+        self.assertIn("compare_error", rows[0])
+
     @patch.object(list_forks, "_collect_fork_statuses", return_value=[])
     @patch.object(list_forks, "get_fork_repos_with_evidence")
     @patch.object(list_forks, "get_auth_context")
@@ -438,6 +634,56 @@ class CliAndReportingTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["discovery"]["source"], "live_github_api")
+
+    @patch.object(list_forks, "_collect_fork_statuses")
+    @patch.object(list_forks, "get_fork_repos_with_evidence")
+    @patch.object(list_forks, "get_auth_context")
+    @patch.object(list_forks, "check_gh_cli")
+    def test_list_json_exits_error_when_repo_status_is_unknown(
+        self, _check, auth, discover, collect
+    ):
+        auth.return_value = {
+            "username": "me",
+            "auth": {"mode": "gh_login", "source": "gh auth login"},
+        }
+        discover.return_value = ([FORK], {"source": "live_github_api"})
+        collect.return_value = [{**FORK, "result": "error"}]
+
+        with patch.object(sys, "argv", ["list-forks.py", "--json"]):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                exit_code = list_forks.main()
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["summary"]["errors"], 1)
+
+    @patch.object(
+        list_forks,
+        "check_gh_cli",
+        side_effect=gh_utils.GhCliUnavailableError(),
+    )
+    def test_list_json_reports_missing_gh_as_structured_error(self, _check):
+        with patch.object(sys, "argv", ["list-forks.py", "--json"]):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                exit_code = list_forks.main()
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["error_code"], "E_GH_ENVIRONMENT")
+
+    @patch.object(
+        sync_forks,
+        "_run",
+        side_effect=gh_utils.GhCliUnavailableError(),
+    )
+    def test_sync_json_reports_missing_gh_as_structured_error(self, _run):
+        with patch.object(sys, "argv", ["sync-forks.py", "--json", "--dry-run"]):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                exit_code = sync_forks.main()
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, sync_forks.EXIT_ERROR)
+        self.assertEqual(payload["error_code"], "E_GH_ENVIRONMENT")
 
     @patch.object(sync_forks, "_run")
     def test_sync_json_emits_machine_report(self, run):
