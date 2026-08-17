@@ -48,6 +48,7 @@ from gh_utils import (
     get_fork_repos_with_evidence,
     gh_api,
     is_not_found_error,
+    paginate,
     parse_nonnegative_int,
     short_error,
 )
@@ -68,12 +69,20 @@ RESULT_SAFETY = "safety"
 RESULT_ERROR = "error"
 MODE_SYNC = "sync"
 MODE_ADD_WORKFLOW = "add-workflow"
+MODE_VERIFY_SCHEDULE = "verify-schedule"
 MODE_VERIFY_RELEASES = "verify-releases"
 MODE_SYNC_RELEASES = "sync-releases"
 MODE_OPTION_FLAGS = (
     ("add_mode", "--add-workflow"),
+    ("verify_schedule", "--verify-schedule"),
     ("verify_releases", "--verify-releases"),
     ("sync_releases", "--sync-releases"),
+)
+VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS = (
+    "missing_workflow",
+    "workflow_needs_update",
+    "missing_secret",
+    "scheduled_run_missing_or_unhealthy",
 )
 VERIFY_RELEASE_SAFETY_SUMMARY_KEYS = (
     "latest_stable_missing_or_without_assets",
@@ -104,6 +113,7 @@ Usage:
 
 Options:
   --add-workflow   Add or update sync-fork.yml instead of syncing now
+  --verify-schedule Verify workflow, secret, and scheduled-run readiness
   --verify-releases Verify stable release mirror retention policy
   --sync-releases  Reconcile stable release mirror retention
   --dry-run        Preview planned changes without modifying repos
@@ -240,6 +250,28 @@ jobs:
           set -euo pipefail
           gh api repos/${{{{ github.repository }}}}/merge-upstream -X POST -f branch=${{{{ github.event.repository.default_branch }}}}
 
+      - name: Verify upstream convergence
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{{{ secrets.SYNC_PAT }}}}
+          BASE_REF: ${{{{ github.event.repository.default_branch }}}}
+          HEAD_REF: ${{{{ steps.upstream.outputs.owner }}}}:${{{{ steps.upstream.outputs.branch }}}}
+        run: |
+          set -euo pipefail
+          COMPARE_BASE=$(python3 -c 'import os; from urllib.parse import quote; print(quote(os.environ["BASE_REF"], safe=":"))')
+          COMPARE_HEAD=$(python3 -c 'import os; from urllib.parse import quote; print(quote(os.environ["HEAD_REF"], safe=":"))')
+          COMPARE_JSON=$(gh api "repos/${{{{ github.repository }}}}/compare/${{COMPARE_BASE}}...${{COMPARE_HEAD}}")
+          if ! printf '%s' "$COMPARE_JSON" | jq -e '.ahead_by | numbers' >/dev/null; then
+            echo "::error::SAFETY ABORT: post-sync compare response has malformed ahead_by."
+            exit 1
+          fi
+          BEHIND_BY=$(printf '%s' "$COMPARE_JSON" | jq -r '.ahead_by')
+          if [ "$BEHIND_BY" -ne 0 ]; then
+            echo "::error::SAFETY ABORT: fork remains $BEHIND_BY upstream commit(s) behind."
+            exit 1
+          fi
+          echo "Verified: fork is not behind upstream."
+
       - name: Release retention policy
         if: steps.upstream.outputs.skip != 'true'
         env:
@@ -254,6 +286,7 @@ jobs:
           import re
           import subprocess
           import tempfile
+          from urllib.parse import quote
 
           repo = os.environ["GITHUB_REPOSITORY"]
           installable_re = re.compile(r"\\.(?:exe|msi|deb|rpm|appimage|dmg|pkg|zip|tar\\.gz)$", re.IGNORECASE)
@@ -281,6 +314,20 @@ jobs:
               )
               if result.returncode != 0:
                   raise RuntimeError(result.stderr.strip() or "gh command failed")
+
+          def gh_paginate(endpoint):
+              results = []
+              separator = "&" if "?" in endpoint else "?"
+              for page in range(1, 51):
+                  batch = gh_json([
+                      "api", f"{{endpoint}}{{separator}}per_page=100&page={{page}}"
+                  ])
+                  if not isinstance(batch, list):
+                      raise RuntimeError("invalid paginated release response")
+                  results.extend(batch)
+                  if len(batch) < 100:
+                      return results
+              raise RuntimeError("release pagination limit exceeded")
 
           def stable(releases):
               return [
@@ -316,14 +363,42 @@ jobs:
                       names.append(name)
               return names
 
+          def assets_by_name(release):
+              return {{
+                  asset.get("name"): asset
+                  for asset in (release.get("assets") or [])
+                  if isinstance(asset, dict)
+                  and isinstance(asset.get("name"), str)
+              }}
+
+          def proven_upstream_mirror(fork_asset, upstream_asset):
+              if not isinstance(fork_asset, dict) or not isinstance(upstream_asset, dict):
+                  return False
+              if fork_asset.get("name") != upstream_asset.get("name"):
+                  return False
+              fork_digest = fork_asset.get("digest")
+              upstream_digest = upstream_asset.get("digest")
+              if isinstance(fork_digest, str) and isinstance(upstream_digest, str):
+                  return bool(fork_digest) and fork_digest == upstream_digest
+              fork_size = fork_asset.get("size")
+              upstream_size = upstream_asset.get("size")
+              return (
+                  isinstance(fork_size, int)
+                  and not isinstance(fork_size, bool)
+                  and isinstance(upstream_size, int)
+                  and not isinstance(upstream_size, bool)
+                  and fork_size >= 0
+                  and fork_size == upstream_size
+              )
+
           repo_meta = gh_json(["api", f"repos/{{repo}}"])
           upstream = ((repo_meta.get("parent") or {{}}).get("full_name") or "").strip()
           if not upstream:
               print("::notice::Upstream repo metadata is missing; release retention skipped.")
               raise SystemExit(0)
 
-          upstream_releases = gh_json(["api", f"repos/{{upstream}}/releases?per_page=100"])
-          fork_releases = gh_json(["api", f"repos/{{repo}}/releases?per_page=100"])
+          upstream_releases = gh_paginate(f"repos/{{upstream}}/releases")
+          fork_releases = gh_paginate(f"repos/{{repo}}/releases")
           upstream_stable = stable(upstream_releases)
           if not upstream_stable:
               print("::notice::source-only release notes policy: upstream has no stable releases.")
@@ -393,10 +468,41 @@ jobs:
                   latest_name = required_by_lower.get("latest.json")
                   latest_json = pathlib.Path(tmpdir) / latest_name if latest_name else None
                   if latest_json is not None and latest_json.exists():
-                      upstream_prefix = f"https://github.com/{{upstream}}/releases/download/{{tag}}/"
-                      fork_prefix = f"https://github.com/{{repo}}/releases/download/{{tag}}/"
                       text = latest_json.read_text(encoding="utf-8")
-                      latest_json.write_text(text.replace(upstream_prefix, fork_prefix), encoding="utf-8")
+                      try:
+                          json.loads(text)
+                      except json.JSONDecodeError as exc:
+                          raise RuntimeError(f"latest.json is invalid JSON: {{exc.msg}}") from exc
+                      raw_tag = tag
+                      encoded_tag = quote(tag, safe="")
+                      upstream_prefixes = [
+                          f"https://github.com/{{upstream}}/releases/download/{{raw_tag}}/",
+                          f"https://github.com/{{upstream}}/releases/download/{{encoded_tag}}/",
+                      ]
+                      fork_prefixes = [
+                          f"https://github.com/{{repo}}/releases/download/{{raw_tag}}/",
+                          f"https://github.com/{{repo}}/releases/download/{{encoded_tag}}/",
+                      ]
+                      rewritten = text
+                      for upstream_prefix, fork_prefix in zip(
+                          upstream_prefixes, fork_prefixes
+                      ):
+                          rewritten = rewritten.replace(upstream_prefix, fork_prefix)
+                      if rewritten == text and not any(
+                          prefix in text for prefix in fork_prefixes
+                      ):
+                          raise RuntimeError(
+                              "latest.json contains no managed GitHub download URL"
+                          )
+                      if any(prefix in rewritten for prefix in upstream_prefixes):
+                          raise RuntimeError(
+                              "latest.json still points to the upstream release"
+                          )
+                      if not any(prefix in rewritten for prefix in fork_prefixes):
+                          raise RuntimeError(
+                              "latest.json does not point to the fork release"
+                          )
+                      latest_json.write_text(rewritten, encoding="utf-8")
 
                   for lowered, algorithm in checksum_algorithms.items():
                       manifest_name = required_by_lower.get(lowered)
@@ -438,26 +544,26 @@ jobs:
                       "-R", repo, "--clobber",
                   ])
 
-          old_stable = [
-              release for release in stable(fork_releases)
-              if release.get("tag_name") != tag
-          ]
-          for release in old_stable:
+          upstream_by_tag = {{
+              release.get("tag_name"): release
+              for release in stable(upstream_releases)
+              if release.get("tag_name") and release.get("tag_name") != tag
+          }}
+          prune_plan = []
+          for release in stable(fork_releases):
               old_tag = release.get("tag_name")
-              if not old_tag:
+              upstream_release = upstream_by_tag.get(old_tag)
+              if not old_tag or upstream_release is None:
                   continue
-              for asset in release.get("assets") or []:
-                  name = asset.get("name")
-                  if not isinstance(name, str):
+              upstream_assets = assets_by_name(upstream_release)
+              for name, asset in assets_by_name(release).items():
+                  if name not in required_asset_names(release):
                       continue
-                  lowered = name.lower()
-                  if (
-                      installable_re.search(name)
-                      or signed_re.search(name)
-                      or lowered == "latest.json"
-                      or lowered in checksum_algorithms
-                  ):
-                      gh_run(["release", "delete-asset", old_tag, name, "-R", repo, "--yes"])
+                  if proven_upstream_mirror(asset, upstream_assets.get(name)):
+                      prune_plan.append((old_tag, name))
+          for old_tag, name in prune_plan:
+              print(f"Pruning proven upstream mirror asset: {{old_tag}}/{{name}}")
+              gh_run(["release", "delete-asset", old_tag, name, "-R", repo, "--yes"])
           PY
 '''
 
@@ -568,13 +674,71 @@ def _is_critical_deleted_path(path):
     )
 
 
-def _old_stable_required_asset_count(releases, latest_tag):
-    """Return retained old-stable assets that policy requires pruning."""
-    return sum(
-        len(_required_release_asset_names(release))
-        for release in _stable_releases(releases)
-        if release.get("tag_name") != latest_tag
+def _fetch_releases(repo_name):
+    """Fetch every release page, failing closed on partial pagination."""
+    releases, page_error = paginate(
+        f"repos/{repo_name}/releases",
+        include_error=True,
     )
+    return page_error if page_error else releases
+
+
+def _release_assets_by_name(release):
+    """Return valid release asset payloads keyed by their exact names."""
+    if not isinstance(release, dict):
+        return {}
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        return {}
+    return {
+        asset["name"]: asset
+        for asset in assets
+        if isinstance(asset, dict) and isinstance(asset.get("name"), str)
+    }
+
+
+def _asset_is_proven_upstream_mirror(fork_asset, upstream_asset):
+    """Prove asset provenance using an exact name plus digest or size."""
+    if not isinstance(fork_asset, dict) or not isinstance(upstream_asset, dict):
+        return False
+    if fork_asset.get("name") != upstream_asset.get("name"):
+        return False
+
+    fork_digest = fork_asset.get("digest")
+    upstream_digest = upstream_asset.get("digest")
+    if isinstance(fork_digest, str) and isinstance(upstream_digest, str):
+        return bool(fork_digest) and fork_digest == upstream_digest
+
+    fork_size = parse_nonnegative_int(fork_asset.get("size"))
+    upstream_size = parse_nonnegative_int(upstream_asset.get("size"))
+    return (
+        fork_size is not None
+        and upstream_size is not None
+        and fork_size == upstream_size
+    )
+
+
+def _prunable_old_release_assets(upstream_releases, fork_releases, latest_tag):
+    """Return only old fork assets proven identical to upstream assets."""
+    upstream_by_tag = {
+        release.get("tag_name"): release
+        for release in _stable_releases(upstream_releases)
+        if release.get("tag_name") and release.get("tag_name") != latest_tag
+    }
+    plan = []
+    for fork_release in _stable_releases(fork_releases):
+        tag = fork_release.get("tag_name")
+        upstream_release = upstream_by_tag.get(tag)
+        if not tag or upstream_release is None:
+            continue
+        upstream_assets = _release_assets_by_name(upstream_release)
+        for name, fork_asset in _release_assets_by_name(fork_release).items():
+            if name not in _required_release_asset_names(fork_release):
+                continue
+            upstream_asset = upstream_assets.get(name)
+            if _asset_is_proven_upstream_mirror(fork_asset, upstream_asset):
+                plan.append({"tag": tag, "name": name})
+    return plan
 
 
 def _write_release_file(path, content):
@@ -583,19 +747,47 @@ def _write_release_file(path, content):
         handle.write(content)
 
 
+def _release_download_prefixes(repo_name, tag):
+    """Return raw and URL-encoded GitHub release download prefixes."""
+    raw = f"https://github.com/{repo_name}/releases/download/{tag}/"
+    encoded_tag = encode_url_component(tag)
+    encoded = (
+        f"https://github.com/{repo_name}/releases/download/{encoded_tag}/"
+        if encoded_tag else raw
+    )
+    return tuple(dict.fromkeys((raw, encoded)))
+
+
 def _rewrite_latest_json(latest_json_path, upstream, full_name, tag):
-    """Rewrite latest.json URLs from upstream to fork download URLs."""
+    """Rewrite and validate latest.json URLs for the fork release."""
     if not os.path.isfile(latest_json_path):
-        return False
+        return False, "latest.json is missing"
     with open(latest_json_path, "r", encoding="utf-8") as handle:
         latest_json_text = handle.read()
-    upstream_prefix = f"https://github.com/{upstream}/releases/download/{tag}/"
-    fork_prefix = f"https://github.com/{full_name}/releases/download/{tag}/"
+    try:
+        json.loads(latest_json_text)
+    except json.JSONDecodeError as exc:
+        return False, f"latest.json is invalid JSON: {exc.msg}"
+
+    upstream_prefixes = _release_download_prefixes(upstream, tag)
+    fork_prefixes = _release_download_prefixes(full_name, tag)
+    rewritten = latest_json_text
+    for upstream_prefix, fork_prefix in zip(upstream_prefixes, fork_prefixes):
+        rewritten = rewritten.replace(upstream_prefix, fork_prefix)
+
+    if rewritten == latest_json_text:
+        if not any(prefix in latest_json_text for prefix in fork_prefixes):
+            return False, "latest.json contains no managed GitHub download URL"
+    if any(prefix in rewritten for prefix in upstream_prefixes):
+        return False, "latest.json still points to the upstream release"
+    if not any(prefix in rewritten for prefix in fork_prefixes):
+        return False, "latest.json does not point to the fork release"
+
     _write_release_file(
         latest_json_path,
-        latest_json_text.replace(upstream_prefix, fork_prefix),
+        rewritten,
     )
-    return True
+    return True, None
 
 
 def _refresh_checksum_manifest_for_latest_json(
@@ -631,6 +823,34 @@ def _refresh_checksum_manifest_for_latest_json(
 
     _write_release_file(manifest_path, "\n".join(updated_lines) + "\n")
     return True, None
+
+
+def _verify_checksum_manifest_for_latest_json(
+    manifest_path, latest_json_path, algorithm
+):
+    """Verify one checksum manifest entry for latest.json."""
+    if not os.path.isfile(manifest_path) or not os.path.isfile(latest_json_path):
+        return False, "release metadata bundle is incomplete"
+    with open(latest_json_path, "rb") as handle:
+        expected = hashlib.new(algorithm, handle.read()).hexdigest().lower()
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    for line in lines:
+        parts = line.split()
+        filename = parts[-1] if parts else ""
+        normalized_name = (
+            filename.lstrip("*")
+            .replace("\\", "/")
+            .rsplit("/", 1)[-1]
+            .lower()
+        )
+        if normalized_name != "latest.json":
+            continue
+        actual = parts[0].lower() if parts else ""
+        if actual != expected:
+            return False, "checksum manifest has a stale latest.json digest"
+        return True, None
+    return False, "checksum manifest does not contain latest.json"
 
 
 def _expand_release_metadata_bundle(release, missing_assets):
@@ -686,6 +906,59 @@ def _download_missing_release_assets(upstream, tag, missing_assets, temp_dir):
         downloaded_paths.append(asset_path)
 
     return downloaded_paths, None
+
+
+def _verify_remote_release_metadata(upstream, full_name, tag, release):
+    """Verify latest.json routing and checksum assets already on a fork."""
+    required = _required_release_asset_names(release)
+    required_by_lower = {name.lower(): name for name in required}
+    latest_name = required_by_lower.get("latest.json")
+    if not latest_name:
+        return True, None
+
+    metadata_names = [latest_name]
+    for lowered in CHECKSUM_MANIFEST_ALGORITHMS:
+        actual_name = required_by_lower.get(lowered)
+        if actual_name:
+            metadata_names.append(actual_name)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        downloaded, error = _download_missing_release_assets(
+            full_name,
+            tag,
+            metadata_names,
+            temp_dir,
+        )
+        if error:
+            return False, error
+        latest_json_path = os.path.join(temp_dir, latest_name)
+        with open(latest_json_path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        try:
+            json.loads(text)
+        except json.JSONDecodeError as exc:
+            return False, f"latest.json is invalid JSON: {exc.msg}"
+
+        fork_prefixes = _release_download_prefixes(full_name, tag)
+        upstream_prefixes = _release_download_prefixes(upstream, tag)
+        if not any(prefix in text for prefix in fork_prefixes):
+            return False, "latest.json does not point to the fork release"
+        if any(prefix in text for prefix in upstream_prefixes):
+            return False, "latest.json still points to the upstream release"
+
+        for lowered, algorithm in CHECKSUM_MANIFEST_ALGORITHMS.items():
+            manifest_name = required_by_lower.get(lowered)
+            if not manifest_name:
+                continue
+            ok, checksum_error = _verify_checksum_manifest_for_latest_json(
+                os.path.join(temp_dir, manifest_name),
+                latest_json_path,
+                algorithm,
+            )
+            if not ok:
+                return False, f"{manifest_name}: {checksum_error}"
+
+    return True, None
 
 
 def safety_check(fork_name, fork_branch, upstream_name, upstream_branch,
@@ -993,6 +1266,7 @@ def _parse_cli_args(argv):
         "dry_run": False,
         "force": False,
         "add_mode": False,
+        "verify_schedule": False,
         "verify_releases": False,
         "sync_releases": False,
         "json_output": "--json" in argv,
@@ -1015,6 +1289,9 @@ def _parse_cli_args(argv):
                 continue
             if arg == "--add-workflow":
                 parsed["add_mode"] = True
+                continue
+            if arg == "--verify-schedule":
+                parsed["verify_schedule"] = True
                 continue
             if arg == "--verify-releases":
                 parsed["verify_releases"] = True
@@ -1130,6 +1407,159 @@ def _find_release_by_tag(releases, tag_name):
     return None
 
 
+def _latest_workflow_run(runs_payload):
+    """Return normalized latest workflow run details, or None if absent."""
+    if not isinstance(runs_payload, dict) or "error" in runs_payload:
+        return None
+    runs = runs_payload.get("workflow_runs")
+    if not isinstance(runs, list) or not runs:
+        return None
+    latest = runs[0]
+    if not isinstance(latest, dict):
+        return None
+    return {
+        "status": latest.get("status"),
+        "conclusion": latest.get("conclusion"),
+        "created_at": latest.get("created_at"),
+        "updated_at": latest.get("updated_at"),
+        "html_url": latest.get("html_url"),
+    }
+
+
+def _fetch_latest_workflow_run(full_name, event):
+    """Fetch the newest managed workflow run for one event type."""
+    return gh_api(
+        "repos/"
+        f"{full_name}/actions/workflows/sync-fork.yml/runs"
+        f"?event={event}&per_page=1"
+    )
+
+
+def _schedule_next_action(row):
+    """Return the next action for one schedule-readiness row."""
+    if row["result"] == RESULT_ERROR:
+        return "investigate_api_errors"
+    if not row["workflow_installed"]:
+        return "install_sync_workflow"
+    if not row["workflow_current"]:
+        return "update_sync_workflow"
+    if not row["secret_sync_pat_present"]:
+        return "set_sync_pat_secret"
+    scheduled = row.get("last_scheduled_run") or {}
+    if not scheduled:
+        smoke = row.get("last_smoke_run") or {}
+        if smoke.get("conclusion") == "success":
+            return "wait_for_natural_scheduled_run"
+        return "wait_or_trigger_smoke_run"
+    if scheduled.get("conclusion") != "success":
+        return "inspect_last_scheduled_failure"
+    return "none"
+
+
+def _build_verify_schedule_row(fork):
+    """Collect workflow, secret, and scheduled-run readiness details."""
+    full_name = fork["full_name"]
+    branch = fork["branch"]
+    encoded_branch = encode_url_component(branch)
+    row = {
+        **_base_fork_row(fork),
+        "branch": branch,
+        "upstream_branch": fork["parent_branch"],
+        "workflow_installed": False,
+        "workflow_current": False,
+        "workflow_update_reason": None,
+        "secret_sync_pat_present": False,
+        "last_scheduled_run": None,
+        "last_smoke_run": None,
+        "result": RESULT_OK,
+    }
+    if not encoded_branch:
+        row["result"] = RESULT_ERROR
+        row["workflow_error"] = "invalid fork branch metadata"
+        row["next_action"] = "investigate_api_errors"
+        return row
+
+    workflow = gh_api(
+        "repos/"
+        f"{full_name}/contents/.github/workflows/sync-fork.yml"
+        f"?ref={encoded_branch}"
+    )
+    if isinstance(workflow, dict) and "error" not in workflow:
+        row["workflow_installed"] = True
+        needs_update, reason = _needs_workflow_update(workflow)
+        row["workflow_current"] = not needs_update
+        if needs_update:
+            row["workflow_update_reason"] = reason
+    elif not is_not_found_error(workflow):
+        row["result"] = RESULT_ERROR
+        row["workflow_error"] = short_error(workflow)
+    else:
+        row["workflow_update_reason"] = "missing file"
+
+    secret = gh_api(f"repos/{full_name}/actions/secrets/SYNC_PAT")
+    if isinstance(secret, dict) and "error" not in secret:
+        row["secret_sync_pat_present"] = True
+    elif not is_not_found_error(secret):
+        row["result"] = RESULT_ERROR
+        row["secret_error"] = short_error(secret)
+
+    scheduled = _fetch_latest_workflow_run(full_name, "schedule")
+    if isinstance(scheduled, dict) and "error" not in scheduled:
+        row["last_scheduled_run"] = _latest_workflow_run(scheduled)
+    elif not is_not_found_error(scheduled):
+        row["result"] = RESULT_ERROR
+        row["scheduled_run_error"] = short_error(scheduled)
+
+    if (
+        row["result"] == RESULT_OK
+        and row["workflow_installed"]
+        and row["workflow_current"]
+        and row["secret_sync_pat_present"]
+        and row["last_scheduled_run"] is None
+    ):
+        smoke = _fetch_latest_workflow_run(full_name, "workflow_dispatch")
+        if isinstance(smoke, dict) and "error" not in smoke:
+            row["last_smoke_run"] = _latest_workflow_run(smoke)
+        elif not is_not_found_error(smoke):
+            row["result"] = RESULT_ERROR
+            row["smoke_run_error"] = short_error(smoke)
+
+    row["next_action"] = _schedule_next_action(row)
+    return row
+
+
+def _verify_schedule_readiness(forks):
+    """Return schedule-readiness rows and summary counters."""
+    rows = []
+    summary = {
+        "total": len(forks),
+        "ready": 0,
+        "missing_workflow": 0,
+        "workflow_needs_update": 0,
+        "missing_secret": 0,
+        "scheduled_run_missing_or_unhealthy": 0,
+        "errors": 0,
+    }
+    for fork in forks:
+        row = _build_verify_schedule_row(fork)
+        rows.append(row)
+        if row["result"] == RESULT_ERROR:
+            summary["errors"] += 1
+            continue
+        if not row["workflow_installed"]:
+            summary["missing_workflow"] += 1
+        elif not row["workflow_current"]:
+            summary["workflow_needs_update"] += 1
+        if not row["secret_sync_pat_present"]:
+            summary["missing_secret"] += 1
+        scheduled = row.get("last_scheduled_run") or {}
+        if scheduled.get("conclusion") != "success":
+            summary["scheduled_run_missing_or_unhealthy"] += 1
+        if row["next_action"] == "none":
+            summary["ready"] += 1
+    return rows, summary
+
+
 def _release_retention_next_action(
     latest_installable_asset_count,
     latest_fork_release,
@@ -1161,12 +1591,13 @@ def _build_verify_releases_row(fork):
         "fork_release_count": 0,
         "fork_latest_stable_asset_count": 0,
         "old_stable_release_asset_count": 0,
+        "old_stable_release_assets": [],
         "missing_latest_release_assets": [],
         "result": RESULT_OK,
     }
 
-    upstream_releases = gh_api(f"repos/{upstream}/releases?per_page=100")
-    fork_releases = gh_api(f"repos/{full_name}/releases?per_page=100")
+    upstream_releases = _fetch_releases(upstream)
+    fork_releases = _fetch_releases(full_name)
     if not isinstance(upstream_releases, list):
         row["result"] = RESULT_ERROR
         row["release_error"] = short_error(upstream_releases)
@@ -1198,10 +1629,35 @@ def _build_verify_releases_row(fork):
         latest_upstream,
         latest_fork,
     )
-    row["old_stable_release_asset_count"] = _old_stable_required_asset_count(
+    row["old_stable_release_assets"] = _prunable_old_release_assets(
+        upstream_releases,
         fork_releases,
         latest_tag,
     )
+    row["old_stable_release_asset_count"] = len(
+        row["old_stable_release_assets"]
+    )
+
+    if latest_fork is not None and not row["missing_latest_release_assets"]:
+        metadata_ok, metadata_error = _verify_remote_release_metadata(
+            upstream,
+            full_name,
+            latest_tag,
+            latest_upstream,
+        )
+        if not metadata_ok:
+            row["metadata_error"] = metadata_error
+            row["missing_latest_release_assets"] = list(dict.fromkeys([
+                *row["missing_latest_release_assets"],
+                *[
+                    name
+                    for name in _required_release_asset_names(latest_upstream)
+                    if name.lower() in {
+                        "latest.json",
+                        *CHECKSUM_MANIFEST_ALGORITHMS,
+                    }
+                ],
+            ]))
 
     row["next_action"] = _release_retention_next_action(
         row["latest_upstream_installable_asset_count"],
@@ -1291,8 +1747,8 @@ def _sync_latest_release_assets(fork, row):
         print("  FAIL: Latest upstream stable tag is missing.")
         return False
 
-    upstream_releases = gh_api(f"repos/{upstream}/releases?per_page=100")
-    fork_releases = gh_api(f"repos/{full_name}/releases?per_page=100")
+    upstream_releases = _fetch_releases(upstream)
+    fork_releases = _fetch_releases(full_name)
     if not isinstance(upstream_releases, list) or not isinstance(fork_releases, list):
         print("  FAIL: Cannot refresh release metadata for sync.")
         return False
@@ -1337,6 +1793,10 @@ def _sync_latest_release_assets(fork, row):
         latest_fork = {"tag_name": tag, "assets": []}
 
     missing_assets = _missing_release_asset_names(latest_upstream, latest_fork)
+    required_names = set(_required_release_asset_names(latest_upstream))
+    for name in row.get("missing_latest_release_assets", []):
+        if name in required_names and name not in missing_assets:
+            missing_assets.append(name)
     if not missing_assets:
         print(f"  Latest stable release already has required assets: {tag}")
         return True
@@ -1363,7 +1823,16 @@ def _sync_latest_release_assets(fork, row):
             os.path.join(temp_dir, latest_name)
             if latest_name else os.path.join(temp_dir, "latest.json")
         )
-        _rewrite_latest_json(latest_json_path, upstream, full_name, tag)
+        if latest_name:
+            rewritten, rewrite_error = _rewrite_latest_json(
+                latest_json_path,
+                upstream,
+                full_name,
+                tag,
+            )
+            if not rewritten:
+                print(f"  FAIL: latest.json: {rewrite_error}")
+                return False
 
         for manifest_name, algorithm in CHECKSUM_MANIFEST_ALGORITHMS.items():
             actual_name = required_by_lower.get(manifest_name)
@@ -1406,33 +1875,37 @@ def _prune_old_stable_release_assets(fork, row):
 
     full_name = fork["full_name"]
     latest_tag = row.get("latest_upstream_stable")
-    fork_releases = gh_api(f"repos/{full_name}/releases?per_page=100")
-    if not isinstance(fork_releases, list):
-        print("  FAIL: Cannot refresh fork releases for pruning.")
+    upstream_releases = _fetch_releases(fork["parent"])
+    fork_releases = _fetch_releases(full_name)
+    if not isinstance(upstream_releases, list) or not isinstance(fork_releases, list):
+        print("  FAIL: Cannot refresh release provenance for pruning.")
         return False
 
-    for release in _stable_releases(fork_releases):
-        old_tag = release.get("tag_name")
-        if old_tag == latest_tag or not old_tag:
-            continue
-        for asset_name in _required_release_asset_names(release):
-            if not _is_safe_release_asset_name(asset_name):
-                print(f"  FAIL: Unsafe release asset name: {asset_name!r}")
-                return False
-            result = _run_gh_command([
-                "release",
-                "delete-asset",
-                old_tag,
-                asset_name,
-                "-R",
-                full_name,
-                "--yes",
-            ])
-            if result.returncode != 0:
-                print(f"  FAIL: {result.stderr.strip()[:200] or 'cannot delete old release asset'}")
-                return False
+    prune_plan = _prunable_old_release_assets(
+        upstream_releases,
+        fork_releases,
+        latest_tag,
+    )
+    for item in prune_plan:
+        old_tag = item["tag"]
+        asset_name = item["name"]
+        if not _is_safe_release_asset_name(asset_name):
+            print(f"  FAIL: Unsafe release asset name: {asset_name!r}")
+            return False
+        result = _run_gh_command([
+            "release",
+            "delete-asset",
+            old_tag,
+            asset_name,
+            "-R",
+            full_name,
+            "--yes",
+        ])
+        if result.returncode != 0:
+            print(f"  FAIL: {result.stderr.strip()[:200] or 'cannot delete old release asset'}")
+            return False
 
-    print("  Pruned old stable release assets.")
+    print(f"  Pruned {len(prune_plan)} proven upstream mirror asset(s).")
     return True
 
 
@@ -1457,6 +1930,11 @@ def _sync_releases_result(fork, dry_run=False):
             "  [DRY-RUN] Would reconcile release retention "
             f"for {fork['full_name']} ({next_action})"
         )
+        for item in row.get("old_stable_release_assets", []):
+            print(
+                "  [DRY-RUN] Would prune proven upstream mirror asset: "
+                f"{item['tag']}/{item['name']}"
+            )
         return RESULT_OK
 
     if next_action in {"mirror_latest_stable_release", "mirror_latest_stable_assets"}:
@@ -1480,8 +1958,11 @@ def _sync_releases_result(fork, dry_run=False):
     return RESULT_OK
 
 
-def _mode_name(add_mode, verify_releases=False, sync_releases=False):
+def _mode_name(add_mode, verify_schedule=False, verify_releases=False,
+               sync_releases=False):
     """Return the machine-readable execution mode name."""
+    if verify_schedule:
+        return MODE_VERIFY_SCHEDULE
     if verify_releases:
         return MODE_VERIFY_RELEASES
     if sync_releases:
@@ -1505,7 +1986,7 @@ def _mode_writes_remotely(mode, dry_run):
         return False
     if mode in {MODE_SYNC, MODE_ADD_WORKFLOW, MODE_SYNC_RELEASES}:
         return True
-    if mode == MODE_VERIFY_RELEASES:
+    if mode in {MODE_VERIFY_SCHEDULE, MODE_VERIFY_RELEASES}:
         return False
     raise ValueError(f"Unclassified execution mode: {mode}")
 
@@ -1630,6 +2111,62 @@ def _finish_empty_forks(report, specific_repos, resolve_errors, json_output):
     return exit_code, report
 
 
+def _format_bool_status(value):
+    """Return a compact status label for text tables."""
+    return "yes" if value else "no"
+
+
+def _format_last_scheduled_run(row):
+    """Return a compact last scheduled-run label."""
+    run = row.get("last_scheduled_run")
+    if not isinstance(run, dict):
+        return "-"
+    return str(run.get("conclusion") or run.get("status") or "-")
+
+
+def _print_verify_schedule_rows(rows):
+    """Print per-repo schedule-readiness rows."""
+    if not rows:
+        return
+    print("Schedule readiness details:")
+    print(
+        f"{'Repository':<35} {'Workflow':<10} {'Current':<8} "
+        f"{'Secret':<7} {'Last':<10} {'Next action'}"
+    )
+    print("-" * 100)
+    for row in rows:
+        print(
+            f"{row['full_name']:<35} "
+            f"{_format_bool_status(row.get('workflow_installed')):<10} "
+            f"{_format_bool_status(row.get('workflow_current')):<8} "
+            f"{_format_bool_status(row.get('secret_sync_pat_present')):<7} "
+            f"{_format_last_scheduled_run(row):<10} "
+            f"{row.get('next_action') or '-'}"
+        )
+    print()
+
+
+def _run_verify_schedule_mode(report, forks, json_output):
+    """Execute verify-schedule mode and return its exit result."""
+    rows, schedule_summary = _verify_schedule_readiness(forks)
+    report["repos"] = rows
+    report["summary"].update(schedule_summary)
+    report["message"] = (
+        "Schedule readiness verified: "
+        f"ready {schedule_summary['ready']}/{schedule_summary['total']}."
+    )
+    if not json_output:
+        _print_verify_schedule_rows(rows)
+        print(report["message"])
+    return (
+        _verification_exit_code(
+            schedule_summary,
+            VERIFY_SCHEDULE_SAFETY_SUMMARY_KEYS,
+        ),
+        report,
+    )
+
+
 def _run_verify_releases_mode(report, forks, json_output):
     """Execute verify-releases mode and return its exit result."""
     rows, release_summary = _verify_release_retention(forks)
@@ -1654,6 +2191,36 @@ def _run_verify_releases_mode(report, forks, json_output):
 def _run_sync_releases_mode(report, forks, dry_run, resolve_errors, json_output):
     """Execute sync-releases mode and return its exit result."""
     _print_fork_overview(forks, json_output)
+
+    if not dry_run:
+        if resolve_errors:
+            report["message"] = (
+                "Apply blocked: one or more requested repositories could "
+                "not be resolved during preflight."
+            )
+            if not json_output:
+                print(report["message"])
+            return EXIT_ERROR, report
+        preflight = _run_preflight_phase(
+            forks,
+            lambda fork: _run_with_captured_stdout(
+                _sync_releases_result,
+                fork,
+                True,
+            ),
+        )
+        report["preflight"] = preflight
+        if not json_output:
+            _print_preflight_phase(preflight)
+        preflight_exit = _preflight_exit_code(preflight)
+        if preflight_exit != EXIT_OK:
+            report["message"] = (
+                "Apply blocked: release dry-run preflight did not pass "
+                "for every repository."
+            )
+            if not json_output:
+                print(report["message"])
+            return preflight_exit, report
 
     for fork in forks:
         if not json_output:
@@ -1754,6 +2321,44 @@ def _append_operation_report(report, fork, result, output, json_output):
     _update_operation_summary(report["summary"], result)
 
 
+def _run_preflight_phase(forks, operation):
+    """Run a complete no-write phase before any multi-repo apply phase."""
+    phase = {
+        "repos": [],
+        "summary": {"success": 0, "failed": 0, "safety_abort": 0},
+    }
+    for fork in forks:
+        result, output = operation(fork)
+        phase["repos"].append({
+            "name": fork["name"],
+            "full_name": fork["full_name"],
+            "result": result,
+            "logs": _split_log_lines(output),
+        })
+        _update_operation_summary(phase["summary"], result)
+    return phase
+
+
+def _preflight_exit_code(phase):
+    """Return the blocking exit code for a preflight phase, or success."""
+    summary = phase["summary"]
+    if summary["failed"]:
+        return EXIT_ERROR
+    if summary["safety_abort"]:
+        return EXIT_SAFETY
+    return EXIT_OK
+
+
+def _print_preflight_phase(phase):
+    """Print captured preflight logs without changing machine output."""
+    print("Preflight (no remote writes):")
+    for repo in phase["repos"]:
+        print(f"[{repo['name']}] result={repo['result']}")
+        for line in repo["logs"]:
+            print(line)
+    print()
+
+
 def _update_operation_summary(summary, result):
     """Update operation summary counters for one repo result."""
     if result == RESULT_OK:
@@ -1768,6 +2373,37 @@ def _run_mutating_or_dryrun_mode(report, forks, mode, dry_run, force,
                                  resolve_errors, json_output):
     """Run add-workflow or sync mode over all resolved forks."""
     _print_fork_overview(forks, json_output)
+
+    if not dry_run:
+        if resolve_errors:
+            report["message"] = (
+                "Apply blocked: one or more requested repositories could "
+                "not be resolved during preflight."
+            )
+            if not json_output:
+                print(report["message"])
+            return EXIT_ERROR, report
+        preflight = _run_preflight_phase(
+            forks,
+            lambda fork: _run_single_repo_operation(
+                fork,
+                mode,
+                True,
+                force,
+            ),
+        )
+        report["preflight"] = preflight
+        if not json_output:
+            _print_preflight_phase(preflight)
+        preflight_exit = _preflight_exit_code(preflight)
+        if preflight_exit != EXIT_OK:
+            report["message"] = (
+                "Apply blocked: dry-run preflight did not pass for every "
+                "repository."
+            )
+            if not json_output:
+                print(report["message"])
+            return preflight_exit, report
 
     for fork in forks:
         if not json_output:
@@ -1809,6 +2445,7 @@ def _run(parsed):
     dry_run = parsed.get("dry_run", False)
     force = parsed.get("force", False)
     add_mode = parsed.get("add_mode", False)
+    verify_schedule = parsed.get("verify_schedule", False)
     verify_releases = parsed.get("verify_releases", False)
     sync_releases = parsed.get("sync_releases", False)
     specific_repos = parsed.get("specific_repos", [])
@@ -1819,7 +2456,12 @@ def _run(parsed):
     auth_info = auth_context["auth"]
     username = auth_context["username"]
 
-    mode = _mode_name(add_mode, verify_releases, sync_releases)
+    mode = _mode_name(
+        add_mode,
+        verify_schedule,
+        verify_releases,
+        sync_releases,
+    )
     report = _build_run_report(
         username, auth_info, mode, dry_run, force, specific_repos,
     )
@@ -1845,6 +2487,8 @@ def _run(parsed):
             report, specific_repos, resolve_errors, json_output,
         )
 
+    if verify_schedule:
+        return _run_verify_schedule_mode(report, forks, json_output)
     if verify_releases:
         return _run_verify_releases_mode(report, forks, json_output)
     if sync_releases:

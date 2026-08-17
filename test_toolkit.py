@@ -129,6 +129,34 @@ class AuthAndDiscoveryTests(unittest.TestCase):
         self.assertTrue(result["configured"])
         self.assertEqual(result["mode"], "gh_login")
 
+    @patch("gh_utils.gh_api")
+    @patch("gh_utils.detect_auth_mode")
+    def test_server_failure_is_not_reported_as_authentication_failure(
+        self, detect_auth, api
+    ):
+        detect_auth.return_value = {
+            "configured": True,
+            "mode": "gh_login",
+            "source": "gh auth login",
+        }
+        api.return_value = {
+            "error": "Service Unavailable (HTTP 503)",
+            "error_type": "server",
+            "error_code": "E_GH_SERVER",
+            "status_code": 503,
+            "retryable": True,
+        }
+
+        with self.assertRaises(gh_utils.AuthContextError) as raised:
+            gh_utils.get_auth_context()
+
+        payload = raised.exception.to_dict("sync-forks")
+        self.assertEqual(payload["error"], "github_user_lookup_failed")
+        self.assertEqual(payload["error_code"], "E_GH_SERVER")
+        self.assertEqual(payload["status_code"], 503)
+        self.assertTrue(payload["retryable"])
+        self.assertIn("authentication settings", payload["message"].lower())
+
     @patch("gh_utils.utc_now_iso", return_value="2026-08-15T00:00:00Z")
     @patch("gh_utils.gh_api")
     @patch("gh_utils.paginate")
@@ -181,6 +209,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("backup/pre-sync", workflow)
         self.assertIn("critical path deletion detected", workflow)
         self.assertIn("merge-upstream", workflow)
+        self.assertIn("Verify upstream convergence", workflow)
+        self.assertIn("gh_paginate", workflow)
+        self.assertIn("proven_upstream_mirror", workflow)
         self.assertIn("timeout-minutes: 30", workflow)
         self.assertIn('"--clobber"', workflow)
         self.assertIn("DELETED_FILE_COUNT", workflow)
@@ -257,6 +288,86 @@ class WorkflowTests(unittest.TestCase):
         ])
 
         self.assertIn("Choose only one mode", parsed["error"])
+
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_schedule_detects_template_drift(self, api):
+        drifted = sync_forks._render_workflow_template() + "\n# unmanaged drift\n"
+        api.side_effect = [
+            {"content": encoded(drifted), "sha": "abc"},
+            {"name": "SYNC_PAT"},
+            {"workflow_runs": [{"status": "completed", "conclusion": "success"}]},
+        ]
+
+        row = sync_forks._build_verify_schedule_row(FORK)
+
+        self.assertTrue(row["workflow_installed"])
+        self.assertFalse(row["workflow_current"])
+        self.assertEqual(row["next_action"], "update_sync_workflow")
+
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_schedule_detects_missing_secret(self, api):
+        api.side_effect = [
+            {
+                "content": encoded(sync_forks._render_workflow_template()),
+                "sha": "abc",
+            },
+            {
+                "error": "Not Found (HTTP 404)",
+                "error_type": "not_found",
+                "status_code": 404,
+            },
+            {"workflow_runs": [{"status": "completed", "conclusion": "success"}]},
+        ]
+
+        row = sync_forks._build_verify_schedule_row(FORK)
+
+        self.assertTrue(row["workflow_current"])
+        self.assertFalse(row["secret_sync_pat_present"])
+        self.assertEqual(row["next_action"], "set_sync_pat_secret")
+
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_schedule_accepts_healthy_natural_run(self, api):
+        api.side_effect = [
+            {
+                "content": encoded(sync_forks._render_workflow_template()),
+                "sha": "abc",
+            },
+            {"name": "SYNC_PAT"},
+            {"workflow_runs": [{"status": "completed", "conclusion": "success"}]},
+        ]
+
+        row = sync_forks._build_verify_schedule_row(FORK)
+
+        self.assertTrue(row["workflow_current"])
+        self.assertTrue(row["secret_sync_pat_present"])
+        self.assertEqual(row["last_scheduled_run"]["conclusion"], "success")
+        self.assertEqual(row["next_action"], "none")
+        self.assertEqual(api.call_count, 3)
+
+    @patch.object(sync_forks, "gh_api")
+    def test_verify_schedule_does_not_treat_smoke_as_natural_run(self, api):
+        api.side_effect = [
+            {
+                "content": encoded(sync_forks._render_workflow_template()),
+                "sha": "abc",
+            },
+            {"name": "SYNC_PAT"},
+            {"workflow_runs": []},
+            {"workflow_runs": [{"status": "completed", "conclusion": "success"}]},
+        ]
+
+        row = sync_forks._build_verify_schedule_row(FORK)
+        with patch.object(
+            sync_forks,
+            "_build_verify_schedule_row",
+            return_value=row,
+        ):
+            rows, summary = sync_forks._verify_schedule_readiness([FORK])
+
+        self.assertEqual(rows[0]["last_smoke_run"]["conclusion"], "success")
+        self.assertEqual(row["next_action"], "wait_for_natural_scheduled_run")
+        self.assertEqual(summary["ready"], 0)
+        self.assertEqual(summary["scheduled_run_missing_or_unhealthy"], 1)
 
 
 class SafetyAndSyncTests(unittest.TestCase):
@@ -423,9 +534,9 @@ class ReleaseTests(unittest.TestCase):
             ["app.zip", "app.zip.sig", "latest.json"],
         )
 
-    @patch.object(sync_forks, "gh_api")
-    def test_release_verification_detects_missing_latest_assets(self, api):
-        api.side_effect = [
+    @patch.object(sync_forks, "_fetch_releases")
+    def test_release_verification_detects_missing_latest_assets(self, fetch):
+        fetch.side_effect = [
             [{
                 "tag_name": "v1",
                 "draft": False,
@@ -440,9 +551,9 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(row["release_policy"], "latest_stable_assets_only")
         self.assertEqual(row["next_action"], "mirror_latest_stable_release")
 
-    @patch.object(sync_forks, "gh_api")
-    def test_release_verification_skips_source_only_releases(self, api):
-        api.side_effect = [
+    @patch.object(sync_forks, "_fetch_releases")
+    def test_release_verification_skips_source_only_releases(self, fetch):
+        fetch.side_effect = [
             [{
                 "tag_name": "v1",
                 "draft": False,
@@ -456,6 +567,83 @@ class ReleaseTests(unittest.TestCase):
 
         self.assertEqual(row["release_policy"], "source_only_release_notes")
         self.assertEqual(row["next_action"], "none")
+
+    @patch.object(sync_forks, "paginate")
+    def test_release_fetch_paginates_and_fails_closed(self, paginate):
+        page_error = {
+            "error": "Service Unavailable (HTTP 503)",
+            "error_code": "E_GH_SERVER",
+        }
+        paginate.side_effect = [([{"tag_name": "v1"}], None), ([], page_error)]
+
+        self.assertEqual(
+            sync_forks._fetch_releases("upstream/repo"),
+            [{"tag_name": "v1"}],
+        )
+        self.assertIs(sync_forks._fetch_releases("me/fork"), page_error)
+        self.assertEqual(
+            paginate.call_args_list[0].args[0],
+            "repos/upstream/repo/releases",
+        )
+        self.assertTrue(paginate.call_args_list[0].kwargs["include_error"])
+
+    def test_release_prune_requires_upstream_provenance(self):
+        upstream_releases = [{
+            "tag_name": "v1",
+            "draft": False,
+            "prerelease": False,
+            "assets": [
+                {"name": "app.zip", "digest": "sha256:same", "size": 10},
+                {"name": "app.exe", "digest": "sha256:upstream", "size": 20},
+            ],
+        }]
+        fork_releases = [
+            {
+                "tag_name": "v1",
+                "draft": False,
+                "prerelease": False,
+                "assets": [
+                    {"name": "app.zip", "digest": "sha256:same", "size": 10},
+                    {"name": "app.exe", "digest": "sha256:fork", "size": 20},
+                ],
+            },
+            {
+                "tag_name": "v999-custom",
+                "draft": False,
+                "prerelease": False,
+                "assets": [
+                    {"name": "private-build.zip", "digest": "sha256:private"},
+                ],
+            },
+        ]
+
+        plan = sync_forks._prunable_old_release_assets(
+            upstream_releases,
+            fork_releases,
+            latest_tag="v2",
+        )
+
+        self.assertEqual(plan, [{"tag": "v1", "name": "app.zip"}])
+
+    def test_latest_json_without_managed_url_is_rejected_unchanged(self):
+        original = '{"url":"https://downloads.example.com/app.zip"}'
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "latest.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(original)
+
+            ok, error = sync_forks._rewrite_latest_json(
+                path,
+                "upstream/repo",
+                "me/fork",
+                "v1",
+            )
+
+            with open(path, "r", encoding="utf-8") as handle:
+                persisted = handle.read()
+        self.assertFalse(ok)
+        self.assertIn("no managed GitHub download URL", error)
+        self.assertEqual(persisted, original)
 
     @patch.object(sync_forks, "_build_verify_releases_row")
     @patch.object(sync_forks, "_sync_latest_release_assets")
@@ -493,10 +681,28 @@ class ReleaseTests(unittest.TestCase):
             self.assertIsNone(error)
             self.assertIn(expected, content)
 
+    def test_stale_latest_json_checksum_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            latest = os.path.join(directory, "latest.json")
+            sums = os.path.join(directory, "SHA256SUMS.txt")
+            with open(latest, "w", encoding="utf-8") as handle:
+                handle.write('{"url": "fork"}')
+            with open(sums, "w", encoding="utf-8") as handle:
+                handle.write(f"{'0' * 64}  latest.json\n")
+
+            ok, error = sync_forks._verify_checksum_manifest_for_latest_json(
+                sums,
+                latest,
+                "sha256",
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("stale latest.json digest", error)
+
     @patch.object(sync_forks, "_run_gh_command")
-    @patch.object(sync_forks, "gh_api")
+    @patch.object(sync_forks, "_fetch_releases")
     def test_missing_checksum_reuploads_latest_metadata_bundle_with_clobber(
-        self, api, run
+        self, fetch, run
     ):
         upstream_latest = {
             "tag_name": "v1",
@@ -515,7 +721,7 @@ class ReleaseTests(unittest.TestCase):
                 {"name": "latest.json"},
             ],
         }
-        api.side_effect = [[upstream_latest], [fork_latest]]
+        fetch.side_effect = [[upstream_latest], [fork_latest]]
 
         def fake_run(args):
             if args[:2] == ["release", "download"]:
@@ -730,6 +936,38 @@ class CliAndReportingTests(unittest.TestCase):
         sync_now.assert_called_once_with(
             "me/fork", "main", "upstream/repo", "main", True, False
         )
+
+    @patch.object(sync_forks, "_run_single_repo_operation")
+    def test_apply_is_blocked_until_every_repo_passes_dry_run(self, operation):
+        second = {**FORK, "name": "fork-two", "full_name": "me/fork-two"}
+        operation.side_effect = [
+            (sync_forks.RESULT_OK, "first dry-run passed\n"),
+            (sync_forks.RESULT_SAFETY, "second dry-run blocked\n"),
+        ]
+        report = sync_forks._build_run_report(
+            "me",
+            {"mode": "gh_login", "source": "gh auth login"},
+            sync_forks.MODE_SYNC,
+            False,
+            False,
+            [],
+        )
+
+        exit_code, report = sync_forks._run_mutating_or_dryrun_mode(
+            report,
+            [FORK, second],
+            sync_forks.MODE_SYNC,
+            False,
+            False,
+            False,
+            True,
+        )
+
+        self.assertEqual(exit_code, sync_forks.EXIT_SAFETY)
+        self.assertEqual(report["preflight"]["summary"]["success"], 1)
+        self.assertEqual(report["preflight"]["summary"]["safety_abort"], 1)
+        self.assertEqual(operation.call_count, 2)
+        self.assertTrue(all(call.args[2] for call in operation.call_args_list))
 
 
 if __name__ == "__main__":

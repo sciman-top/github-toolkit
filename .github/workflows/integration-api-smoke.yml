@@ -60,6 +60,7 @@ jobs:
           set -euo pipefail
           python list-forks.py --json > integration-list-forks.json
           python sync-forks.py --json --dry-run > integration-sync-all-dry-run.json
+          python sync-forks.py --json --verify-schedule > integration-verify-schedule.json
           python sync-forks.py --json --verify-releases > integration-verify-releases.json
 
       - name: Integration specific-repo dry checks

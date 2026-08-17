@@ -4,6 +4,7 @@
 
 - `list-forks.py`：只读列出当前账号的 fork、上游差异和同步 workflow 状态；API 无法确认时明确报告 `Unknown`，不伪装成 `Missing`。
 - `sync-forks.py`：dry-run 或同步 fork，并在真实默认分支写入前创建 `backup/pre-sync`。
+- `sync-forks.py --verify-schedule`：只读核对 workflow 模板、`SYNC_PAT` 与自然定时运行状态。
 - `sync-forks.py --verify-releases/--sync-releases`：核对或收敛最新稳定版资产。
 
 仓库状态、默认分支、上游和认证均在运行时从 GitHub 获取；README 不保存易过期的成功快照。
@@ -35,6 +36,9 @@ python sync-forks.py
 python sync-forks.py --add-workflow --dry-run
 python sync-forks.py --add-workflow
 
+# 只读核对 workflow、secret 和定时运行健康度
+python sync-forks.py --verify-schedule --json
+
 # 稳定版资产只读核对与收敛
 python sync-forks.py --verify-releases --json
 python sync-forks.py --sync-releases --dry-run --json
@@ -48,7 +52,7 @@ python sync-forks.py --sync-releases repo-name
 默认分支同步遵循固定顺序：
 
 1. 从 GitHub API fresh discover fork 与上游默认分支。
-2. 即使使用 `--dry-run`，也会真实读取并比较 fork/upstream 文件数量与删除内容；dry-run 本身不写 GitHub。
+2. 即使使用 `--dry-run`，也会真实读取并比较 fork/upstream 文件数量与删除内容；dry-run 本身不写 GitHub。未显式使用 `--dry-run` 时，工具也会先对全部目标完成同样的无写入 preflight；任一目标失败或安全阻断，整批 apply 都不会开始。
 3. 上游文件数低于 fork 的 50%、删除文件数过大、compare 文件列表达到 300 条而可能截断，或删除 `.github/`、`README.md`、`LICENSE` 等关键路径时中止。
 4. 真实同步前把当前 fork HEAD 写入移动恢复分支 `backup/pre-sync`。
 5. 调用 GitHub `merge-upstream`，随后重新比较并确认 fork 不再落后；无法复核时按安全阻断返回，不把写入响应外推为已收敛。
@@ -70,7 +74,7 @@ python sync-forks.py --force
 - 把 `latest.json` 下载地址改写到 fork，并同步更新 `SHA256SUMS.txt`；
 - 将 `latest.json` 与 SHA-256/SHA-512 清单作为一个元数据 bundle 覆盖上传，避免只缺其中一个文件时留下不匹配校验值；
 - 拒绝包含路径分隔符、NUL 或 CLI 选项前缀的异常上游资产名，避免逃逸临时目录或改变参数解析；
-- 删除旧稳定版的安装/校验资产，但保留 tag、标题和说明。
+- 只删除能够用同 tag、同名及相同 digest（无 digest 时使用相同 size）证明来自上游的旧稳定版镜像资产；fork 自有 tag/资产默认保留。
 
 没有安装资产的上游按 `source_only_release_notes` 跳过。本地 release 子命令单次最长等待 10 分钟，生成的 workflow job 最长 30 分钟；执行器会在写入后重新核对，未收敛时返回 safety 状态，不把部分成功报告为完成。
 
@@ -85,8 +89,8 @@ python sync-forks.py --force
 ## GitHub Actions
 
 - `ci.yml`：push/PR 只运行一套行为测试，不重复安装 lint/type/benchmark 工具。
-- `auto-setup-forks.yml`：定时为新 fork 安装或更新同步 workflow；managed 文件与当前模板不完全一致时会收敛，避免保留未受管步骤。
-- `integration-api-smoke.yml`：使用独立只读凭据运行最薄 GitHub API 主链；它是运营检查，不是每次本地编码门禁。
+- `auto-setup-forks.yml`：定时为新 fork 安装或更新同步 workflow；`main` 上模板实现变化时也会立即投影，且 concurrency 防止安装任务并发。managed 文件与当前模板不完全一致时会收敛，避免保留未受管步骤。
+- `integration-api-smoke.yml`：使用独立只读凭据运行最薄 GitHub API 主链，包括 `--verify-schedule` 与 release 核对；它是运营检查，不是每次本地编码门禁。
 
 仓库 Secret：
 
@@ -103,4 +107,4 @@ python sync-forks.py --force
 python -m unittest -q test_toolkit.py
 ```
 
-测试覆盖认证/API 错误、fork 发现、dry-run、删除保护、恢复点、force acknowledgement、JSON 错误和 release 安全结果。只有出现可复现的独立失败时才增加针对性验证；不维护逐任务证据文件、合成 benchmark 或重复 contract suite。
+测试覆盖认证/API 错误、fork 发现、全批次 preflight、dry-run、删除保护、恢复点、force acknowledgement、schedule readiness、JSON 错误和 release 来源证明/安全结果。只有出现可复现的独立失败时才增加针对性验证；不维护逐任务证据文件、合成 benchmark 或重复 contract suite。

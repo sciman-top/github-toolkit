@@ -119,25 +119,40 @@ def check_gh_cli():
 
 
 class AuthContextError(RuntimeError):
-    """Structured authentication failure for text and JSON callers."""
+    """Structured authenticated-user lookup failure for text and JSON callers."""
 
-    def __init__(self, auth_info, error_type, message, detail=None):
+    def __init__(self, auth_info, error_type, message, detail=None,
+                 error_code=None, status_code=None, retryable=False):
         super().__init__(message)
         self.auth_info = auth_info
         self.error_type = error_type
         self.message = message
         self.detail = detail
+        self.error_code = error_code
+        self.status_code = status_code
+        self.retryable = retryable
 
     def to_dict(self, tool):
         """Serialize auth failure for JSON CLI output."""
+        is_auth_failure = self.error_type == "auth"
         payload = {
             "tool": tool,
-            "error": "authentication_failed",
-            "error_code": "E_AUTH_CONTEXT_FAILED",
+            "error": (
+                "authentication_failed"
+                if is_auth_failure else "github_user_lookup_failed"
+            ),
+            "error_code": (
+                "E_AUTH_CONTEXT_FAILED"
+                if is_auth_failure else self.error_code or "E_GH_UNKNOWN"
+            ),
             "error_type": self.error_type,
             "message": self.message,
             "auth": self.auth_info,
         }
+        if self.status_code is not None:
+            payload["status_code"] = self.status_code
+        if self.retryable:
+            payload["retryable"] = True
         if self.detail:
             payload["detail"] = self.detail
         return payload
@@ -240,7 +255,12 @@ def get_auth_context():
     else:
         error_type = "auth"
 
-    if auth_info.get("configured"):
+    if error_type != "auth":
+        message = (
+            "GitHub user lookup failed because the API is currently "
+            "unavailable. Retry without changing authentication settings."
+        )
+    elif auth_info.get("configured"):
         message = (
             "Authentication is configured but GitHub user lookup failed. "
             "Verify the token or gh login still has API access."
@@ -253,6 +273,15 @@ def get_auth_context():
         error_type=error_type,
         message=message,
         detail=detail,
+        error_code=(
+            user.get("error_code") if isinstance(user, dict) else None
+        ),
+        status_code=(
+            user.get("status_code") if isinstance(user, dict) else None
+        ),
+        retryable=bool(
+            user.get("retryable") if isinstance(user, dict) else False
+        ),
     )
 
 
