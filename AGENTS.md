@@ -1,7 +1,7 @@
 # AGENTS.md - github-toolkit
 **项目契约**: 2.0
-**全局规则复核**: 9.76
-**最后更新**: 2026-08-15
+**全局规则复核**: 9.77
+**最后更新**: 2026-08-19
 
 ## 1. 当前落点与目标归宿
 - 当前落点：`gh_utils.py` 负责 GitHub CLI/API 与认证，`sync-forks.py` 负责 dry-run、安全检查、恢复点、同步和 release 收敛，`list-forks.py` 负责只读状态。
@@ -17,22 +17,18 @@
 ## B. 执行边界与参考依据
 - setup/auth 不是门禁；认证缺失时只做本地测试，不声称 live 状态。
 - workflow、默认分支和 release 的真实写入属于中风险；未确认 dry-run、删除阈值和恢复点时阻断。
-- 本仓无专属 reference shelf：`gate_na`; reason=`无本地参考消费者`; alternative_verification=`GitHub 官方文档、gh help 与行为测试`; recovery_condition=`引入版本敏感 API 或第三方源码时再登记来源/revision/license/consumer`。
+- 本仓无专属 reference shelf；出现版本敏感 API 或第三方源码消费者时再登记来源、revision、license 与 consumer。
 - 不保留逐任务证据文件、计划副本、合成 benchmark 或宿主环境修复层；Git 历史、当前命令输出和 GitHub Actions run 是证据入口。
 
 ## C. 最低充分门禁与回滚
 - fixed order：`build -> test -> contract/invariant -> hotspot`。
-- build：`gate_na`; reason=`无构建产物`; alternative_verification=`test 导入并执行全部 Python 模块`。
+- build：无独立构建产物；test 会导入并执行全部 Python 模块。
 - test：`python -m unittest -q test_toolkit.py`。
 - contract/invariant：同一 suite 覆盖 dry-run、删除保护、恢复点、force acknowledgement、JSON 错误和 release 安全结果；禁止再叠加重复 suite。
-- hotspot：`gate_na`; reason=`当前无实测性能故障`; alternative_verification=`仅在出现可复现性能回归时添加一次针对性测量`。
+- hotspot：当前无实测性能故障；仅在出现可复现性能回归时添加一次针对性测量。
 - `.github/workflows/integration-api-smoke.yml` 是定时只读运营检查，不是每次编码收口门禁。
 - 回滚只撤销本任务；远端同步按 `backup/pre-sync` 或执行前 SHA 恢复。测试失败、删除保护失效或恢复点不成立时阻断真实写入。
 
-## D. Global Rule -> Repo Action
-- Git profile：baseline=`main`; upstream=`origin/main`; closeout=`focused_test_only`。
-- `R1/R2/R6`：先冻结写集和远端写入面，只跑 C 章唯一 suite；不机械扩到 full/static/benchmark。
-- `R3/R4/R7`：临时兼容写明回收点；远端写入保留 dry-run、force ack、恢复点和现有 JSON/退出码兼容。
-- `R5/S1/S2`：优先删除浅模块和无人消费的治理面；从最薄真实主链开始，易变状态只做 fresh query。
-- `R8/S3/S4/S5`：依据落到官方语义、命令输出、Git 历史或 CI；可逆决定成立即停止研究，prose 不冒充强制层。
-- `E4`：唯一 suite 与定时 integration run 承接健康信号；`E5`：仅新增依赖/action 时核供应链；`E6`：JSON/workflow 结构变化必须保留迁移、兼容和回滚说明。
+## D. Git 与回滚
+- Git baseline=`main`; upstream=`origin/main`; closeout=`focused_test_only`。
+- 回滚只撤销本任务；远端同步按 `backup/pre-sync` 或执行前 SHA 恢复。
