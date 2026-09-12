@@ -1,12 +1,12 @@
 # AGENTS.md - github-toolkit
 **项目契约**: 2.0
-**全局规则复核**: 9.77
-**最后更新**: 2026-08-19
+**全局规则复核**: 9.81
+**最后更新**: 2026-09-12
 
 ## 1. 当前落点与目标归宿
 - 当前落点：`gh_utils.py` 负责 GitHub CLI/API 与认证，`sync-forks.py` 负责 dry-run、安全检查、恢复点、同步和 release 收敛，`list-forks.py` 负责只读状态。
 - 目标归宿：以最少接口安全维护 fork；真实写入只沿“发现 -> dry-run -> 删除保护 -> `backup/pre-sync` -> apply -> 状态复核”主链发生。
-- 下一最小里程碑：完成当前脚本切片并通过一套行为测试；仓、SHA、认证和线上结果必须 fresh query，不写入规则快照。
+- 仓、SHA、认证和线上结果必须 fresh query，不写入规则快照。
 
 ## A. 仓库事实与模块边界
 - 真实同步必须先 dry-run；`--force` 真实写入还需 `SYNC_FORKS_FORCE_ACK=I_UNDERSTAND`。
@@ -27,7 +27,7 @@
 - contract/invariant：同一 suite 覆盖 dry-run、删除保护、恢复点、force acknowledgement、JSON 错误和 release 安全结果；禁止再叠加重复 suite。
 - hotspot：当前无实测性能故障；仅在出现可复现性能回归时添加一次针对性测量。
 - `.github/workflows/integration-api-smoke.yml` 是定时只读运营检查，不是每次编码收口门禁。
-- 回滚只撤销本任务；远端同步按 `backup/pre-sync` 或执行前 SHA 恢复。测试失败、删除保护失效或恢复点不成立时阻断真实写入。
+- 测试失败、删除保护失效或恢复点不成立时阻断真实写入。
 
 ## D. Git 与回滚
 - Git baseline=`main`; upstream=`origin/main`; closeout=`focused_test_only`。
