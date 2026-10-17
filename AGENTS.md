@@ -1,7 +1,7 @@
 # AGENTS.md - github-toolkit
 **项目契约**: 2.0
 **全局规则复核**: 9.87
-**最后更新**: 2026-09-12
+**最后更新**: 2026-10-17
 
 ## 1. 当前落点与目标归宿
 - 当前落点：`gh_utils.py` 负责 GitHub CLI/API 与认证，`sync-forks.py` 负责 dry-run、安全检查、恢复点、同步和 release 收敛，`list-forks.py` 负责只读状态。
@@ -15,6 +15,7 @@
 - 不为单一仓型增加策略层；只有出现第二个真实消费者且现有主链无法表达时才增加 seam。
 
 ## B. 执行边界与参考依据
+- 默认主代理串行完成；子代理须有用户或适用项目/技能规则的明确委派授权，并限定独立切片、互斥 write set、最低证明与 stop；“继续”或要求深入分析不构成授权。
 - setup/auth 不是门禁；认证缺失时只做本地测试，不声称 live 状态。
 - workflow、默认分支和 release 的真实写入属于中风险；未确认 dry-run、删除阈值和恢复点时阻断。
 - 本仓无专属 reference shelf；出现版本敏感 API 或第三方源码消费者时再登记来源、revision、license 与 consumer。
