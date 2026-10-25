@@ -11,6 +11,7 @@
   <img src="https://img.shields.io/badge/dependencies-zero%20(stdlib%20only)-brightgreen.svg" alt="Zero Dependencies">
   <img src="https://img.shields.io/badge/gh%20cli-official-2088FF.svg?logo=github" alt="GitHub CLI">
   <img src="https://img.shields.io/badge/tests-58%20passed-success.svg" alt="Unit Tests">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
 </p>
 
 <p align="center">
@@ -332,4 +333,4 @@ python -m unittest -q test_toolkit.py
 
 ## 许可证
 
-本项目基于 [MIT 许可证](https://opensource.org/licenses/MIT) 开源。欢迎提交 Issue 或 Pull Request 共同完善！
+本项目基于 [MIT 许可证](LICENSE) 开源。欢迎提交 Issue 或 Pull Request 共同完善！
