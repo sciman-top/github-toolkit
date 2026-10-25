@@ -11,6 +11,7 @@
   <img src="https://img.shields.io/badge/dependencies-zero%20(stdlib%20only)-brightgreen.svg" alt="Zero Dependencies">
   <img src="https://img.shields.io/badge/gh%20cli-official-2088FF.svg?logo=github" alt="GitHub CLI">
   <img src="https://img.shields.io/badge/tests-58%20passed-success.svg" alt="Unit Tests">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
 </p>
 
 <p align="center">
@@ -333,4 +334,4 @@ Test coverage highlights:
 
 ## License
 
-Distributed under the [MIT License](https://opensource.org/licenses/MIT). Issues and Pull Requests are warmly welcome!
+Distributed under the [MIT License](LICENSE). Issues and Pull Requests are warmly welcome!
